@@ -72,41 +72,39 @@ This produces:
 | `build/mel2wav` | HiFT only: mel.npy → wav (demo) |
 | `build/test-s3gen` | Staged numerical validation vs Python dumps |
 
-## 2. One-time: convert weights and dump the reference voice
+## 2. One-time: convert weights
 
 ```bash
 # Activate the Python environment from the Prerequisites step
 . ../chatterbox-ref/.venv/bin/activate
 
-# Convert T3 weights + built-in voice conditionals
+# Convert T3 weights + tokenizer + voice conditionals
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
 
 # Convert S3Gen encoder + CFM + HiFT weights
+# (the built-in reference voice is embedded inside this GGUF)
 python scripts/convert-s3gen-to-gguf.py --out models/chatterbox-s3gen.gguf
-
-# Dump the built-in reference voice (speaker embedding, prompt tokens, prompt mel)
-# as .npy files — chatterbox-tts needs these as the "ref_dir".
-python scripts/dump-s3gen-reference.py \
-  --text "Hello from ggml." \
-  --out artifacts/s3gen-ref \
-  --seed 42 --n-predict 64 --device cpu
 ```
 
-The first two scripts pull `ResembleAI/chatterbox-turbo` from Hugging Face
-Hub on first run (about 1.5 GB). They also cache `vocab.json`, `merges.txt`,
-and `added_tokens.json` which the C++ tokenizer reads at runtime.
+The scripts pull `ResembleAI/chatterbox-turbo` from Hugging Face Hub on
+first run (about 1.5 GB). They also cache `vocab.json`, `merges.txt`, and
+`added_tokens.json` which the C++ tokenizer reads at runtime (see §3 for
+how they're located).
 
 You should now have:
 
 ```
 models/
   chatterbox-t3-turbo.gguf   (~730 MB, F16 T3 weights)
-  chatterbox-s3gen.gguf      (~410 MB, F32 S3Gen + HiFT weights)
-artifacts/s3gen-ref/
-  embedding.npy              (192,) speaker embedding
-  prompt_token.npy           (250,) reference voice speech tokens
-  prompt_feat.npy            (500, 80) reference mel
-  mel_output.npy             ... and many more (used by test-s3gen)
+  chatterbox-s3gen.gguf      (~410 MB, F32 S3Gen + HiFT weights + built-in voice)
+```
+
+For numerical validation against PyTorch (optional, step 4), also run:
+
+```bash
+python scripts/dump-s3gen-reference.py \
+  --text "Hello from ggml." --out artifacts/s3gen-ref \
+  --seed 42 --n-predict 64 --device cpu
 ```
 
 ## 3. Run — end-to-end text → wav
@@ -122,8 +120,6 @@ That wraps the two-binary pipeline:
 ```bash
 # What synthesize.sh actually runs under the hood:
 
-TOKENIZER_DIR=~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/
-
 ./build/chatterbox \
   --model models/chatterbox-t3-turbo.gguf \
   --tokenizer-dir "$TOKENIZER_DIR" \
@@ -132,10 +128,22 @@ TOKENIZER_DIR=~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snap
 
 ./build/chatterbox-tts \
   --s3gen-gguf models/chatterbox-s3gen.gguf \
-  --ref-dir artifacts/s3gen-ref \
   --tokens-file /tmp/tokens.txt \
   --out /tmp/out.wav
 ```
+
+The tokenizer directory is auto-located in this order, first hit wins:
+
+1. `$CHATTERBOX_TOKENIZER_DIR/vocab.json` (env var override)
+2. `./tokenizer/vocab.json` (copy `vocab.json`, `merges.txt`,
+   `added_tokens.json` here if you don't want to depend on the HF cache)
+3. `~/.cache/huggingface/hub/models--ResembleAI--chatterbox-turbo/snapshots/*/`
+   (the dir that the converter scripts populate on first run)
+
+`chatterbox-tts` reads the built-in reference voice from the s3gen GGUF by
+default. Pass `--ref-dir DIR` to override with a custom set of
+`embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` files (used for
+validation and custom-voice workflows).
 
 Play the result:
 
@@ -233,15 +241,16 @@ chatterbox.cpp/
 
 ## Troubleshooting
 
-**`error: missing artifacts/s3gen-ref`** — run the
-`dump-s3gen-reference.py` step in §2. That directory currently contains the
-built-in reference voice used by `chatterbox-tts`.
+**`gpt2_bpe: failed to open .../vocab.json`** — `synthesize.sh` couldn't
+find the tokenizer. Either set `CHATTERBOX_TOKENIZER_DIR` before running
+it, or drop `vocab.json`, `merges.txt`, and `added_tokens.json` into a
+`tokenizer/` directory at the repo root. The HF snapshot dir that
+`convert-t3-turbo-to-gguf.py` populates on first run works too.
 
-**`gpt2_bpe: failed to open .../vocab.json`** — the tokenizer dir points at
-the Hugging Face snapshot directory that contains `vocab.json`,
-`merges.txt`, and `added_tokens.json`. Either set
-`CHATTERBOX_TOKENIZER_DIR` before running `synthesize.sh`, or pass
-`--tokenizer-dir /path/to/dir` explicitly to `./build/chatterbox`.
+**`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
+random bits to make every intermediate tensor bit-exactly comparable.
+Run `python scripts/dump-s3gen-reference.py --out artifacts/s3gen-ref …`
+first, then pass `--ref-dir artifacts/s3gen-ref`.
 
 **Output is much louder than the Python reference** — expected: the Python
 reference dump uses a very short utterance (mostly silence). Generate a

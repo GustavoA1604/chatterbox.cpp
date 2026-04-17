@@ -1128,23 +1128,52 @@ int main(int argc, char ** argv) {
         else if (a == "--threads" && i + 1 < argc) n_threads = std::atoi(argv[++i]);
         else if (a == "--debug") debug_mode = true;
         else {
-            fprintf(stderr, "usage: %s --s3gen-gguf MODEL.gguf --ref-dir DIR [--tokens-file FILE | --tokens CSV] --out OUT.wav [--seed N] [--threads N] [--debug]\n", argv[0]);
+            fprintf(stderr,
+                "usage: %s --s3gen-gguf MODEL.gguf [--ref-dir DIR]\n"
+                "           (--tokens-file FILE | --tokens CSV)\n"
+                "           --out OUT.wav [--seed N] [--threads N] [--debug]\n"
+                "\n"
+                "With no --ref-dir the built-in voice embedded in MODEL.gguf is used.\n"
+                "--ref-dir is required for --debug mode (needs Python-dumped tensors).\n",
+                argv[0]);
             return 1;
         }
     }
     if (n_threads <= 0) n_threads = (int)std::max(1u, std::thread::hardware_concurrency());
     g_n_threads = n_threads;
     fprintf(stderr, "Using %d threads\n", g_n_threads);
-    if (gguf_path.empty() || ref_dir.empty() || out_path.empty()) {
-        fprintf(stderr, "missing required arguments\n");
+    if (gguf_path.empty() || out_path.empty()) {
+        fprintf(stderr, "missing required arguments (--s3gen-gguf and --out)\n");
+        return 1;
+    }
+    if (debug_mode && ref_dir.empty()) {
+        fprintf(stderr, "--debug requires --ref-dir (Python-dumped intermediate tensors)\n");
         return 1;
     }
 
-    // Load reference conditioning (built-in voice for demo)
-    fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
-    npy_array emb_npy = npy_load(ref_dir + "/embedding.npy");                    // (192,)
-    npy_array pt_npy  = npy_load(ref_dir + "/prompt_token.npy");                 // (n_prompt,) int32
-    npy_array pf_npy  = npy_load(ref_dir + "/prompt_feat.npy");                  // (mel_len1, 80)
+    // Reference conditioning: prefer GGUF-embedded built-in voice;
+    // fall back to .npy files if --ref-dir was provided.
+    // Layout: emb (192,) float32; pt (N,) int32; pf (mel_len1, 80) float32.
+    std::vector<float>   emb_data;
+    std::vector<int32_t> pt_data;
+    std::vector<float>   pf_data;
+    int pf_rows = 0;  // mel_len1
+
+    if (ref_dir.empty()) {
+        fprintf(stderr, "No --ref-dir given; loading built-in voice from GGUF.\n");
+    } else {
+        fprintf(stderr, "Loading ref dict from %s\n", ref_dir.c_str());
+        npy_array emb_npy = npy_load(ref_dir + "/embedding.npy");
+        npy_array pt_npy  = npy_load(ref_dir + "/prompt_token.npy");
+        npy_array pf_npy  = npy_load(ref_dir + "/prompt_feat.npy");
+        emb_data.assign((const float*)emb_npy.data.data(),
+                        (const float*)emb_npy.data.data() + emb_npy.n_elements());
+        pt_data.assign((const int32_t*)pt_npy.data.data(),
+                       (const int32_t*)pt_npy.data.data() + pt_npy.n_elements());
+        pf_data.assign((const float*)pf_npy.data.data(),
+                       (const float*)pf_npy.data.data() + pf_npy.n_elements());
+        pf_rows = (int)pf_npy.shape[0];
+    }
 
     // Speech tokens
     std::vector<int32_t> speech_tokens;
@@ -1154,11 +1183,13 @@ int main(int argc, char ** argv) {
         std::stringstream ss(tokens_csv);
         std::string t;
         while (std::getline(ss, t, ',')) speech_tokens.push_back(std::stoi(t));
-    } else {
-        // Default: use dumped speech_tokens
+    } else if (!ref_dir.empty()) {
         npy_array st = npy_load(ref_dir + "/speech_tokens.npy");
         const int32_t * pi = (const int32_t *)st.data.data();
         for (size_t i = 0; i < st.n_elements(); ++i) speech_tokens.push_back(pi[i]);
+    } else {
+        fprintf(stderr, "error: no speech tokens provided (use --tokens-file or --tokens)\n");
+        return 1;
     }
     fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());
 
@@ -1175,25 +1206,43 @@ int main(int argc, char ** argv) {
     double load_t0 = now_ms();
     model_ctx m = load_s3gen_gguf(gguf_path);
     fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), now_ms() - load_t0);
+
+    // If no --ref-dir, pull the built-in voice from the GGUF.
+    if (ref_dir.empty()) {
+        ggml_tensor * t_emb = find_tensor(m, "s3gen/builtin/embedding");
+        ggml_tensor * t_pt  = find_tensor(m, "s3gen/builtin/prompt_token");
+        ggml_tensor * t_pf  = find_tensor(m, "s3gen/builtin/prompt_feat");
+        emb_data.resize(ggml_nelements(t_emb));
+        pt_data.resize(ggml_nelements(t_pt));
+        pf_data.resize(ggml_nelements(t_pf));
+        ggml_backend_tensor_get(t_emb, emb_data.data(), 0, ggml_nbytes(t_emb));
+        ggml_backend_tensor_get(t_pt,  pt_data.data(),  0, ggml_nbytes(t_pt));
+        ggml_backend_tensor_get(t_pf,  pf_data.data(),  0, ggml_nbytes(t_pf));
+        // prompt_feat is stored ggml ne=[80, 500] = numpy (500, 80).
+        // We want pf_rows = mel_len1 (500). ggml ne[1] maps to numpy shape[0].
+        pf_rows = (int)t_pf->ne[1];
+        fprintf(stderr, "  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
+                emb_data.size(), pt_data.size(), pf_rows, (long long)t_pf->ne[0]);
+    }
     double pipeline_t0 = now_ms();
 
     const int D = 512;
     const int MEL = 80;
 
     // 1) Concat prompt_token + padded speech_tokens
-    int n_prompt = (int)pt_npy.shape[0];
+    int n_prompt = (int)pt_data.size();
     int n_total = n_prompt + (int)padded.size();
     fprintf(stderr, "n_prompt=%d n_speech_padded=%zu n_total=%d\n", n_prompt, padded.size(), n_total);
 
     std::vector<int32_t> flow_tokens(n_total);
-    std::memcpy(flow_tokens.data(), pt_npy.data.data(), n_prompt * sizeof(int32_t));
+    std::memcpy(flow_tokens.data(), pt_data.data(), n_prompt * sizeof(int32_t));
     std::memcpy(flow_tokens.data() + n_prompt, padded.data(), padded.size() * sizeof(int32_t));
 
     // 2) input_embedding lookup + multiply by mask
     fprintf(stderr, "Running input_embedding...\n");
     ggml_tensor * emb_w = find_tensor(m, "flow/input_embedding");
-    std::vector<float> emb_data(ggml_nelements(emb_w));
-    ggml_backend_tensor_get(emb_w, emb_data.data(), 0, ggml_nbytes(emb_w));
+    std::vector<float> emb_w_data(ggml_nelements(emb_w));
+    ggml_backend_tensor_get(emb_w, emb_w_data.data(), 0, ggml_nbytes(emb_w));
     fprintf(stderr, "  emb_w ne=[%lld, %lld]\n", (long long)emb_w->ne[0], (long long)emb_w->ne[1]);
     int vocab_size = (int)emb_w->ne[1];
     std::vector<float> input_embed(n_total * D);
@@ -1204,7 +1253,7 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "warning: token %d out of range (vocab=%d), clamping\n", tok, vocab_size);
             tok = vocab_size - 1;
         }
-        std::memcpy(input_embed.data() + i * D, emb_data.data() + (size_t)tok * D, D * sizeof(float));
+        std::memcpy(input_embed.data() + i * D, emb_w_data.data() + (size_t)tok * D, D * sizeof(float));
     }
     if (debug_mode) {
         fprintf(stderr, "  token[0]=%d lookup: %.6f %.6f %.6f %.6f %.6f\n",
@@ -1254,7 +1303,7 @@ int main(int argc, char ** argv) {
 
     // 4) Speaker embedding: F.normalize + spk_embed_affine_layer
     fprintf(stderr, "Computing speaker embedding...\n");
-    const float * emb_raw = (const float*)emb_npy.data.data();
+    const float * emb_raw = emb_data.data();
     float norm = 0.0f;
     for (int i = 0; i < 192; ++i) norm += emb_raw[i] * emb_raw[i];
     norm = std::sqrt(norm + 1e-12f);
@@ -1274,7 +1323,7 @@ int main(int argc, char ** argv) {
     }
 
     // 5) Build cond: zeros(T_mu, 80), fill first mel_len1 rows with prompt_feat
-    int mel_len1 = (int)pf_npy.shape[0];
+    int mel_len1 = pf_rows;
     if (mel_len1 > T_mu) {
         fprintf(stderr, "error: mel_len1=%d > T_mu=%d\n", mel_len1, T_mu);
         return 1;
@@ -1283,7 +1332,7 @@ int main(int argc, char ** argv) {
     // pf is (mel_len1, 80) numpy = ne=[80, mel_len1] in ggml. We want cond ne=[T_mu, MEL].
     // In memory ggml ne=[T_mu, MEL] means [t0_m0, t1_m0, ..., t_Tmu-1_m0, t0_m1, ...].
     // So cond[m, t] = pf[t, m].
-    const float * pf_raw = (const float*)pf_npy.data.data();
+    const float * pf_raw = pf_data.data();
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
