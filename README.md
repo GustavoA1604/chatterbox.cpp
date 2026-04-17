@@ -141,9 +141,24 @@ Advanced modes:
   `--output tokens.txt`. Useful for piping into other tools.
 - **S3Gen + HiFT only** — pass `--s3gen-gguf` + `--tokens-file FILE` with
   already-generated speech tokens and no `--model`.
-- **Custom voice** — `--ref-dir DIR` overrides the built-in voice with
-  `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` from a
-  directory produced by `scripts/dump-s3gen-reference.py`.
+- **Custom voice (voice cloning)** — first turn a reference `.wav` into
+  a voice profile directory, then pass it as `--ref-dir`:
+
+  ```bash
+  python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
+  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --ref-dir voices/me/ \
+                     --text "Hello in my voice." \
+                     --out out.wav
+  ```
+
+  `voices/me/` holds five `.npy` tensors (speaker embedding + prompt
+  tokens + prompt mel for T3 and S3Gen respectively). Reference audio
+  needs to be at least 5 s of clean speech; longer helps. The
+  preprocessing script is a Python-side bridge for now — native C++
+  VoiceEncoder / mel-extractor / S3TokenizerV2 are on the backlog
+  (see `PROGRESS.md` A1 phase 2+).
 
 Play the result:
 

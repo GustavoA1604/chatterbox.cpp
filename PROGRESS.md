@@ -421,27 +421,73 @@ Ranked by impact-per-effort ratio, from biggest wins to niche polish.
 
 ### Tier A — biggest wins, should be tackled next
 
-#### A1. Voice cloning (VoiceEncoder + S3Tokenizer + mel extraction)
+#### A1. Voice cloning — **phase 1 DONE**, phases 2-4 pending
 
-Right now the only voice is the built-in one baked into `conds.pt`; users
-cannot clone their own. Adds a `--reference-audio file.wav` flag to
-`chatterbox-tts` that computes the three conditioning tensors in C++
-instead of requiring the Python-side dump.
+Voice cloning works end-to-end TODAY using a Python preprocessing
+helper that produces a five-tensor voice profile from a reference
+`.wav`. The C++ binary accepts it via `--ref-dir DIR`.
 
-What to port:
-- **`VoiceEncoder`** — 3-layer bi-LSTM, `wav (16 kHz) → speaker embedding
-  (192-d)`. LSTM in ggml is known-good from `whisper.cpp` / `llama.cpp`
-  / `bark.cpp`.
-- **`S3Tokenizer`** — small wav2vec-style encoder producing the
-  6561-vocab speech tokens used as `prompt_token`.
-- **Mel spectrogram extraction** for `prompt_feat` — 80-channel log-mel
-  via STFT + filterbank. The STFT code from the HiFT port is reusable;
-  mel filterbank is ~50 lines.
+**Phase 1 (DONE)** — Python helper + C++ wiring:
 
-Scope: ~2–3 days. Biggest unknown is the `S3Tokenizer` architecture.
+- `scripts/prepare-voice.py`: wraps
+  `ChatterboxTurboTTS.prepare_conditionals()` to produce a directory
+  with `speaker_emb.npy` (T3 256-d) + `cond_prompt_speech_tokens.npy`
+  (T3 ≤375 int32) + `embedding.npy` (S3Gen 192-d) + `prompt_token.npy`
+  (S3Gen int32) + `prompt_feat.npy` (S3Gen mel, 80-channel).
+- `src/main.cpp`: when `--ref-dir` is set, overwrite the T3 side in
+  place (`model.builtin_speaker_emb`) or, when the prompt-tokens length
+  differs from the GGUF's built-in (audio < 15 s → fewer tokens),
+  allocate a fresh tensor in `ctx_override` + `buffer_override` on the
+  same backend and repoint `model.builtin_cond_prompt_tokens` at it.
+  `hparams.cond_prompt_len` is updated to match so `build_prompt_graph`
+  sizes the sequence correctly.
+- `src/chatterbox_tts.cpp`: the S3Gen side already reads the same three
+  `.npy` files when `ref_dir` is non-empty.
 
-Impact: **transforms the project from a fixed-voice demo into a real
-zero-shot TTS** — the flagship Chatterbox feature.
+End user workflow:
+
+```bash
+python scripts/prepare-voice.py --ref-audio me.wav --out voices/me/
+./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+                   --s3gen-gguf models/chatterbox-s3gen.gguf \
+                   --ref-dir voices/me/ \
+                   --text "Hello in my voice." \
+                   --out out.wav
+```
+
+Verified end-to-end on the remote EPYC: override prints
+`overrode T3 built-in voice from voices/test (speaker_emb=256,
+cond_prompt_tokens=260)`, the synthesis runs at RTF 0.44, the output
+wav plays back cleanly on the Mac.
+
+**Phase 2 (NEXT)** — C++ mel extraction for `prompt_feat`:
+
+- 80-channel log-mel at 24 kHz, hop 256, win 1024 (to match
+  `s3gen.mel_extractor`).
+- STFT code from the HiFT port is reusable; mel filterbank is a
+  `[80, n_fft/2+1]` matrix that `librosa.filters.mel` computes and we
+  can bake into the s3gen GGUF as a single tensor, then mul_mat over
+  the magnitude spectrogram.
+- Tiny — expect ~150 lines of C++ + a converter-side export of the
+  pre-computed filterbank.
+
+**Phase 3** — C++ VoiceEncoder (3-layer unidirectional LSTM, 40-channel
+16 kHz mel in, 256-d speaker embedding out). LSTM cell + recurrence in
+ggml follows the `whisper.cpp` / `bark.cpp` patterns. The partial-window
+averaging from `VoiceEncoder.inference` is CPU-side bookkeeping.
+
+**Phase 4** — C++ S3TokenizerV2 (~600-line wav2vec-style encoder with
+FSMN attention and an FSQ codebook). This is the biggest lift and will
+probably need staged verification against Python dumps, same approach
+as the S3Gen encoder port in §3.3. Produces both the T3
+`cond_prompt_speech_tokens` and the S3Gen `prompt_token`.
+
+After all three phases land, `scripts/prepare-voice.py` becomes
+redundant and `chatterbox --reference-audio file.wav ...` replaces it.
+
+Impact: even Phase 1 alone unlocks "zero-shot voice cloning" as a usable
+feature — the flagship reason anyone picks Chatterbox in the first
+place.
 
 #### A2. GPU backend (Metal first, then CUDA)
 

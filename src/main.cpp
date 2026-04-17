@@ -29,6 +29,14 @@
 #include <vector>
 
 #include "s3gen_pipeline.h"
+#include "npy.h"
+
+#include <sys/stat.h>
+
+static bool file_exists(const std::string & path) {
+    struct stat st;
+    return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
 
 static constexpr int CHBX_MAX_NODES = 8192;
 
@@ -111,6 +119,12 @@ struct chatterbox_model {
 
     ggml_backend_buffer_t buffer_w  = nullptr;
     ggml_backend_buffer_t buffer_kv = nullptr;
+
+    // Override buffer: populated only when --ref-dir supplies a cond_prompt
+    // tensor whose length differs from the GGUF's built-in. The original
+    // built-in tensor stays alive (reachable via ctx_w) but unused.
+    ggml_context *        ctx_override    = nullptr;
+    ggml_backend_buffer_t buffer_override = nullptr;
 
     std::map<std::string, ggml_tensor *> tensors;
 
@@ -719,6 +733,61 @@ int main(int argc, char ** argv) {
         chatterbox_model model;
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
 
+        // Voice-profile override: if --ref-dir has speaker_emb.npy and
+        // cond_prompt_speech_tokens.npy, swap out the T3-side built-in voice.
+        // The S3Gen side is overridden later inside s3gen_synthesize_to_wav
+        // via the same ref_dir path.
+        if (!params.ref_dir.empty()) {
+            const std::string se_path = params.ref_dir + "/speaker_emb.npy";
+            const std::string ct_path = params.ref_dir + "/cond_prompt_speech_tokens.npy";
+            if (file_exists(se_path) && file_exists(ct_path)) {
+                npy_array se = npy_load(se_path);
+                npy_array ct = npy_load(ct_path);
+                if ((int64_t)se.n_elements() != ggml_nelements(model.builtin_speaker_emb)) {
+                    fprintf(stderr,
+                        "error: %s has %zu elements but builtin_speaker_emb expects %lld\n",
+                        se_path.c_str(), se.n_elements(),
+                        (long long)ggml_nelements(model.builtin_speaker_emb));
+                    return 1;
+                }
+
+                // speaker_emb is always the same shape (speaker_embed_size,);
+                // we can just overwrite the data in place.
+                ggml_backend_tensor_set(model.builtin_speaker_emb,
+                                        se.data.data(), 0, ggml_nbytes(model.builtin_speaker_emb));
+
+                // cond_prompt_tokens can be any length depending on how long the
+                // user's reference audio is. If it differs from the built-in size,
+                // allocate a fresh tensor in a separate context + backend buffer
+                // and repoint model.builtin_cond_prompt_tokens at it.
+                if ((int64_t)ct.n_elements() == ggml_nelements(model.builtin_cond_prompt_tokens)) {
+                    ggml_backend_tensor_set(model.builtin_cond_prompt_tokens,
+                                            ct.data.data(), 0,
+                                            ggml_nbytes(model.builtin_cond_prompt_tokens));
+                } else {
+                    ggml_init_params op = { ggml_tensor_overhead() * 2, nullptr, true };
+                    model.ctx_override = ggml_init(op);
+                    if (!model.ctx_override) throw std::runtime_error("ggml_init(ctx_override) failed");
+                    ggml_tensor * new_ct = ggml_new_tensor_1d(model.ctx_override, GGML_TYPE_I32, (int64_t)ct.n_elements());
+                    ggml_set_name(new_ct, "chatterbox/builtin/cond_prompt_speech_tokens_override");
+                    model.buffer_override = ggml_backend_alloc_ctx_tensors(model.ctx_override, model.backend);
+                    if (!model.buffer_override) throw std::runtime_error("alloc override buffer failed");
+                    ggml_backend_tensor_set(new_ct, ct.data.data(), 0, ct.n_elements() * sizeof(int32_t));
+                    model.builtin_cond_prompt_tokens = new_ct;
+                    model.hparams.cond_prompt_len = (int32_t)ct.n_elements();
+                }
+
+                fprintf(stderr,
+                    "%s: overrode T3 built-in voice from %s (speaker_emb=%zu, cond_prompt_tokens=%zu)\n",
+                    __func__, params.ref_dir.c_str(), se.n_elements(), ct.n_elements());
+            } else {
+                fprintf(stderr,
+                    "%s: --ref-dir %s has no T3 override (speaker_emb.npy + cond_prompt_speech_tokens.npy); "
+                    "keeping built-in T3 voice\n",
+                    __func__, params.ref_dir.c_str());
+            }
+        }
+
         std::vector<int32_t> text_tokens;
         if (!params.text.empty()) {
             if (model.tok_tokens.empty()) {
@@ -799,9 +868,11 @@ int main(int argc, char ** argv) {
         ggml_gallocr_free(allocr);
         ggml_backend_buffer_free(model.buffer_w);
         ggml_backend_buffer_free(model.buffer_kv);
+        if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
         ggml_backend_free(model.backend);
         ggml_free(model.ctx_w);
         ggml_free(model.ctx_kv);
+        if (model.ctx_override) ggml_free(model.ctx_override);
     } catch (const std::exception & e) {
         fprintf(stderr, "error: %s\n", e.what());
         return 1;
