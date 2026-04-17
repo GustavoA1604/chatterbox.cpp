@@ -23,6 +23,9 @@ artifacts/
 # Local tokenizer files (downloaded from HF cache)
 tokenizer/
 
+# Voice-clone profiles (generated per reference audio)
+voices/
+
 # Generated audio
 *.wav
 
