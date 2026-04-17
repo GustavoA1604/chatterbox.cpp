@@ -135,17 +135,14 @@ That wraps the two-binary pipeline:
 Everything is self-contained in the two `.gguf` files:
 
 - `chatterbox-t3-turbo.gguf` embeds the BPE tokenizer (vocab + merges +
-  added tokens) as standard `tokenizer.ggml.*` metadata.
+  added tokens) as standard `tokenizer.ggml.*` metadata, which the C++
+  binary loads out of GGUF at startup.
 - `chatterbox-s3gen.gguf` embeds the built-in reference voice (embedding,
   prompt token, prompt mel) under `s3gen/builtin/*`.
 
-Legacy knobs if you ever need them:
-
-- `--tokenizer-dir DIR` on `chatterbox` — override the embedded tokenizer,
-  or supply one if the GGUF was built before tokenizer embedding landed.
-- `--ref-dir DIR` on `chatterbox-tts` — override the built-in voice with
-  `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy` (used by
-  validation and custom-voice workflows).
+`chatterbox-tts` also accepts `--ref-dir DIR` to override the built-in
+voice with `embedding.npy` / `prompt_token.npy` / `prompt_feat.npy`
+(used by validation and custom-voice workflows).
 
 Play the result:
 
@@ -243,12 +240,13 @@ chatterbox.cpp/
 
 ## Troubleshooting
 
-**`error: GGUF has no embedded tokenizer and --tokenizer-dir was not provided`**
-— you're running against a legacy T3 GGUF built before the tokenizer was
-embedded. Re-run the converter (`python scripts/convert-t3-turbo-to-gguf.py
---out models/chatterbox-t3-turbo.gguf`) or pass `--tokenizer-dir DIR` to
-point at a directory holding `vocab.json`, `merges.txt`, and
-`added_tokens.json`.
+**`error: this GGUF has no embedded tokenizer`** — you're running against
+a legacy T3 GGUF built before the tokenizer was embedded. Re-run the
+converter to produce a fresh GGUF:
+
+```bash
+python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
+```
 
 **`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
 random bits to make every intermediate tensor bit-exactly comparable.

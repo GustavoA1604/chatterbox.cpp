@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
-#include <fstream>
+#include <cstdint>
 #include <functional>
 #include <queue>
 #include <regex>
@@ -47,123 +47,7 @@ static std::string bytes_to_unicode_str(const std::string & raw) {
     return out;
 }
 
-// ---- simple JSON helpers (no dependencies) ---------------------------------
-
-static std::string json_unescape(const std::string & s) {
-    std::string out;
-    for (size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '\\' && i + 1 < s.size()) {
-            char c = s[++i];
-            if (c == '"') out += '"';
-            else if (c == '\\') out += '\\';
-            else if (c == '/') out += '/';
-            else if (c == 'n') out += '\n';
-            else if (c == 'r') out += '\r';
-            else if (c == 't') out += '\t';
-            else if (c == 'u' && i + 4 < s.size()) {
-                uint32_t cp = (uint32_t)std::stoul(s.substr(i+1, 4), nullptr, 16);
-                i += 4;
-                if (cp >= 0xD800 && cp <= 0xDBFF && i + 2 < s.size() && s[i+1] == '\\' && s[i+2] == 'u') {
-                    uint32_t lo = (uint32_t)std::stoul(s.substr(i+3, 4), nullptr, 16);
-                    i += 6;
-                    cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                }
-                if (cp < 0x80) out += (char)cp;
-                else if (cp < 0x800) { out += (char)(0xC0|(cp>>6)); out += (char)(0x80|(cp&0x3F)); }
-                else if (cp < 0x10000) { out += (char)(0xE0|(cp>>12)); out += (char)(0x80|((cp>>6)&0x3F)); out += (char)(0x80|(cp&0x3F)); }
-                else { out += (char)(0xF0|(cp>>18)); out += (char)(0x80|((cp>>12)&0x3F)); out += (char)(0x80|((cp>>6)&0x3F)); out += (char)(0x80|(cp&0x3F)); }
-            } else { out += c; }
-        } else {
-            out += s[i];
-        }
-    }
-    return out;
-}
-
-// ---- load vocab.json -------------------------------------------------------
-
-bool gpt2_bpe::load_vocab_json(const std::string & path) {
-    std::ifstream f(path);
-    if (!f) { fprintf(stderr, "gpt2_bpe: failed to open %s\n", path.c_str()); return false; }
-    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
-    size_t max_id = 0;
-    size_t pos = 0;
-    while (pos < json.size()) {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) break;
-        size_t key_start = ++pos;
-        while (pos < json.size() && json[pos] != '"') { if (json[pos] == '\\') ++pos; ++pos; }
-        std::string key = json_unescape(json.substr(key_start, pos - key_start));
-        ++pos;
-        pos = json.find(':', pos);
-        if (pos == std::string::npos) break;
-        ++pos;
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) ++pos;
-        size_t num_start = pos;
-        while (pos < json.size() && ((json[pos] >= '0' && json[pos] <= '9') || json[pos] == '-')) ++pos;
-        int32_t id = (int32_t)std::stoi(json.substr(num_start, pos - num_start));
-        token_to_id[key] = id;
-        if ((size_t)id >= max_id) max_id = (size_t)id + 1;
-    }
-
-    id_to_token.resize(max_id);
-    for (auto & [tok, id] : token_to_id) {
-        if (id >= 0 && (size_t)id < id_to_token.size()) id_to_token[id] = tok;
-    }
-    return true;
-}
-
-// ---- load merges.txt -------------------------------------------------------
-
-bool gpt2_bpe::load_merges_txt(const std::string & path) {
-    std::ifstream f(path);
-    if (!f) { fprintf(stderr, "gpt2_bpe: failed to open %s\n", path.c_str()); return false; }
-    std::string line;
-    int rank = 0;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        size_t sp = line.find(' ');
-        if (sp == std::string::npos) continue;
-        std::string left = line.substr(0, sp);
-        std::string right = line.substr(sp + 1);
-        while (!right.empty() && (right.back() == '\r' || right.back() == '\n')) right.pop_back();
-        bpe_ranks[left + " " + right] = rank++;
-    }
-    return true;
-}
-
-// ---- load added_tokens.json ------------------------------------------------
-
-bool gpt2_bpe::load_added_tokens_json(const std::string & path) {
-    std::ifstream f(path);
-    if (!f) return true; // optional
-    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-
-    size_t pos = 0;
-    while (pos < json.size()) {
-        pos = json.find('"', pos);
-        if (pos == std::string::npos) break;
-        size_t key_start = ++pos;
-        while (pos < json.size() && json[pos] != '"') { if (json[pos] == '\\') ++pos; ++pos; }
-        std::string key = json_unescape(json.substr(key_start, pos - key_start));
-        ++pos;
-        pos = json.find(':', pos);
-        if (pos == std::string::npos) break;
-        ++pos;
-        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) ++pos;
-        size_t ns = pos;
-        while (pos < json.size() && ((json[pos] >= '0' && json[pos] <= '9') || json[pos] == '-')) ++pos;
-        int32_t id = (int32_t)std::stoi(json.substr(ns, pos - ns));
-
-        token_to_id[key] = id;
-        if ((size_t)id >= id_to_token.size()) id_to_token.resize((size_t)id + 1);
-        id_to_token[id] = key;
-    }
-    return true;
-}
-
-// ---- in-memory loader for GGUF-embedded tokenizer -------------------------
+// ---- load tokenizer from arrays embedded in GGUF metadata -----------------
 
 bool gpt2_bpe::load_from_arrays(const std::vector<std::string> & tokens,
                                 const std::vector<std::string> & merges) {

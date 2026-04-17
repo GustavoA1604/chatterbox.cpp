@@ -24,10 +24,11 @@ TEST_CASES = [
 ]
 
 
-def c_tokenize(binary: Path, tokenizer_dir: Path, text: str) -> list[int]:
-    """Call the chatterbox binary with --dump-tokens to get C++ tokens."""
+def c_tokenize(binary: Path, gguf_model: Path, text: str) -> list[int]:
+    """Call the chatterbox binary with --dump-tokens-only to get C++ tokens.
+    The GGUF must embed the tokenizer (standard tokenizer.ggml.* metadata)."""
     result = subprocess.run(
-        [str(binary), "--tokenizer-dir", str(tokenizer_dir),
+        [str(binary), "--model", str(gguf_model),
          "--text", text, "--dump-tokens-only"],
         capture_output=True, text=True,
     )
@@ -42,8 +43,12 @@ def c_tokenize(binary: Path, tokenizer_dir: Path, text: str) -> list[int]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", type=Path, required=True)
-    ap.add_argument("--tokenizer-dir", type=Path, required=True)
+    ap.add_argument("--binary", type=Path, required=True,
+                    help="Path to the chatterbox binary")
+    ap.add_argument("--model", type=Path, required=True,
+                    help="Path to chatterbox-t3-turbo.gguf (contains embedded tokenizer)")
+    ap.add_argument("--tokenizer-dir", type=Path, required=True,
+                    help="HuggingFace snapshot dir for the PyTorch reference tokenizer")
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(str(args.tokenizer_dir))
@@ -53,7 +58,7 @@ def main():
     for text in TEST_CASES:
         normalized = punc_norm(text)
         py_ids = tok(normalized, return_tensors="pt").input_ids.squeeze(0).tolist()
-        cpp_ids = c_tokenize(args.binary, args.tokenizer_dir, text)
+        cpp_ids = c_tokenize(args.binary, args.model, text)
 
         match = py_ids == cpp_ids
         status = "PASS" if match else "FAIL"

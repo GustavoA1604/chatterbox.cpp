@@ -112,8 +112,7 @@ struct chatterbox_model {
 
     std::map<std::string, ggml_tensor *> tensors;
 
-    // Tokenizer embedded in GGUF metadata (empty when the GGUF predates the
-    // tokenizer-in-GGUF change; caller should then fall back to --tokenizer-dir).
+    // GPT-2 BPE tokenizer, carried in the GGUF as tokenizer.ggml.* metadata.
     std::vector<std::string> tok_tokens;
     std::vector<std::string> tok_merges;
 };
@@ -126,7 +125,6 @@ struct cli_params {
     std::string model;
     std::string tokens_file;
     std::string text;
-    std::string tokenizer_dir;
     std::string output;
     bool    dump_tokens_only = false;
     int32_t seed           = 0;
@@ -144,10 +142,9 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "usage: %s --model MODEL.gguf [--text TEXT | --tokens-file tokens.txt] [options]\n", argv0);
     fprintf(stderr, "\noptions:\n");
     fprintf(stderr, "  --model PATH            GGUF model produced by convert-t3-turbo-to-gguf.py\n");
-    fprintf(stderr, "  --text TEXT             Input text (uses built-in GPT-2 BPE tokenizer)\n");
-    fprintf(stderr, "  --tokenizer-dir PATH    Directory with vocab.json + merges.txt + added_tokens.json.\n");
-    fprintf(stderr, "                          Only needed if the GGUF was produced before the tokenizer\n");
-    fprintf(stderr, "                          was embedded (recent GGUFs carry it in metadata).\n");
+    fprintf(stderr, "                          (must embed tokenizer.ggml.* metadata; produced by the\n");
+    fprintf(stderr, "                          current converter)\n");
+    fprintf(stderr, "  --text TEXT             Input text (uses the GPT-2 BPE tokenizer embedded in GGUF)\n");
     fprintf(stderr, "  --tokens-file PATH      Pre-tokenized text token ids (alternative to --text)\n");
     fprintf(stderr, "  --output PATH           Output file for generated speech tokens\n");
     fprintf(stderr, "  --seed N                RNG seed (default: 0)\n");
@@ -172,7 +169,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
 
         if      (arg == "--model")          { auto v = next("--model");          if (!v) return false; params.model = v; }
         else if (arg == "--text")           { auto v = next("--text");           if (!v) return false; params.text = v; }
-        else if (arg == "--tokenizer-dir")  { auto v = next("--tokenizer-dir");  if (!v) return false; params.tokenizer_dir = v; }
         else if (arg == "--tokens-file")    { auto v = next("--tokens-file");    if (!v) return false; params.tokens_file = v; }
         else if (arg == "--output")         { auto v = next("--output");         if (!v) return false; params.output = v; }
         else if (arg == "--seed")           { auto v = next("--seed");           if (!v) return false; params.seed = std::stoi(v); }
@@ -199,10 +195,6 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
     if (params.text.empty() && params.tokens_file.empty()) {
         fprintf(stderr, "error: either --text or --tokens-file is required\n"); return false;
     }
-    // Note: when --text is given and the GGUF has no embedded tokenizer,
-    // main() will check for --tokenizer-dir after loading the model and
-    // emit a clear error. We no longer require it up-front because recent
-    // GGUFs embed the tokenizer.
     return true;
 }
 
@@ -683,22 +675,15 @@ int main(int argc, char ** argv) {
 
         std::vector<int32_t> text_tokens;
         if (!params.text.empty()) {
+            if (model.tok_tokens.empty()) {
+                fprintf(stderr,
+                    "error: this GGUF has no embedded tokenizer. Re-run\n"
+                    "       scripts/convert-t3-turbo-to-gguf.py to produce a fresh GGUF\n"
+                    "       with tokenizer.ggml.* metadata.\n");
+                return 1;
+            }
             gpt2_bpe bpe;
-            bool tok_loaded = false;
-            if (!model.tok_tokens.empty()) {
-                tok_loaded = bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
-            }
-            if (!tok_loaded) {
-                if (params.tokenizer_dir.empty()) {
-                    fprintf(stderr, "error: GGUF has no embedded tokenizer and --tokenizer-dir was not provided\n");
-                    return 1;
-                }
-                std::string dir = params.tokenizer_dir;
-                if (dir.back() != '/') dir += '/';
-                if (!bpe.load_vocab_json(dir + "vocab.json")) return 1;
-                if (!bpe.load_merges_txt(dir + "merges.txt")) return 1;
-                bpe.load_added_tokens_json(dir + "added_tokens.json");
-            }
+            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
 
             std::string normalized = gpt2_bpe::punc_norm(params.text);
             text_tokens = bpe.tokenize(normalized);

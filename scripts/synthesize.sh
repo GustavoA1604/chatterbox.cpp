@@ -27,16 +27,6 @@ TTS_BIN="$ROOT/build/chatterbox-tts"
 T3_GGUF="$ROOT/models/chatterbox-t3-turbo.gguf"
 S3G_GGUF="$ROOT/models/chatterbox-s3gen.gguf"
 
-# The tokenizer is embedded in chatterbox-t3-turbo.gguf as GGUF metadata,
-# so no separate path is required. For legacy GGUFs without an embedded
-# tokenizer, set CHATTERBOX_TOKENIZER_DIR (or use --tokenizer-dir directly).
-TOKENIZER_ARGS=""
-if [[ -n "${CHATTERBOX_TOKENIZER_DIR:-}" ]] && [[ -f "$CHATTERBOX_TOKENIZER_DIR/vocab.json" ]]; then
-    TOKENIZER_ARGS="--tokenizer-dir $CHATTERBOX_TOKENIZER_DIR"
-elif [[ -f "$ROOT/tokenizer/vocab.json" ]]; then
-    TOKENIZER_ARGS="--tokenizer-dir $ROOT/tokenizer"
-fi
-
 if [[ ! -x "$T3_BIN" ]] || [[ ! -x "$TTS_BIN" ]]; then
     echo "error: binaries not built; run 'cmake --build build' first" >&2
     exit 1
@@ -51,7 +41,6 @@ trap "rm -f $TMP" EXIT
 echo ">>> [1/2] T3: text -> speech tokens"
 "$T3_BIN" \
     --model "$T3_GGUF" \
-    ${TOKENIZER_ARGS} \
     --text "$TEXT" \
     --output "$TMP" \
     ${EXTRA_ARGS} > /dev/null
