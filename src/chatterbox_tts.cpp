@@ -1289,8 +1289,13 @@ int s3gen_synthesize_to_wav(
     }
     const model_ctx & m_hift = hift_on_cpu ? m_hift_storage : m;
 
-    // If no --ref-dir, pull the built-in voice from the GGUF.
-    if (ref_dir.empty()) {
+    // If neither --ref-dir nor any C++ override populated the three
+    // conditioning tensors above, pull the built-in voice from the GGUF.
+    //
+    // NB: `ref_dir.empty()` alone is NOT a valid check here — --reference-audio
+    // by itself (no --ref-dir) legitimately fills all three via the C++
+    // override path, and we must not overwrite those.
+    if (pt_data.empty() && emb_data.empty() && pf_data.empty()) {
         ggml_tensor * t_emb = find_tensor(m, "s3gen/builtin/embedding");
         ggml_tensor * t_pt  = find_tensor(m, "s3gen/builtin/prompt_token");
         ggml_tensor * t_pf  = find_tensor(m, "s3gen/builtin/prompt_feat");
@@ -1301,7 +1306,6 @@ int s3gen_synthesize_to_wav(
         ggml_backend_tensor_get(t_pt,  pt_data.data(),  0, ggml_nbytes(t_pt));
         ggml_backend_tensor_get(t_pf,  pf_data.data(),  0, ggml_nbytes(t_pf));
         // prompt_feat is stored ggml ne=[80, 500] = numpy (500, 80).
-        // We want pf_rows = mel_len1 (500). ggml ne[1] maps to numpy shape[0].
         pf_rows = (int)t_pf->ne[1];
         fprintf(stderr, "  built-in voice: embedding=(%zu,) prompt_token=(%zu,) prompt_feat=(%d, %lld)\n",
                 emb_data.size(), pt_data.size(), pf_rows, (long long)t_pf->ne[0]);
