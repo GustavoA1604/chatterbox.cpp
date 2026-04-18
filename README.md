@@ -36,8 +36,11 @@ thin convenience wrapper that fills in the two GGUF paths.
 
 - C++17 compiler (clang or gcc)
 - cmake ≥ 3.14
-- Python 3.10+ with `torch`, `numpy`, `gguf`, `safetensors`, `scipy` —
-  needed **once** for the weight conversion and the reference-voice dump.
+- Python 3.10+ with `torch`, `numpy`, `gguf`, `safetensors`, `scipy`,
+  `librosa`, `resampy` — needed **once**, at setup time only, to run the
+  weight converters (which bake the precomputed mel filterbanks into the
+  GGUFs) and the optional reference-dump scripts. Once the GGUFs exist,
+  the C++ binary has zero runtime dependency on Python.
 
 The easiest way to get the Python side is:
 
@@ -46,7 +49,7 @@ git clone https://github.com/resemble-ai/chatterbox.git chatterbox-ref
 cd chatterbox-ref
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
-pip install gguf safetensors scipy
+pip install gguf safetensors scipy librosa resampy
 cd -
 ```
 
@@ -178,10 +181,15 @@ Advanced modes:
                      --out out.wav
   ```
 
-  Reference audio needs to be at least 5 s of clean mono speech
-  (16- or 24-kHz WAV — any sample rate works; the binary resamples).
-  Longer helps.  All five voice-conditioning tensors are produced in
-  C++:
+  Requirements for the reference wav:
+  - **Strictly more than 5 s** of clean mono speech (the binary enforces
+    this and fails fast; 10–15 s gives the best similarity).
+  - Any sample rate, any PCM bit-depth (binary resamples + downmixes).
+
+  Loudness is normalised to **-27 LUFS** (ITU-R BS.1770-4 / EBU R 128)
+  internally before preprocessing, so a quiet recording like a phone
+  memo works as well as a studio track.  All five voice-conditioning
+  tensors are produced in C++:
 
   | tensor                         | source                           |
   |--------------------------------|----------------------------------|
@@ -191,10 +199,32 @@ Advanced modes:
   | `embedding`                    | C++ CAMPPlus      (S3Gen GGUF)   |
   | `prompt_feat`                  | C++ mel extraction               |
 
-  You can still pre-bake tensors into a voice directory and pass
-  `--ref-dir voices/me/` (any `.npy` there overrides the C++ path for
-  that tensor).  But it's optional now — `--reference-audio` alone is
-  enough.
+- **Cache a voice for fast reuse (`--save-voice`)** — voice preprocessing
+  (VoiceEncoder + CAMPPlus + S3TokenizerV2 + mel) adds ≈ 2 minutes on a
+  Mac before every synthesis.  The five tensors don't depend on the
+  text, so bake them once:
+
+  ```bash
+  # Bake the profile (no --text needed; just preprocesses + saves).
+  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --reference-audio me.wav \
+                     --save-voice voices/me/
+  # Writes voices/me/{speaker_emb, cond_prompt_speech_tokens,
+  # embedding, prompt_token, prompt_feat}.npy (~160 KB total).
+
+  # Reuse (≈ 17× faster; VoiceEncoder / CAMPPlus / S3TokenizerV2
+  # / mel extraction are all skipped).
+  ./build/chatterbox --model models/chatterbox-t3-turbo.gguf \
+                     --s3gen-gguf models/chatterbox-s3gen.gguf \
+                     --ref-dir voices/me/ \
+                     --text "Anything you want." \
+                     --out  out.wav
+  ```
+
+  You can mix the two: `--ref-dir D --reference-audio X.wav` will load
+  any `.npy` present in `D` and compute the rest from `X.wav`.  Useful
+  during development when you want to iterate on one tensor.
 
 Play the result:
 
@@ -210,9 +240,18 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
   excitation (same text, different voice "take").
 - `--threads N` — override the default `std::thread::hardware_concurrency()`.
   The sweet spot on a 10-core CPU is 10.
+- `--n-gpu-layers N` — move layers to the GPU backend when built with
+  `-DGGML_METAL=ON` / `-DGGML_CUDA=ON` / `-DGGML_VULKAN=ON`.  Pass `99`
+  (or any large number) to move everything.
+- `--reference-audio PATH` — voice cloning input (see the Custom voice
+  section above).
+- `--save-voice DIR` — cache the five voice-conditioning tensors for
+  reuse via `--ref-dir DIR`.
+- `--ref-dir DIR` — load previously-baked voice tensors (or a subset)
+  from `DIR/*.npy`.
 - `--debug` (requires `--ref-dir`) — substitute Python-dumped reference
-  values for the random bits so every stage can be bit-exactly compared to
-  PyTorch.
+  values for the random bits so every stage can be bit-exactly compared
+  to PyTorch.
 
 Typical timings on a 10-core EPYC CPU:
 
@@ -271,23 +310,44 @@ python scripts/reference-t3-turbo.py \
 chatterbox.cpp/
   ggml/                          pristine ggml clone (not tracked)
   src/
-    main.cpp                     CLI + T3 runtime      (chatterbox)
-    chatterbox_tts.cpp           S3Gen + HiFT pipeline (linked into chatterbox)
+    main.cpp                     CLI + T3 runtime            (chatterbox)
+    chatterbox_tts.cpp           S3Gen + HiFT pipeline       (linked into chatterbox)
     s3gen_pipeline.h             public API for the S3Gen+HiFT back half
-    mel2wav.cpp                  HiFT-only demo        (mel2wav)
-    test_s3gen.cpp               staged validation     (test-s3gen)
+    mel2wav.cpp                  HiFT-only demo              (mel2wav)
     gpt2_bpe.{h,cpp}             self-contained GPT-2 BPE tokenizer
-    npy.h                        minimal .npy loader + compare helpers
+
+    voice_features.{h,cpp}       WAV I/O, sinc resampler, LUFS meter,
+                                   24 kHz & 16 kHz log-mel extraction,
+                                   Kaldi-style 80-ch fbank
+    voice_encoder.{h,cpp}        3-layer LSTM → 256-d speaker_emb
+                                   (matches Resemble VoiceEncoder)
+    campplus.{h,cpp}              FunASR x-vector port (FCM + 3× CAMDense
+                                   TDNN) → 192-d embedding
+    s3tokenizer.{h,cpp}          6-layer FSMN-attn transformer + FSQ →
+                                   25-Hz speech tokens
+    dr_wav.h                     vendored single-header WAV reader
+    npy.h                        minimal .npy load / save + compare
+
+    test_*.cpp                   per-stage numerical-parity harnesses
   scripts/
     synthesize.sh                text → wav wrapper
-    convert-t3-turbo-to-gguf.py  T3 weights + conds → GGUF
-    convert-s3gen-to-gguf.py     flow (encoder + CFM) + HiFT → GGUF
-    dump-s3gen-reference.py      PyTorch → .npy intermediates
+    convert-t3-turbo-to-gguf.py  T3 weights + tokenizer + VE + builtin
+                                   voice → T3 GGUF
+    convert-s3gen-to-gguf.py     S3Gen encoder + CFM + HiFT + CAMPPlus +
+                                   S3TokenizerV2 + mel filterbanks →
+                                   S3Gen GGUF
+    dump-*-reference.py          PyTorch → .npy intermediates for the
+                                   per-stage harnesses
     reference-t3-turbo.py        PyTorch T3 bit-exact compare vs C++
     compare-tokenizer.py         10-case BPE tokenizer compare vs HF
+  patches/
+    ggml-metal-chatterbox-ops.patch  ggml-metal fixes (see patches/README.md)
+    README.md                    applies-to / what-it-does notes
+  voices/                        baked voice profiles (not tracked; populated
+                                   by --save-voice)
   models/                        generated GGUFs (not tracked)
-  artifacts/s3gen-ref/           generated .npy reference tensors (not tracked)
-  CMakeLists.txt                 top-level build: add_subdirectory(ggml) + 3 targets
+  artifacts/                     .npy dumps for validation (not tracked)
+  CMakeLists.txt                 top-level build
   README.md                      this file
   PROGRESS.md                    chronological development journal
 ```

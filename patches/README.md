@@ -1,18 +1,31 @@
 # ggml patches for Chatterbox
 
-`ggml` is vendored as a fresh upstream clone (see the top-level README), so
-any fixes we need in it live here as standalone patches and are applied
-after the clone.
+`ggml` is vendored as a pristine upstream clone (see the top-level
+[`README.md`](../README.md)), so any fixes we need in it live here as
+standalone patches and are applied after the clone.
+
+Only the Metal backend currently needs a patch. CPU / CUDA / Vulkan
+builds work with stock upstream ggml and can skip this step entirely.
 
 ## Apply
 
 ```bash
-# From the repo root, after cloning upstream ggml into ./ggml
-cd ggml
-git apply ../patches/ggml-metal-chatterbox-ops.patch
-cd ..
-# then rebuild as usual
+# From the repo root, after cloning upstream ggml into ./ggml.
+(cd ggml && git apply ../patches/ggml-metal-chatterbox-ops.patch)
+
+# Then configure + build as usual.  To enable Metal:
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
+cmake --build build -j$(sysctl -n hw.ncpu)
 ```
+
+To confirm the patch applied cleanly:
+
+```bash
+(cd ggml && git status --short)
+# Expected: three modified files under ggml/src/ggml-metal/
+```
+
+Skip the `git apply` step on Linux or when building CPU-only.
 
 ## `ggml-metal-chatterbox-ops.patch`
 
@@ -29,14 +42,24 @@ on Metal:
 
 Measured on M3 Ultra, `hift_decode` at HiFT-realistic shapes:
 - Before: ~15 000 ms
-- After:    ~350 ms (≈ 40× speedup; end-to-end `gen_RTF` goes from unusable → 0.19 on F16)
+- After:    ~350 ms (≈ 40× speedup; end-to-end `gen_RTF` goes from
+  unusable → 0.19 on F16)
 
-Correctness is validated against the ggml CPU backend by
-`build/test-metal-ops` (added in the parent repo).
+Correctness is validated against the ggml CPU backend by the
+`test-metal-ops` binary built in the parent repo (Metal builds only).
+Run it after rebuilding:
+
+```bash
+./build/test-metal-ops
+# Expected: "diag_mask_inf / pad_ext / conv_transpose_1d: PASS"
+```
 
 ## Dropping the patch
 
 If upstream ggml merges equivalent fixes, delete the patch file and
-remove the `git apply` step from the build instructions. The C++ side
-of Chatterbox already uses ops supported by every backend, so nothing
-else needs to change.
+remove the `git apply` step from the build instructions.  The C++ side
+of Chatterbox uses only ops supported by every backend, so nothing else
+needs to change.
+
+No patch is needed for CPU / CUDA / Vulkan — those backends already
+handle every op Chatterbox emits.
