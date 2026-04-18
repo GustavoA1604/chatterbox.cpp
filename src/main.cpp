@@ -504,17 +504,25 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         }
         return true;
     }
+    // Bake-only mode: just save the 5 voice tensors and exit.
+    const bool bake_only = !params.save_voice_dir.empty()
+                        && !params.reference_audio.empty()
+                        && params.text.empty()
+                        && params.tokens_file.empty();
     // If we're only doing the S3Gen+HiFT back half (user already has speech tokens),
     // --model (T3) is optional; otherwise it's required.
     const bool skip_t3 = !params.s3gen_gguf.empty() && !params.tokens_file.empty() && params.text.empty();
-    if (!skip_t3 && params.model.empty()) {
-        fprintf(stderr, "error: --model is required (pass --s3gen-gguf + --tokens-file to skip T3)\n");
+    if (!skip_t3 && !bake_only && params.model.empty()) {
+        fprintf(stderr, "error: --model is required (pass --s3gen-gguf + --tokens-file to skip T3, "
+                        "or --save-voice + --reference-audio to bake only)\n");
         return false;
     }
-    if (params.text.empty() && params.tokens_file.empty()) {
-        fprintf(stderr, "error: either --text or --tokens-file is required\n"); return false;
+    if (!bake_only && params.text.empty() && params.tokens_file.empty()) {
+        fprintf(stderr, "error: either --text or --tokens-file is required (or --save-voice + "
+                        "--reference-audio to bake a voice profile without synthesising)\n");
+        return false;
     }
-    if (!params.s3gen_gguf.empty() && params.out_wav.empty()) {
+    if (!params.s3gen_gguf.empty() && !bake_only && params.out_wav.empty()) {
         fprintf(stderr, "error: --s3gen-gguf requires --out PATH.wav\n"); return false;
     }
     if (params.debug && params.ref_dir.empty()) {
@@ -1078,6 +1086,69 @@ int main(int argc, char ** argv) {
             if (!validate_reference_audio(params.reference_audio)) return 1;
         }
 
+        // Bake-only mode: user passed --reference-audio + --save-voice but no
+        // text to synthesise.  Compute the five voice tensors, dump them, and
+        // exit.  Later runs can reuse with --ref-dir DIR (no preprocessing).
+        if (!params.save_voice_dir.empty()
+            && !params.reference_audio.empty()
+            && params.text.empty()
+            && params.tokens_file.empty()) {
+            if (params.model.empty() || params.s3gen_gguf.empty()) {
+                fprintf(stderr, "error: --save-voice needs both --model and --s3gen-gguf\n");
+                return 1;
+            }
+            // Peek cond_prompt_len out of the T3 GGUF metadata (no weight load).
+            int cond_prompt_len = 375;  // Turbo default
+            {
+                gguf_init_params gp = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
+                gguf_context * g = gguf_init_from_file(params.model.c_str(), gp);
+                if (g) {
+                    int64_t id = gguf_find_key(g, KEY_COND_PROMPT_LEN);
+                    if (id >= 0) cond_prompt_len = (int)gguf_get_val_u32(g, id);
+                    gguf_free(g);
+                }
+            }
+
+            // (1) speaker_emb via VoiceEncoder.
+            std::vector<float> se_bake;
+            {
+                voice_encoder_weights vew;
+                if (voice_encoder_load(params.model, vew)) {
+                    std::vector<float> wav; int sr = 0;
+                    if (!wav_load(params.reference_audio, wav, sr))
+                        throw std::runtime_error("failed to load --reference-audio");
+                    normalise_lufs(wav, sr, -27.0);
+                    if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
+                    if (!voice_encoder_embed(wav, vew, se_bake))
+                        throw std::runtime_error("VoiceEncoder forward failed");
+                }
+            }
+
+            // (2 + 4) cond_prompt_speech_tokens + prompt_token via S3TokenizerV2.
+            std::vector<int32_t> pt_bake, ct_bake;
+            (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
+                                               cond_prompt_len, pt_bake, ct_bake,
+                                               params.n_threads);
+
+            // (3) embedding via CAMPPlus.
+            std::vector<float> emb_bake;
+            (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake);
+
+            // (5) prompt_feat via mel_extract_24k_80.
+            std::vector<float> pf_bake;
+            int pf_rows = 0;
+            (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
+                                             pf_bake, pf_rows);
+
+            save_voice_profile(params.save_voice_dir,
+                               se_bake, ct_bake, emb_bake, pt_bake, pf_bake, pf_rows);
+            fprintf(stderr,
+                "done: voice profile written to %s.  Reuse it with "
+                "--ref-dir %s (no --reference-audio needed).\n",
+                params.save_voice_dir.c_str(), params.save_voice_dir.c_str());
+            return 0;
+        }
+
         // Short-circuit: user gave us speech tokens directly + --s3gen-gguf. Skip T3 entirely.
         if (params.model.empty() && !params.s3gen_gguf.empty() && !params.tokens_file.empty()) {
             std::vector<int32_t> speech_tokens = read_token_file(params.tokens_file);
@@ -1309,6 +1380,17 @@ int main(int argc, char ** argv) {
                                                opts.embedding_override);
                 if (!prompt_token_from_ref.empty()) {
                     opts.prompt_token_override = std::move(prompt_token_from_ref);
+                }
+
+                // Optionally persist the five voice tensors to disk so later
+                // runs can reuse them via --ref-dir DIR (no --reference-audio).
+                if (!params.save_voice_dir.empty()) {
+                    save_voice_profile(params.save_voice_dir,
+                                       se_data, ct_data,
+                                       opts.embedding_override,
+                                       opts.prompt_token_override,
+                                       opts.prompt_feat_override,
+                                       opts.prompt_feat_rows_override);
                 }
             }
             int rc = s3gen_synthesize_to_wav(generated, opts);
