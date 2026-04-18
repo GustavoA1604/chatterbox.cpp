@@ -1268,26 +1268,12 @@ int s3gen_synthesize_to_wav(
     fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
     fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
 
-    // Metal backend currently makes HiFT decode ~100x slower than CPU because
-    // the conv_transpose_1d upsample kernels and some of the reshape-heavy
-    // residual blocks either fall back op-by-op or hit a pathological shader
-    // path.  Encoder + CFM are fine on Metal; HiFT/F0/STFT are the pain.
-    // Workaround: load a second CPU copy of the S3Gen GGUF and run the
-    // HiFT-side graphs there.  ~1 GB extra memory, but we stay fast end-to-end.
-    // CUDA / Vulkan don't need this (they run HiFT quickly).
-#ifdef GGML_USE_METAL
-    const bool hift_on_cpu = ggml_backend_is_metal(m.backend);
-#else
-    const bool hift_on_cpu = false;
-#endif
-    model_ctx m_hift_storage;
-    if (hift_on_cpu) {
-        fprintf(stderr, "  loading CPU copy of S3Gen for HiFT (Metal conv_transpose_1d workaround)...\n");
-        double t_cpu0 = now_ms();
-        m_hift_storage = load_s3gen_gguf(gguf_path, /*n_gpu_layers=*/0);
-        fprintf(stderr, "  HiFT CPU copy loaded (%.1f ms)\n", now_ms() - t_cpu0);
-    }
-    const model_ctx & m_hift = hift_on_cpu ? m_hift_storage : m;
+    // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
+    // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
+    // pad_ext and diag_mask_inf were either missing or pathologically slow in
+    // ggml-metal.  After the kernel fixes in ggml/src/ggml-metal/, HiFT runs
+    // on the main backend directly on every platform.
+    const model_ctx & m_hift = m;
 
     // If neither --ref-dir nor any C++ override populated the three
     // conditioning tensors above, pull the built-in voice from the GGUF.

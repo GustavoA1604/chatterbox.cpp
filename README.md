@@ -60,10 +60,20 @@ cd chatterbox.cpp
 # ggml is vendored as a sibling subdirectory
 git clone https://github.com/ggml-org/ggml.git ggml
 
+# Apply our Metal op fixes (diag_mask_inf, pad_ext, faster conv_transpose_1d).
+# Skip this if you're not building with -DGGML_METAL=ON.
+(cd ggml && git apply ../patches/ggml-metal-chatterbox-ops.patch)
+
 # Configure + build every target in one shot.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
+
+To enable GPU acceleration, add the matching backend flag at configure
+time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
+Linux/Windows with a Vulkan loader, or `-DGGML_CUDA=ON` if you have the
+CUDA toolkit. Pass `--n-gpu-layers 99` at runtime to actually use the
+GPU. See `patches/README.md` for what the Metal patch does and why.
 
 This produces the main binary plus a set of per-stage validation harnesses:
 
@@ -79,6 +89,7 @@ This produces the main binary plus a set of per-stage validation harnesses:
 | `build/test-campplus`         | CAMPPlus 192-d embedding parity |
 | `build/test-voice-embedding`  | wav → fbank → CAMPPlus end-to-end parity |
 | `build/test-s3tokenizer`      | S3TokenizerV2 log-mel + speech-token parity |
+| `build/test-metal-ops`        | Metal-only: parity check for `diag_mask_inf`, `pad_ext`, and fast `conv_transpose_1d` (only useful when built with `-DGGML_METAL=ON`) |
 
 You'll normally only need `build/chatterbox`; the `test-*` binaries are
 there for the staged-verification methodology in `PROGRESS.md`.

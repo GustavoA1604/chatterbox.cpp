@@ -91,6 +91,14 @@ add_executable(test-s3tokenizer
 target_link_libraries(test-s3tokenizer PRIVATE ggml)
 target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
 
+# Metal kernel validation: diag_mask_inf + pad with front padding.
+add_executable(test-metal-ops src/test_metal_ops.cpp)
+target_link_libraries(test-metal-ops PRIVATE ggml)
+target_include_directories(test-metal-ops PRIVATE ggml/include src)
+if (GGML_METAL)
+    target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
+endif()
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()
