@@ -852,7 +852,10 @@ int main(int argc, char ** argv) {
 
         // Load model first so we can use the GGUF-embedded tokenizer (if any).
         chatterbox_model model;
+        const int64_t _t3_load_t0 = ggml_time_us();
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
+        const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
+        fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
         // Voice-profile override on the T3 side.  We resolve two tensors
         // independently:
@@ -979,6 +982,7 @@ int main(int argc, char ** argv) {
         std::mt19937 rng(params.seed);
         std::vector<float> logits;
         int prompt_len = 0;
+        const int64_t _t3_infer_t0 = ggml_time_us();
         if (!eval_prompt(model, allocr, params.n_threads, text_tokens, logits, prompt_len))
             throw std::runtime_error("prompt eval failed");
 
@@ -1001,6 +1005,10 @@ int main(int argc, char ** argv) {
 
         if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
             generated.pop_back();
+
+        const int64_t _t3_infer_ms = (ggml_time_us() - _t3_infer_t0) / 1000;
+        fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
+                (long long)_t3_infer_ms, generated.size());
 
         if (!params.output.empty()) write_token_file(params.output, generated);
 

@@ -1194,7 +1194,9 @@ int s3gen_synthesize_to_wav(
     fprintf(stderr, "Loading %s\n", gguf_path.c_str());
     double load_t0 = now_ms();
     model_ctx m = load_s3gen_gguf(gguf_path);
-    fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), now_ms() - load_t0);
+    const double load_ms = now_ms() - load_t0;
+    fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
+    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
 
     // If no --ref-dir, pull the built-in voice from the GGUF.
     if (ref_dir.empty()) {
@@ -1484,6 +1486,7 @@ int s3gen_synthesize_to_wav(
 
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
+    fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
     fprintf(stderr, "\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
             pipeline_total, audio_ms,
             pipeline_total / audio_ms,
