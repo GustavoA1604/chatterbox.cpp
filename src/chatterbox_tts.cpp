@@ -84,43 +84,45 @@ struct model_ctx {
     std::map<std::string, ggml_tensor*> tensors;
 };
 
-static ggml_backend_t s3gen_init_backend(int n_gpu_layers) {
+static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_cuda_init(0);
-        if (b) { fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
+        if (b) { if (verbose) fprintf(stderr, "s3gen: using CUDA backend\n"); return b; }
     }
 #endif
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
-        if (b) { fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
+        if (b) { if (verbose) fprintf(stderr, "s3gen: using Metal backend\n"); return b; }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_vk_init(0);
         if (b) {
-            char desc[256] = {0};
-            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-            fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
+            if (verbose) {
+                char desc[256] = {0};
+                ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+                fprintf(stderr, "s3gen: using Vulkan backend (device 0: %s)\n", desc);
+            }
             return b;
         }
     }
 #endif
     auto * b = ggml_backend_cpu_init();
     if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
-    fprintf(stderr, "s3gen: using CPU backend\n");
+    if (verbose) fprintf(stderr, "s3gen: using CPU backend\n");
     return b;
 }
 
-static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers) {
+static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gp = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * g = gguf_init_from_file(path.c_str(), gp);
     if (!g) throw std::runtime_error("gguf_init_from_file failed: " + path);
-    m.backend = s3gen_init_backend(n_gpu_layers);
+    m.backend = s3gen_init_backend(n_gpu_layers, verbose);
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
@@ -1291,10 +1293,10 @@ int s3gen_synthesize_to_wav(
 
     vlog("Loading %s\n", gguf_path.c_str());
     double load_t0 = now_ms();
-    model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers);
+    model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers, verbose);
     const double load_ms = now_ms() - load_t0;
     vlog("  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
-    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
+    if (verbose) fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
     // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
@@ -1700,7 +1702,7 @@ int s3gen_synthesize_to_wav(
 
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
-    fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
+    if (verbose) fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
     fprintf(stderr, "\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
             pipeline_total, audio_ms,
             pipeline_total / audio_ms,

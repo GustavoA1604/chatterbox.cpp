@@ -584,33 +584,41 @@ static ggml_tensor * require_tensor(const chatterbox_model & m, const char * nam
 // Backend init
 // --------------------------------------------------------------------------
 
+// Verbose flag: set once in main() before any ggml init so helpers
+// below (init_backend, load_model_gguf) can gate their startup prints on it.
+// 0 = quiet, 1 = --verbose mode.
+static int g_log_verbose = 0;
+
 static ggml_backend_t init_backend(int n_gpu_layers) {
+    const bool v = g_log_verbose != 0;
 #ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_cuda_init(0);
-        if (b) { fprintf(stderr, "%s: using CUDA backend\n", __func__); return b; }
+        if (b) { if (v) fprintf(stderr, "%s: using CUDA backend\n", __func__); return b; }
     }
 #endif
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_metal_init();
-        if (b) { fprintf(stderr, "%s: using Metal backend\n", __func__); return b; }
+        if (b) { if (v) fprintf(stderr, "%s: using Metal backend\n", __func__); return b; }
     }
 #endif
 #ifdef GGML_USE_VULKAN
     if (n_gpu_layers > 0) {
         auto * b = ggml_backend_vk_init(0);
         if (b) {
-            char desc[256] = {0};
-            ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
-            fprintf(stderr, "%s: using Vulkan backend (device 0: %s)\n", __func__, desc);
+            if (v) {
+                char desc[256] = {0};
+                ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
+                fprintf(stderr, "%s: using Vulkan backend (device 0: %s)\n", __func__, desc);
+            }
             return b;
         }
     }
 #endif
     auto * b = ggml_backend_cpu_init();
     if (!b) throw std::runtime_error("ggml_backend_cpu_init() failed");
-    fprintf(stderr, "%s: using CPU backend\n", __func__);
+    if (v) fprintf(stderr, "%s: using CPU backend\n", __func__);
     return b;
 }
 
@@ -696,10 +704,10 @@ static bool load_model_gguf(const std::string & path, chatterbox_model & model, 
         model.memory_v = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, n_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
 
-        fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
+        if (g_log_verbose) fprintf(stderr, "%s: ctx=%d embd=%d layers=%d heads=%d text_vocab=%d speech_vocab=%d cond_prompt=%d\n",
                 __func__, hp.n_ctx, hp.n_embd, hp.n_layer, hp.n_head,
                 hp.n_text_vocab, hp.n_speech_vocab, hp.cond_prompt_len);
-        fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
+        if (g_log_verbose) fprintf(stderr, "%s: weights=%.2f MB  KV=%.2f MB\n", __func__,
                 ggml_backend_buffer_get_size(model.buffer_w) / (1024.0*1024.0),
                 ggml_backend_buffer_get_size(model.buffer_kv) / (1024.0*1024.0));
 
@@ -718,7 +726,7 @@ static bool load_model_gguf(const std::string & path, chatterbox_model & model, 
                 for (size_t i = 0; i < n_mer; ++i) {
                     model.tok_merges.emplace_back(gguf_get_arr_str(gguf_ctx, mer_kid, i));
                 }
-                fprintf(stderr, "%s: tokenizer embedded (%zu tokens, %zu merges)\n",
+                if (g_log_verbose) fprintf(stderr, "%s: tokenizer embedded (%zu tokens, %zu merges)\n",
                         __func__, n_tok, n_mer);
             } else {
                 fprintf(stderr, "%s: no embedded tokenizer; --tokenizer-dir will be required for --text\n",
@@ -1078,10 +1086,27 @@ static int32_t sample_next_token(
 // Main
 // --------------------------------------------------------------------------
 
+// Log filter: when --verbose is off, drop everything below ERROR.  This
+// silences ggml-metal's per-kernel "compiling pipeline" spam, ggml_vulkan's
+// device enumeration, ggml-metal's "tensor API disabled" one-liner, etc. —
+// none of which a non-debugging user cares about.  Errors still go through
+// so real failures are never hidden.
+// (g_log_verbose is declared near init_backend; see above.)
+static void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*ud*/) {
+    if (g_log_verbose || level >= GGML_LOG_LEVEL_ERROR) {
+        fputs(text, stderr);
+    }
+}
+
 int main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }
+
+    // Apply the log filter BEFORE any ggml_backend_*_init() runs, otherwise
+    // Metal / Vulkan device-init messages leak out.
+    g_log_verbose = params.verbose ? 1 : 0;
+    ggml_log_set(chatterbox_log_cb, nullptr);
 
     try {
         // Early preflight: if the user supplied --reference-audio, make sure
@@ -1135,7 +1160,7 @@ int main(int argc, char ** argv) {
                     if (!voice_encoder_embed(wav, vew, vc_backend, se_bake))
                         throw std::runtime_error("VoiceEncoder forward failed");
                 }
-                fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (2 + 4) cond_prompt_speech_tokens + prompt_token via S3TokenizerV2.
@@ -1146,7 +1171,7 @@ int main(int argc, char ** argv) {
                                                    cond_prompt_len, pt_bake, ct_bake,
                                                    params.n_threads, vc_backend,
                                                    params.verbose);
-                fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (3) embedding via CAMPPlus.
@@ -1155,7 +1180,7 @@ int main(int argc, char ** argv) {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
                                                emb_bake, vc_backend, params.verbose);
-                fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (5) prompt_feat via mel_extract_24k_80.
@@ -1165,7 +1190,7 @@ int main(int argc, char ** argv) {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                  pf_bake, pf_rows, params.verbose);
-                fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             save_voice_profile(params.save_voice_dir,
@@ -1221,7 +1246,7 @@ int main(int argc, char ** argv) {
         const int64_t _t3_load_t0 = ggml_time_us();
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
         const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
-        fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
+        if (params.verbose) fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
         // Voice-profile override on the T3 side.  We resolve two tensors
         // independently:
@@ -1255,7 +1280,7 @@ int main(int argc, char ** argv) {
         if (!have_se && !params.reference_audio.empty()) {
             voice_encoder_weights vew;
             if (voice_encoder_load(params.model, vew)) {
-                fprintf(stderr, "voice_encoder: computing speaker_emb from %s\n",
+                if (params.verbose) fprintf(stderr, "voice_encoder: computing speaker_emb from %s\n",
                         params.reference_audio.c_str());
                 std::vector<float> wav;
                 int sr = 0;
@@ -1325,7 +1350,7 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if (have_se || have_ct) {
+        if ((have_se || have_ct) && params.verbose) {
             fprintf(stderr,
                 "%s: T3 voice override — speaker_emb=%s, cond_prompt_tokens=%s\n",
                 __func__,
@@ -1398,7 +1423,7 @@ int main(int argc, char ** argv) {
             generated.pop_back();
 
         const int64_t _t3_infer_ms = (ggml_time_us() - _t3_infer_t0) / 1000;
-        fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
+        if (params.verbose) fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
                 (long long)_t3_infer_ms, generated.size());
 
         if (!params.output.empty()) write_token_file(params.output, generated);
