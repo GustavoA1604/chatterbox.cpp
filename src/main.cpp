@@ -72,6 +72,21 @@ static void stream_write_wav(const std::string & path, const std::vector<float> 
     }
 }
 
+// Emit a chunk of float samples to stdout as raw 16-bit little-endian PCM
+// and flush so downstream players hear it immediately (stdio buffers would
+// otherwise hold up to 4-8 KB, stalling real-time playback at chunk
+// boundaries).  Used by `--out -` streaming mode; callers pipe into e.g.
+// `ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -`.
+static void stream_emit_pcm_stdout(const std::vector<float> & wav) {
+    for (float v : wav) {
+        int s = (int)std::lround(v * 32767.0f);
+        if (s > 32767) s = 32767; if (s < -32768) s = -32768;
+        int16_t s16 = (int16_t)s;
+        std::fwrite(&s16, sizeof(s16), 1, stdout);
+    }
+    std::fflush(stdout);
+}
+
 static bool validate_reference_audio(const std::string & path) {
     std::vector<float> wav;
     int sr = 0;
@@ -214,7 +229,7 @@ static bool compute_embedding_native(const std::string & wav_path,
     for (int t = 0; t < T; ++t)
         for (int c = 0; c < 80; ++c) fbank[(size_t)t * 80 + c] -= col_mean[c];
 
-    if (!campplus_embed(fbank, T, w, out_emb)) return false;
+    if (!campplus_embed(fbank, T, w, /*backend=*/nullptr, out_emb)) return false;
     fprintf(stderr, "voice: embedding shape=(%zu,) via CAMPPlus (%d fbank frames)\n",
             out_emb.size(), T);
     return true;
@@ -477,6 +492,9 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "\n");
     fprintf(stderr, "  --s3gen-gguf PATH       Enables the full text -> wav pipeline (S3Gen + HiFT).\n");
     fprintf(stderr, "  --out PATH              Output wav file when --s3gen-gguf is set.\n");
+    fprintf(stderr, "                          Use `--out -` together with --stream-chunk-tokens to\n");
+    fprintf(stderr, "                          pipe raw s16le mono @ 24 kHz to stdout as each chunk\n");
+    fprintf(stderr, "                          is ready (for live playback, e.g. `| ffplay -f s16le`).\n");
     fprintf(stderr, "  --ref-dir DIR           Override built-in voice with embedding.npy /\n");
     fprintf(stderr, "                          prompt_token.npy / prompt_feat.npy from DIR, plus\n");
     fprintf(stderr, "                          T3 speaker_emb.npy / cond_prompt_speech_tokens.npy.\n");
@@ -1505,13 +1523,22 @@ int main(int argc, char ** argv) {
                 std::vector<float> streamed_wav;
                 int prev_mels_emitted = 0;
 
-                const std::string base = params.out_wav;
+                // `--out -` is the live-streaming mode: emit each chunk's
+                // PCM to stdout as it's produced (no per-chunk wav files
+                // left behind, no final concatenated wav — the consumer
+                // pipes stdout straight into a player).  Otherwise we
+                // write chunk_KK.wav next to --out and concat at the end.
+                const bool to_stdout = (params.out_wav == "-");
+                const std::string base = to_stdout
+                    ? std::string("/tmp/chatterbox_stream")
+                    : params.out_wav;
                 std::string base_noext = base;
                 if (base_noext.size() > 4 && base_noext.substr(base_noext.size()-4) == ".wav")
                     base_noext.resize(base_noext.size()-4);
 
-                fprintf(stderr, "\n=== streaming synthesis: %d chunks of %d tokens ===\n",
-                        (int)boundaries.size() - 1, chunk_n);
+                fprintf(stderr, "\n=== streaming synthesis: %d chunks of %d tokens%s ===\n",
+                        (int)boundaries.size() - 1, chunk_n,
+                        to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
                 const double stream_t0_ms = 1e-3 * ggml_time_us();
                 double first_chunk_t_ms = -1.0;
 
@@ -1541,15 +1568,27 @@ int main(int argc, char ** argv) {
                     if (first_chunk_t_ms < 0.0)
                         first_chunk_t_ms = 1e-3 * ggml_time_us() - stream_t0_ms;
 
-                    // Read back the per-chunk wav (16-bit PCM @ 24 kHz) and
-                    // append to the streamed buffer.
-                    std::ifstream wf(copts.out_wav_path, std::ios::binary);
-                    if (wf) {
-                        char hdr[44]; wf.read(hdr, 44);
-                        int16_t s16;
-                        while (wf.read((char*)&s16, 2))
-                            streamed_wav.push_back((float)s16 / 32768.0f);
+                    // Read back the per-chunk wav (16-bit PCM @ 24 kHz)
+                    // produced by s3gen_synthesize_to_wav.  In stdout mode
+                    // we also pipe the samples straight to stdout as raw
+                    // s16le and delete the temp file so nothing is left
+                    // behind; in file-output mode we keep the chunk wavs
+                    // next to --out and concatenate at the end.
+                    std::vector<float> chunk_pcm;
+                    {
+                        std::ifstream wf(copts.out_wav_path, std::ios::binary);
+                        if (wf) {
+                            char hdr[44]; wf.read(hdr, 44);
+                            int16_t s16;
+                            while (wf.read((char*)&s16, 2))
+                                chunk_pcm.push_back((float)s16 / 32768.0f);
+                        }
                     }
+                    if (to_stdout) {
+                        stream_emit_pcm_stdout(chunk_pcm);
+                        std::remove(copts.out_wav_path.c_str());
+                    }
+                    streamed_wav.insert(streamed_wav.end(), chunk_pcm.begin(), chunk_pcm.end());
                     hift_cache_source = std::move(tail_out);
 
                     // The number of mel frames emitted by this chunk equals
@@ -1562,14 +1601,19 @@ int main(int argc, char ** argv) {
                     last_streamed = streamed_wav.size();
                 }
 
-                // Write the concatenated streamed wav to --out.
-                stream_write_wav(params.out_wav, streamed_wav, 24000);
+                // Write the concatenated streamed wav to --out (skip in
+                // stdout mode — we already emitted the PCM live).
+                if (!to_stdout)
+                    stream_write_wav(params.out_wav, streamed_wav, 24000);
                 fprintf(stderr, "\n=== streaming done: %zu samples (%.3fs), first-chunk latency=%.1f ms, total=%.1f ms ===\n",
                         streamed_wav.size(),
                         (float)streamed_wav.size() / 24000.0f,
                         first_chunk_t_ms,
                         1e-3 * ggml_time_us() - stream_t0_ms);
-                fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
+                if (to_stdout)
+                    fprintf(stderr, "Streamed to stdout (raw s16le @ 24 kHz mono)\n");
+                else
+                    fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
             }
         } else {
             // Legacy: print the tokens to stdout too (handy for piping).

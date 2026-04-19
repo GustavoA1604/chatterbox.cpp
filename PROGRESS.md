@@ -1693,6 +1693,39 @@ duration so the streamer can stay ahead of playback.  Incremental
 encoder / KV-cached CFM stay on the backlog for when someone wants to
 retrain Chatterbox with chunk-causal attention.
 
+##### Phase 3c (live stdout streaming) — ✅ DONE (2026-04-12)
+
+`--out -` emits each chunk's audio as raw 16-bit little-endian PCM
+to stdout the moment it's produced, with an explicit `fflush` after
+every chunk so downstream players receive it immediately (no stdio
+buffering stalls at chunk boundaries).
+
+In stdout mode no `.wav` files are left behind — per-chunk
+intermediate writes go to `/tmp/chatterbox_stream_chunk_KK.wav` and
+are `unlink()`'d right after the bytes hit stdout.  All log output
+stays on stderr so the audio stream is clean.
+
+```bash
+./build/chatterbox \
+  --model models/chatterbox-t3-turbo.gguf \
+  --s3gen-gguf models/chatterbox-s3gen.gguf \
+  --text "Testing stdout streaming." \
+  --stream-first-chunk-tokens 10 --stream-chunk-tokens 50 \
+  --stream-cfm-steps 1 \
+  --out - \
+  | ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -
+```
+
+Validation: the PCM emitted to stdout is byte-for-byte identical to
+the file written by the same invocation with a normal `--out
+foo.wav`, checked by loading both and taking a diff (max=0, rms=0).
+
+Why not WAV-header-then-PCM?  A live WAV header needs the total
+sample count up front and we don't know it until the last chunk
+finalises; writing a placeholder then patching after the fact doesn't
+compose with pipe output.  Raw s16le is what `ffplay`, `aplay`,
+`pacat`, `sox` etc. accept natively, so no one loses in practice.
+
 #### B2. Server mode with persistent graphs
 
 Every invocation currently pays ~200–400 ms fixed cost for graph
