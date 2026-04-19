@@ -1108,6 +1108,7 @@ int main(int argc, char ** argv) {
             // (1) speaker_emb via VoiceEncoder.
             std::vector<float> se_bake;
             {
+                const int64_t _t0 = ggml_time_us();
                 voice_encoder_weights vew;
                 if (voice_encoder_load(params.model, vew)) {
                     std::vector<float> wav; int sr = 0;
@@ -1118,23 +1119,36 @@ int main(int argc, char ** argv) {
                     if (!voice_encoder_embed(wav, vew, se_bake))
                         throw std::runtime_error("VoiceEncoder forward failed");
                 }
+                fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (2 + 4) cond_prompt_speech_tokens + prompt_token via S3TokenizerV2.
             std::vector<int32_t> pt_bake, ct_bake;
-            (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
-                                               cond_prompt_len, pt_bake, ct_bake,
-                                               params.n_threads);
+            {
+                const int64_t _t0 = ggml_time_us();
+                (void)compute_speech_tokens_native(params.reference_audio, params.s3gen_gguf,
+                                                   cond_prompt_len, pt_bake, ct_bake,
+                                                   params.n_threads);
+                fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+            }
 
             // (3) embedding via CAMPPlus.
             std::vector<float> emb_bake;
-            (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake);
+            {
+                const int64_t _t0 = ggml_time_us();
+                (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf, emb_bake);
+                fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+            }
 
             // (5) prompt_feat via mel_extract_24k_80.
             std::vector<float> pf_bake;
             int pf_rows = 0;
-            (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
-                                             pf_bake, pf_rows);
+            {
+                const int64_t _t0 = ggml_time_us();
+                (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
+                                                 pf_bake, pf_rows);
+                fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+            }
 
             save_voice_profile(params.save_voice_dir,
                                se_bake, ct_bake, emb_bake, pt_bake, pf_bake, pf_rows);
