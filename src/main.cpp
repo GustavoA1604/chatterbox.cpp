@@ -1105,7 +1105,13 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            // (1) speaker_emb via VoiceEncoder.
+            // Voice-cloning preprocessing shares a backend: on Mac we pick
+            // Metal, on Linux + NVIDIA we pick CUDA / Vulkan.  Falls back to
+            // the ggml-cpu NEON/AVX kernels when n_gpu_layers == 0.
+            ggml_backend_t vc_backend = init_backend(params.n_gpu_layers);
+
+            // (1) speaker_emb via VoiceEncoder (3-layer LSTM + proj + L2-norm
+            //     on the chosen backend).
             std::vector<float> se_bake;
             {
                 const int64_t _t0 = ggml_time_us();
@@ -1116,7 +1122,7 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("failed to load --reference-audio");
                     normalise_lufs(wav, sr, -27.0);
                     if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
-                    if (!voice_encoder_embed(wav, vew, se_bake))
+                    if (!voice_encoder_embed(wav, vew, vc_backend, se_bake))
                         throw std::runtime_error("VoiceEncoder forward failed");
                 }
                 fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
@@ -1156,6 +1162,7 @@ int main(int argc, char ** argv) {
                 "done: voice profile written to %s.  Reuse it with "
                 "--ref-dir %s (no --reference-audio needed).\n",
                 params.save_voice_dir.c_str(), params.save_voice_dir.c_str());
+            ggml_backend_free(vc_backend);
             return 0;
         }
 
@@ -1237,7 +1244,9 @@ int main(int argc, char ** argv) {
                     throw std::runtime_error("failed to load --reference-audio for VoiceEncoder");
                 normalise_lufs(wav, sr, -27.0);
                 if (sr != 16000) wav = resample_sinc(wav, sr, 16000);
-                if (!voice_encoder_embed(wav, vew, se_data))
+                // Reuse the T3 backend — already loaded & sitting on the GPU
+                // at this point in the flow.
+                if (!voice_encoder_embed(wav, vew, model.backend, se_data))
                     throw std::runtime_error("VoiceEncoder forward failed");
                 have_se = true;
             } else {
