@@ -257,6 +257,24 @@ def main() -> None:
         captured_mu["mu"] = out.detach().clone().cpu()
     _mu_hook_handle = tts.s3gen.flow.encoder_proj.register_forward_hook(_enc_proj_hook)
 
+    # Also hook flow_matching.forward so we can capture the EXACT tensors
+    # the decoder sees: mu, mask, spks, cond.  If any of these diverge from
+    # what the C++ port constructs, per-chunk mel will drift even with
+    # identical z0.
+    captured_decoder = {"mu": None, "mask": None, "spks": None, "cond": None}
+    _orig_decoder_forward = tts.s3gen.flow.decoder.forward
+    def _decoder_forward_capture(mu, mask, n_timesteps, temperature=1.0,
+                                  spks=None, cond=None, noised_mels=None,
+                                  meanflow=False):
+        captured_decoder["mu"]   = mu.detach().clone().cpu()
+        captured_decoder["mask"] = mask.detach().clone().cpu()
+        captured_decoder["spks"] = None if spks is None else spks.detach().clone().cpu()
+        captured_decoder["cond"] = None if cond is None else cond.detach().clone().cpu()
+        return _orig_decoder_forward(mu, mask, n_timesteps, temperature=temperature,
+                                     spks=spks, cond=cond, noised_mels=noised_mels,
+                                     meanflow=meanflow)
+    tts.s3gen.flow.decoder.forward = _decoder_forward_capture
+
     for k, end in enumerate(boundaries[1:], start=1):
         is_last = (end == n_speech)
         tokens_so_far = speech_tokens[:end]
@@ -281,9 +299,16 @@ def main() -> None:
             z_np = captured_z["z"].squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_cfm_z.npy", np.ascontiguousarray(z_np))
         if captured_mu["mu"] is not None:
-            # encoder_proj output shape: (1, T_mu, 80).  Save as (T_mu, 80).
             mu_np = captured_mu["mu"].squeeze(0).numpy().astype(np.float32)
             np.save(args.out / f"chunk_{k:02d}_mu.npy", np.ascontiguousarray(mu_np))
+        # decoder input tensors — shapes follow flow_matching.forward's
+        # convention of (B, 80, T_mu) for mu/cond, (B, 1, T_mu) for mask,
+        # (B, emb_dim) for spks.
+        for name in ("mu", "mask", "spks", "cond"):
+            t = captured_decoder[name]
+            if t is None: continue
+            arr = t.squeeze(0).numpy().astype(np.float32)
+            np.save(args.out / f"chunk_{k:02d}_dec_{name}.npy", np.ascontiguousarray(arr))
 
         # How many NEW mel frames this chunk produces (beyond the last
         # chunk's emission):
@@ -335,6 +360,7 @@ def main() -> None:
               f"mels_new={mels_new_count}  wav={len(wav_k_np)} samples")
 
     _mu_hook_handle.remove()
+    tts.s3gen.flow.decoder.forward = _orig_decoder_forward
     np.save(args.out / "streamed_wav.npy", np.ascontiguousarray(streamed_wav))
 
     # Numerical comparison.  We can't expect bit-exact equality: HiFT's

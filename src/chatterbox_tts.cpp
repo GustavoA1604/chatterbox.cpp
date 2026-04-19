@@ -1448,6 +1448,21 @@ int s3gen_synthesize_to_wav(
         for (int t = 0; t < mel_len1; ++t)
             cond[m2 * T_mu + t] = pf_raw[t * MEL + m2];
 
+    // Streaming debug: dump spks + cond so we can compare against Python's
+    // flow.decoder input tensors chunk-by-chunk.
+    if (!opts.dump_mel_path.empty()) {
+        std::string base = opts.dump_mel_path;
+        if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
+            base.resize(base.size() - 4);
+        npy_save_f32(base + "_spks.npy", {MEL}, spks.data());
+        // C++ stores cond in ggml ne=[T_mu, MEL] layout (T_mu innermost) which
+        // Python sees as numpy shape (MEL, T_mu).  Dump in that layout so we
+        // can diff directly against Python's (80, T_mu) decoder-input cond.
+        npy_save_f32(base + "_cond.npy", {MEL, (int64_t)T_mu}, cond.data());
+        fprintf(stderr, "  [stream] dumped spks (%d,) cond (%d, %d) → %s_{spks,cond}.npy\n",
+                MEL, MEL, T_mu, base.c_str());
+    }
+
     if (debug_mode) {
         npy_array ref = npy_load(ref_dir + "/cfm_step0_cond.npy");
         const float * r = (const float*)ref.data.data();
