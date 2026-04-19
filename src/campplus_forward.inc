@@ -260,10 +260,18 @@ static ggml_tensor * fcm_res_block(ggml_context * ctx, ggml_tensor * x,
 
 // CAMDenseTDNN layer.  Takes x (T, C_in) and returns concat[x, cam_out] along
 // the channel axis → (T, C_in + growth).
+//
+// `seg_scale` is a precomputed (1, S, 1) tensor of per-bin 1/count factors
+// for the seg-pool step.  Rather than using ggml_pool_1d (which lacks a
+// Vulkan shader and gives wrong results via the scheduler's CPU fallback),
+// we do pooling via reshape + sum_rows + broadcast multiply, which stays in
+// pure elementwise / reduction ops supported on every backend.
 static ggml_tensor * cam_dense_tdnn_layer(ggml_context * ctx, ggml_tensor * x,
                                           const ve_cam_layer_t & L,
                                           int kernel_size, int dilation, int seg_pool_len,
-                                          int growth, int bn_channels)
+                                          int growth, int bn_channels,
+                                          ggml_tensor * seg_scale,
+                                          int T_pad, int S, int T)
 {
     // nonlinear1 = BN + ReLU on (T, C_in)
     ggml_tensor * y = bn_apply_1d(ctx, x, L.bn1);
@@ -291,16 +299,36 @@ static ggml_tensor * cam_dense_tdnn_layer(ggml_context * ctx, ggml_tensor * x,
     // mean_ctx (1, bn_channels) — ggml_mean reduces ne[0]=T
     ggml_tensor * mean_ctx = ggml_mean(ctx, z);
 
-    // seg_pool_expand: pool along T with kernel=seg_len, stride=seg_len, then
-    // upsample back to T via nearest-neighbour. Input (T, C), pool gives
-    // (T/seg_len, C), interpolate back to (T, C).  ggml_pool_1d expects
-    // ne[0] to be the pooled axis — matches our T-innermost layout.
-    ggml_tensor * pooled = ggml_pool_1d(ctx, z, GGML_OP_POOL_AVG,
-                                         /*k=*/seg_pool_len, /*s=*/seg_pool_len, /*p=*/0);
-    const int T = (int) z->ne[0];
-    ggml_tensor * seg_ctx = ggml_interpolate(ctx, pooled, T, pooled->ne[1],
-                                              pooled->ne[2], pooled->ne[3],
-                                              GGML_SCALE_MODE_NEAREST);
+    // seg_pool_expand, Vulkan-safe reformulation:
+    //
+    //   1. Pad z along the time axis so T becomes T_pad = S * seg_len
+    //      (S = ceil(T / seg_len)).  Requires zero-pad.
+    //   2. Reshape (T_pad, C) → (seg_len, S, C).
+    //   3. Sum across ne[0]=seg_len via ggml_sum_rows  → (1, S, C).
+    //   4. Divide by per-bin count via a (1, S, 1) scale tensor
+    //      precomputed by the host: [1/seg_len, ..., 1/last_bin_size].
+    //   5. Broadcast back to (seg_len, S, C) via ggml_repeat.
+    //   6. Reshape (seg_len, S, C) → (T_pad, C), view first T entries.
+    //
+    // Uses only reshape / pad / sum_rows / mul / repeat, all of which have
+    // native Vulkan kernels.  Avoids ggml_pool_1d (no Vulkan shader; the
+    // scheduler's CPU-fallback copy mangled the output, cos_sim ~ 0.13).
+    const int64_t C_bn = z->ne[1];
+    ggml_tensor * z_pad = z;
+    if (T_pad > T) {
+        z_pad = ggml_pad(ctx, z, T_pad - T, 0, 0, 0);   // [T_pad, C, 1]
+    }
+    ggml_tensor * z_r     = ggml_reshape_3d(ctx, z_pad, seg_pool_len, S, C_bn);
+    ggml_tensor * seg_sum = ggml_sum_rows (ctx, z_r);                         // [1, S, C]
+    ggml_tensor * seg_mean = ggml_mul(ctx, seg_sum, seg_scale);                // [1, S, C] broadcast
+    ggml_tensor * seg_bc  = ggml_repeat (ctx, seg_mean, z_r);                  // [seg_len, S, C]
+    ggml_tensor * seg_flat = ggml_reshape_2d(ctx, seg_bc, T_pad, C_bn);
+    ggml_tensor * seg_ctx;
+    if (T_pad > T) {
+        seg_ctx = ggml_view_2d(ctx, seg_flat, T, C_bn, seg_flat->nb[1], 0);
+    } else {
+        seg_ctx = seg_flat;
+    }
 
     // context = mean_ctx (1, bn_channels) + seg_ctx (T, bn_channels)
     ggml_tensor * context = ggml_add(ctx, seg_ctx, mean_ctx);
@@ -322,12 +350,15 @@ static ggml_tensor * cam_dense_tdnn_layer(ggml_context * ctx, ggml_tensor * x,
 }
 
 static ggml_tensor * build_cam_block(ggml_context * ctx, ggml_tensor * x,
-                                     const ve_cam_block_t & blk, int seg_pool_len)
+                                     const ve_cam_block_t & blk, int seg_pool_len,
+                                     ggml_tensor * seg_scale,
+                                     int T_pad, int S, int T)
 {
     for (int i = 0; i < blk.num_layers; ++i) {
         x = cam_dense_tdnn_layer(ctx, x, blk.layers[i],
                                   blk.kernel_size, blk.dilation, seg_pool_len,
-                                  blk.growth, blk.bn_channels);
+                                  blk.growth, blk.bn_channels,
+                                  seg_scale, T_pad, S, T);
     }
     return x;
 }
@@ -406,6 +437,18 @@ static ggml_cgraph * build_campplus_graph(const campplus_gctx & g, int T) {
     x1 = bn_apply_1d(ctx, x1, g.tdnn_bn);
     x1 = ggml_relu(ctx, x1);
 
+    // Segment-pool geometry: after TDNN (stride 2 along time), T is fixed for
+    // the remainder of the network, so the same seg_scale tensor feeds all 52
+    // CAMDenseTDNN layers across block1 / block2 / block3.
+    const int T_cam   = (int) x1->ne[0];
+    const int S       = (T_cam + g.seg_pool_len - 1) / g.seg_pool_len;
+    const int T_pad   = S * g.seg_pool_len;
+
+    // seg_scale: shape (1, S, 1).  Values are 1/bin_size per bin — full
+    // seg_len for the first S-1 bins and the remainder for the last bin.
+    ggml_tensor * seg_scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, S, 1);
+    ggml_set_name(seg_scale, "seg_scale"); ggml_set_input(seg_scale);
+
     // Block1 + transit1
     // cam_dense_tdnn_layer expects (T, C).  conv1d_f32 returns 3D; we reshape
     // back to 2D before each block to keep shapes consistent.  The block
@@ -413,21 +456,21 @@ static ggml_cgraph * build_campplus_graph(const campplus_gctx & g, int T) {
     x1 = ggml_reshape_3d(ctx, x1, x1->ne[0], x1->ne[1], 1);
     // Block/transit builders expect 3D (T, C, 1) to feed conv1d_f32 and then
     // squeeze to 2D for BN.  We keep it 3D throughout blocks.
-    x1 = build_cam_block (ctx, x1, g.block1, g.seg_pool_len);
+    x1 = build_cam_block (ctx, x1, g.block1, g.seg_pool_len, seg_scale, T_pad, S, T_cam);
     x1 = ggml_reshape_2d(ctx, x1, x1->ne[0], x1->ne[1]);
     x1 = bn_apply_1d    (ctx, x1, g.transit1.bn);
     x1 = ggml_relu      (ctx, x1);
     x1 = ggml_reshape_3d(ctx, x1, x1->ne[0], x1->ne[1], 1);
     x1 = conv1d_f32     (ctx, g.transit1.lin.w, x1, 1, 0, 1);
 
-    x1 = build_cam_block (ctx, x1, g.block2, g.seg_pool_len);
+    x1 = build_cam_block (ctx, x1, g.block2, g.seg_pool_len, seg_scale, T_pad, S, T_cam);
     x1 = ggml_reshape_2d(ctx, x1, x1->ne[0], x1->ne[1]);
     x1 = bn_apply_1d    (ctx, x1, g.transit2.bn);
     x1 = ggml_relu      (ctx, x1);
     x1 = ggml_reshape_3d(ctx, x1, x1->ne[0], x1->ne[1], 1);
     x1 = conv1d_f32     (ctx, g.transit2.lin.w, x1, 1, 0, 1);
 
-    x1 = build_cam_block (ctx, x1, g.block3, g.seg_pool_len);
+    x1 = build_cam_block (ctx, x1, g.block3, g.seg_pool_len, seg_scale, T_pad, S, T_cam);
     x1 = ggml_reshape_2d(ctx, x1, x1->ne[0], x1->ne[1]);
     x1 = bn_apply_1d    (ctx, x1, g.transit3.bn);
     x1 = ggml_relu      (ctx, x1);
@@ -653,19 +696,17 @@ static bool campplus_embed_ggml(const std::vector<float> & fbank_t_by_c, int T,
         return false;
     }
 
-    // Pin CAMPPlus to the ggml-cpu backend: the encoder graph uses
-    // `ggml_pool_1d` for the CAM segment-pool step, which the Vulkan backend
-    // does not implement.  The scheduler's CPU fallback copy for that single
-    // op turned out to produce numerically wrong outputs end-to-end
-    // (cos_sim ~ 0.13 vs Metal / ggml-cpu reference), while ggml-cpu alone is
-    // ~6× faster than the previous scalar+OpenMP path on M3 Ultra (570 ms
-    // vs 3,372 ms) and ~1.1× faster than it on x86-64 + AVX.  Short of a
-    // proper Vulkan pool_1d kernel we prefer correctness over that last 200 ms.
-    (void) backend;
+    // CAMPPlus can now run on any backend: the CAM seg_pool step was
+    // reformulated via reshape + sum_rows + broadcast multiply so no
+    // `ggml_pool_1d` dispatch is needed (that op has no Vulkan shader and
+    // the scheduler's CPU fallback gave cos_sim ~ 0.13 end-to-end).
     campplus_gctx g;
-    g.backend      = ggml_backend_cpu_init();
-    g.owns_backend = true;
-    if (!g.backend) { fprintf(stderr, "campplus_ggml: cpu init failed\n"); return false; }
+    g.backend = backend;
+    if (!g.backend) {
+        g.backend      = ggml_backend_cpu_init();
+        g.owns_backend = true;
+        if (!g.backend) { fprintf(stderr, "campplus_ggml: cpu init failed\n"); return false; }
+    }
 
     if (!declare_weights(g, w)) { campplus_gctx_free(g); return false; }
     if (!upload_weights (g, w)) { campplus_gctx_free(g); return false; }
@@ -683,6 +724,22 @@ static bool campplus_embed_ggml(const std::vector<float> & fbank_t_by_c, int T,
     // flat memory ordering matches the input we were given (T, 80) row-major.
     ggml_tensor * fb = ggml_graph_get_tensor(gf, "fbank");
     upload(fb, fbank_t_by_c.data(), fbank_t_by_c.size() * sizeof(float));
+
+    // Upload seg_scale for the CAM seg_pool.  T_cam is the post-TDNN time
+    // dimension (T/2 since TDNN stride=2).  We rederive it here — staying
+    // consistent with the graph builder — and emit one 1/bin_size value per
+    // bin, with the last bin possibly partial.
+    {
+        const int T_cam = (T + 1) / 2;                       // TDNN stride 2, pad 2
+        const int S     = (T_cam + w.seg_pool_len - 1) / w.seg_pool_len;
+        const int T_pad = S * w.seg_pool_len;
+        std::vector<float> scale((size_t) S);
+        for (int s = 0; s < S - 1; ++s) scale[s] = 1.0f / (float) w.seg_pool_len;
+        scale[S - 1] = 1.0f / (float) (T_cam - (S - 1) * w.seg_pool_len);
+        (void) T_pad;
+        ggml_tensor * ss = ggml_graph_get_tensor(gf, "seg_scale");
+        if (ss) upload(ss, scale.data(), scale.size() * sizeof(float));
+    }
 
     if (ggml_backend_graph_compute(g.backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "campplus_ggml: graph_compute failed\n");
