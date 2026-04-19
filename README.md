@@ -393,3 +393,12 @@ between `std::mt19937` and `torch.rand`).
 **Slower than real-time** — make sure you built `-DCMAKE_BUILD_TYPE=Release`
 and that `--threads` picks up all your cores. The binary defaults to
 `std::thread::hardware_concurrency()`.
+
+## License
+
+Released under the [MIT License](LICENSE) — Copyright (c) 2026 Gianfranco
+Cordella. The bundled `ggml/` is also MIT-licensed
+([ggml/LICENSE](ggml/LICENSE)). The upstream Python implementation
+([Chatterbox](https://github.com/resemble-ai/chatterbox), Copyright (c) 2025
+Resemble AI) is likewise MIT-licensed; see `LICENSE` for the third-party
+attribution block.
