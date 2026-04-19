@@ -46,7 +46,8 @@ target_include_directories(test-voice-features PRIVATE ggml/include src)
 
 add_executable(test-resample
     src/test_resample.cpp
-    src/voice_features.cpp)
+    src/voice_features.cpp
+    src/mel_extract_stft.cpp)
 target_link_libraries(test-resample PRIVATE ggml)
 target_include_directories(test-resample PRIVATE src)
 
