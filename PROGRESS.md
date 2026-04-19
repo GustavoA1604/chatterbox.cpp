@@ -1821,6 +1821,55 @@ Scope: **2–3 days**.
 Impact: for repeated short utterances on the same server, another **20–30 %**
 off wall time on top of the current RTF 0.28.
 
+#### B3. Bake cloned voice into a reusable GGUF
+
+Right now a cloned voice is persisted as five `.npy` files under a
+directory and loaded via `--ref-dir DIR`.  That's convenient during
+development but awkward to share: end users end up with a zip of five
+opaque numpy files plus the C++ binary plus the original
+`chatterbox-s3gen.gguf`.  Most deployments would rather ship **one
+file** — a voice-baked `.gguf` that works with the existing CLI as a
+drop-in replacement for `models/chatterbox-s3gen.gguf`.
+
+Fundamentally the five tensors are already first-class GGUF citizens:
+`s3gen/builtin/embedding`, `s3gen/builtin/prompt_token`,
+`s3gen/builtin/prompt_feat` live inside the base GGUF as-is, and the T3
+side needs `speaker_emb` + `cond_prompt_speech_tokens`.  So "baking a
+voice" is just "rewrite those five tensor slots and copy everything
+else through".
+
+What to add:
+
+- **`--save-model PATH.gguf`** (name tentative) that, combined with
+  `--reference-audio PATH` or `--ref-dir DIR`, writes a new GGUF next
+  to the original `chatterbox-s3gen.gguf` with the five voice tensors
+  replaced.  Bit-identical to the original in every other tensor and
+  metadata entry — just a rewritten `builtin` block.  The two voice
+  tensors that belong on the T3 side (speaker_emb,
+  cond_prompt_speech_tokens) could either live alongside in the same
+  GGUF (preferred: the binary already knows how to look for them under
+  a `s3gen/builtin/` prefix) or produce a matching
+  `chatterbox-t3-turbo.<voice>.gguf` with those two tensors replaced.
+- **Zero runtime overhead once baked.**  Subsequent runs just use the
+  new GGUF path as `--s3gen-gguf` and `--model`; no `--ref-dir`,
+  `--reference-audio` or `.npy` files needed.  The built-in-voice
+  fallback in `chatterbox_tts.cpp` already reads from exactly those
+  tensor names, so there's literally no new load-time code — just the
+  converter.
+- **CLI UX:** `chatterbox --reference-audio voice.wav --save-model
+  alice.gguf --no-synthesize` should be enough to bake once and walk
+  away.  No `--text`, no wav output, just the new GGUFs on disk.
+
+Scope: **~1 day**.  It's essentially a `gguf` re-write helper — read
+the original, iterate tensors, substitute the five voice slots with
+the freshly computed values, copy everything else through.
+`gguf_writer` can do this directly; no new numeric code is needed.
+
+Impact: clean distribution story.  "Here is my voice" becomes a
+single 400 MB file instead of "here is this directory of numpy files
+and you need to know which C++ flag they go behind."  Also opens up
+prebuilt-voice downloads on Hugging Face (cf. C3).
+
 ### Tier C — nice polish, niche
 
 #### C1. Custom fused Conformer attention op (with rel-pos bias)
@@ -1858,11 +1907,12 @@ users).
 
 ### Recommended next-up order
 
-With A1 (voice cloning), A2 (GPU backends) and A3 (T3 quantization)
-done, the remaining high-impact work is:
+With A1 (voice cloning), A2 (GPU backends), A3 (T3 quantization), and
+B1 (streaming) done, the remaining high-impact work is:
 
-1. **B1 — Streaming** (~1 week) → what gets this into interactive apps;
-   currently blocked only by wiring, not correctness.
+1. **B3 — Bake voice into GGUF** (~1 day) → cleanest distribution
+   story for sharing custom voices; makes prebuilt-voice downloads on
+   Hugging Face (C3) actually shippable.
 2. **C3 — CI + prebuilt GGUFs** — pick up before announcing publicly.
 3. **T3 autoregressive speedup** (speculative decoding, or a smaller T3
    draft model). Biggest chunk of wall time left on both Metal and
