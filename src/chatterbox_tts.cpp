@@ -43,6 +43,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -133,6 +134,25 @@ static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
 }  // namespace
 
+// Release any cached model_ctx (frees its backend buffer, ggml context and
+// backend).  Must run before the ggml-metal / ggml-cuda / ggml-vulkan dylib
+// tears down its static device list; otherwise their static destructors hit
+// a "rsets->data count != 0" assert (residency sets still referenced by an
+// orphan backend buffer).  We register it with atexit() on first cache
+// insertion so it runs before process-exit dylib finalisers.
+static void s3gen_model_cache_release() {
+    std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    if (!g_s3gen_cache_entry) return;
+    model_ctx * m = g_s3gen_cache_entry->m.get();
+    if (m) {
+        if (m->buffer_w) { ggml_backend_buffer_free(m->buffer_w); m->buffer_w = nullptr; }
+        if (m->ctx_w)    { ggml_free(m->ctx_w);                   m->ctx_w    = nullptr; }
+        if (m->backend)  { ggml_backend_free(m->backend);         m->backend  = nullptr; }
+        m->tensors.clear();
+    }
+    g_s3gen_cache_entry.reset();
+}
+
 static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_layers) {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
     if (g_s3gen_cache_entry &&
@@ -150,6 +170,16 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
     fprintf(stderr, "  %zu tensors loaded (%.1f ms)\n", m->tensors.size(), g_s3gen_cache_last_load_ms);
     g_s3gen_cache_entry = std::make_unique<s3gen_cache_entry>(
         s3gen_cache_entry{path, n_gpu_layers, std::move(m)});
+
+    // Register the release on first insertion.  atexit() handlers run in
+    // LIFO and execute before any static destructors in DSOs loaded *after*
+    // this point — which on macOS / Linux is how we avoid Metal's device
+    // teardown assert on process exit.
+    static bool registered = false;
+    if (!registered) {
+        std::atexit(s3gen_model_cache_release);
+        registered = true;
+    }
     return g_s3gen_cache_entry->m.get();
 }
 
