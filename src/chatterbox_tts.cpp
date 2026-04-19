@@ -1252,14 +1252,21 @@ int s3gen_synthesize_to_wav(
 
     fprintf(stderr, "Speech tokens: %zu\n", speech_tokens.size());
 
-    // Trim tokens >= vocab_size and append 3 silence tokens (S3GEN_SIL=4299)
+    // Trim tokens >= vocab_size.  In batch / last-chunk (`finalize=true`) we
+    // append 3 S3GEN_SIL lookahead tokens to give the encoder right-context
+    // for the true ending.  For streaming chunks (`finalize=false`) we skip
+    // that: the lookahead will come from real speech tokens in the next
+    // chunk, and we'll trim the 6 mel frames corresponding to the pre-
+    // lookahead window right after CFM.
     const int32_t S3GEN_SIL = 4299;
     const int32_t VOCAB_SIZE = 6561;
     std::vector<int32_t> padded;
     for (int32_t t : speech_tokens) {
         if (t >= 0 && t < VOCAB_SIZE) padded.push_back(t);
     }
-    for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
+    if (opts.append_lookahead_silence) {
+        for (int i = 0; i < pre_lookahead_len; ++i) padded.push_back(S3GEN_SIL);
+    }
 
     fprintf(stderr, "Loading %s\n", gguf_path.c_str());
     double load_t0 = now_ms();
@@ -1512,15 +1519,56 @@ int s3gen_synthesize_to_wav(
     }
     fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
-    // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1)
-    int T_mel = T_mu - mel_len1;
-    fprintf(stderr, "Mel slicing: T_mu=%d mel_len1=%d -> T_mel=%d\n", T_mu, mel_len1, T_mel);
+    // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1).
+    //
+    // For streaming (finalize=false), also drop the last
+    //   pre_lookahead_len * token_mel_ratio = 3 * 2 = 6 mel frames
+    // — these aren't "safe" yet (they'd change once the next chunk's tokens
+    // provide more right-context).  Matches the trim in Python
+    // CausalMaskedDiffWithXvec.inference(..., finalize=False).
+    // Beyond-prompt mel span: starts at mel_len1 in z, ends at T_mu.  For
+    // streaming (finalize=false) we drop the tail `pre_lookahead_len *
+    // token_mel_ratio = 6` frames (they aren't safe yet).  Then we skip
+    // the first `skip_mel_frames` frames (mels already emitted on prior
+    // chunks).
+    int T_mel_full = T_mu - mel_len1;
+    const int TOKEN_MEL_RATIO = 2;
+    if (!opts.finalize) {
+        const int trim = pre_lookahead_len * TOKEN_MEL_RATIO;  // 6
+        if (T_mel_full > trim) T_mel_full -= trim;
+        else {
+            fprintf(stderr, "error: streaming chunk too short (T_mel_full=%d ≤ trim=%d)\n",
+                    T_mel_full, trim);
+            return 1;
+        }
+    }
+    int skip = opts.skip_mel_frames;
+    if (skip < 0) skip = 0;
+    if (skip > T_mel_full) {
+        fprintf(stderr, "error: skip_mel_frames=%d > T_mel_full=%d\n", skip, T_mel_full);
+        return 1;
+    }
+    int T_mel = T_mel_full - skip;
+    fprintf(stderr, "Mel slicing: T_mu=%d mel_len1=%d full=%d skip=%d -> T_mel=%d  "
+                    "(finalize=%s, pad_silence=%s)\n",
+            T_mu, mel_len1, T_mel_full, skip, T_mel,
+            opts.finalize ? "true" : "false",
+            opts.append_lookahead_silence ? "true" : "false");
     std::vector<float> mel(MEL * T_mel);
-    // ggml layout: z ne=[T_mu, MEL]; slice T axis [mel_len1, T_mu) -> keep MEL channels
-    // mel ne=[T_mel, MEL]: mel[m * T_mel + t] = z[m * T_mu + (t + mel_len1)]
+    // z has shape ne=[T_mu, MEL]; grab the slice [mel_len1 + skip, mel_len1 + skip + T_mel).
+    const int mel_off = mel_len1 + skip;
     for (int m2 = 0; m2 < MEL; ++m2)
         for (int t = 0; t < T_mel; ++t)
-            mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_len1)];
+            mel[m2 * T_mel + t] = z[m2 * T_mu + (t + mel_off)];
+
+    if (!opts.dump_mel_path.empty()) {
+        std::vector<float> mel_tn((size_t)T_mel * MEL);
+        for (int t = 0; t < T_mel; ++t)
+            for (int m2 = 0; m2 < MEL; ++m2)
+                mel_tn[(size_t)t * MEL + m2] = mel[(size_t)m2 * T_mel + t];
+        npy_save_f32(opts.dump_mel_path, {(int64_t)T_mel, MEL}, mel_tn.data());
+        fprintf(stderr, "  dumped mel (%d, %d) → %s\n", T_mel, MEL, opts.dump_mel_path.c_str());
+    }
 
     if (debug_mode) {
         npy_array ref_mel = npy_load(ref_dir + "/mel_output.npy");

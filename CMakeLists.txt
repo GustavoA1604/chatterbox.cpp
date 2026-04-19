@@ -91,6 +91,13 @@ add_executable(test-s3tokenizer
 target_link_libraries(test-s3tokenizer PRIVATE ggml)
 target_include_directories(test-s3tokenizer PRIVATE ggml/include src)
 
+# Streaming port (PROGRESS.md B1): per-chunk mel comparison against Python dumps.
+add_executable(test-streaming
+    src/test_streaming.cpp
+    src/chatterbox_tts.cpp)
+target_link_libraries(test-streaming PRIVATE ggml)
+target_include_directories(test-streaming PRIVATE ggml/include src)
+
 # Metal kernel validation: diag_mask_inf + pad with front padding.
 add_executable(test-metal-ops src/test_metal_ops.cpp)
 target_link_libraries(test-metal-ops PRIVATE ggml)

@@ -49,6 +49,40 @@ struct s3gen_synthesize_opts {
     // cannot be initialised.  The actual layer count is not yet used for split
     // offload; any positive value enables the GPU path.
     int  n_gpu_layers = 0;
+
+    // ---------------- streaming support (PROGRESS.md B1) ----------------
+    //
+    // Controls for chunked / streaming synthesis.  Defaults preserve the
+    // original batch behaviour, so non-streaming callers can ignore them.
+    //
+    //   finalize                    mirrors Python's flow.inference(finalize).
+    //                               When false, drop the last
+    //                               `pre_lookahead_len * token_mel_ratio = 6`
+    //                               mel frames from CFM output — they'll be
+    //                               re-emitted on the next chunk with more
+    //                               right-context.
+    //
+    //   append_lookahead_silence    whether to auto-pad `speech_tokens` with
+    //                               3 S3GEN_SIL tokens before running the
+    //                               encoder.  Streaming callers handle the
+    //                               silence at the full-sequence level (once
+    //                               at the end of the last chunk), so they
+    //                               set this to false; batch callers leave
+    //                               it true.
+    //
+    //   skip_mel_frames             offset into the "beyond-prompt" CFM mel
+    //                               output.  Streaming caller sets this to
+    //                               `mels_emitted_so_far` so each chunk
+    //                               returns only the *new* mel frames it
+    //                               contributes.  Defaults to 0.
+    bool finalize                  = true;
+    bool append_lookahead_silence  = true;
+    int  skip_mel_frames           = 0;
+
+    // Debug hook: if non-empty, dump the post-CFM mel (shape (T_mel_effective, 80)
+    // as float32) to this path.  Used by the streaming validation harness
+    // to compare each chunk's C++ mel against Python's chunk_{k}_mels_new.npy.
+    std::string dump_mel_path;
 };
 
 // Runs encoder + CFM + HiFT on the given T3 speech tokens and writes a WAV.

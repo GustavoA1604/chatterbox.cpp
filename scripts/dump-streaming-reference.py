@@ -166,6 +166,20 @@ def main() -> None:
     np.save(args.out / "speech_tokens.npy",
             np.ascontiguousarray(speech_tokens.cpu().numpy().astype(np.int32)))
 
+    # Also dump the voice profile (what the C++ --ref-dir path expects) so a
+    # single --ref-dir points at everything the pipeline needs: voice + text
+    # tokens + chunk-by-chunk ground truth.
+    np.save(args.out / "speaker_emb.npy",
+            np.ascontiguousarray(cond_t3.speaker_emb.detach().squeeze().cpu().numpy().astype(np.float32)))
+    np.save(args.out / "cond_prompt_speech_tokens.npy",
+            np.ascontiguousarray(cond_t3.cond_prompt_speech_tokens.detach().squeeze().cpu().numpy().astype(np.int32)))
+    np.save(args.out / "embedding.npy",
+            np.ascontiguousarray(cond_gen["embedding"].detach().squeeze().cpu().numpy().astype(np.float32)))
+    np.save(args.out / "prompt_token.npy",
+            np.ascontiguousarray(cond_gen["prompt_token"].detach().squeeze().cpu().numpy().astype(np.int32)))
+    np.save(args.out / "prompt_feat.npy",
+            np.ascontiguousarray(cond_gen["prompt_feat"].detach().squeeze().cpu().numpy().astype(np.float32)))
+
     # ---------- Step 2: batch reference (non-streamed) ----------
     print("[2/3] batch (non-streamed) reference")
     with torch.no_grad():
