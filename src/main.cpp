@@ -1160,7 +1160,7 @@ int main(int argc, char ** argv) {
                     if (!voice_encoder_embed(wav, vew, vc_backend, se_bake))
                         throw std::runtime_error("VoiceEncoder forward failed");
                 }
-                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                fprintf(stderr, "BENCH: VC_STAGE_speaker_emb_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (2 + 4) cond_prompt_speech_tokens + prompt_token via S3TokenizerV2.
@@ -1171,7 +1171,7 @@ int main(int argc, char ** argv) {
                                                    cond_prompt_len, pt_bake, ct_bake,
                                                    params.n_threads, vc_backend,
                                                    params.verbose);
-                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                fprintf(stderr, "BENCH: VC_STAGE_s3tokenizer_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (3) embedding via CAMPPlus.
@@ -1180,7 +1180,7 @@ int main(int argc, char ** argv) {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_embedding_native(params.reference_audio, params.s3gen_gguf,
                                                emb_bake, vc_backend, params.verbose);
-                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                fprintf(stderr, "BENCH: VC_STAGE_campplus_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             // (5) prompt_feat via mel_extract_24k_80.
@@ -1190,7 +1190,7 @@ int main(int argc, char ** argv) {
                 const int64_t _t0 = ggml_time_us();
                 (void)compute_prompt_feat_native(params.reference_audio, params.s3gen_gguf,
                                                  pf_bake, pf_rows, params.verbose);
-                if (params.verbose) fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
+                fprintf(stderr, "BENCH: VC_STAGE_prompt_feat_ms=%lld\n", (long long)((ggml_time_us() - _t0)/1000));
             }
 
             save_voice_profile(params.save_voice_dir,
@@ -1246,7 +1246,7 @@ int main(int argc, char ** argv) {
         const int64_t _t3_load_t0 = ggml_time_us();
         if (!load_model_gguf(params.model, model, params.n_ctx, params.n_gpu_layers)) return 1;
         const int64_t _t3_load_ms = (ggml_time_us() - _t3_load_t0) / 1000;
-        if (params.verbose) fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
+        fprintf(stderr, "BENCH: T3_LOAD_MS=%lld\n", (long long)_t3_load_ms);
 
         // Voice-profile override on the T3 side.  We resolve two tensors
         // independently:
@@ -1423,7 +1423,7 @@ int main(int argc, char ** argv) {
             generated.pop_back();
 
         const int64_t _t3_infer_ms = (ggml_time_us() - _t3_infer_t0) / 1000;
-        if (params.verbose) fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
+        fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
                 (long long)_t3_infer_ms, generated.size());
 
         if (!params.output.empty()) write_token_file(params.output, generated);

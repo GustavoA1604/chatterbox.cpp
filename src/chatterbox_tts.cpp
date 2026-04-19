@@ -1296,7 +1296,7 @@ int s3gen_synthesize_to_wav(
     model_ctx m = load_s3gen_gguf(gguf_path, opts.n_gpu_layers, verbose);
     const double load_ms = now_ms() - load_t0;
     vlog("  %zu tensors loaded (%.1f ms)\n", m.tensors.size(), load_ms);
-    if (verbose) fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
+    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
     // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
@@ -1367,7 +1367,7 @@ int s3gen_synthesize_to_wav(
     vlog("Running encoder (T=%d)...\n", n_total);
     double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
-    vlog("  [encoder] %.1f ms\n", now_ms() - encoder_t0);
+    fprintf(stderr, "  [encoder] %.1f ms\n", now_ms() - encoder_t0);
     int T_mu = 2 * n_total;
     vlog("  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
@@ -1584,7 +1584,7 @@ int s3gen_synthesize_to_wav(
 
         double step_t0 = now_ms();
         auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
-        vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
+        fprintf(stderr, "  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
         if (debug_mode) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
@@ -1607,7 +1607,7 @@ int s3gen_synthesize_to_wav(
 
         for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
     }
-    vlog("  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
+    fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
     // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1).
     //
@@ -1669,7 +1669,7 @@ int s3gen_synthesize_to_wav(
     vlog("Running f0_predictor...\n");
     double t0 = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel);
-    vlog("  [f0_predictor] %.1f ms\n", now_ms() - t0);
+    fprintf(stderr, "  [f0_predictor] %.1f ms\n", now_ms() - t0);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1685,24 +1685,24 @@ int s3gen_synthesize_to_wav(
     float l_linear_b;
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
-    vlog("  [sinegen] %.1f ms\n", now_ms() - t0);
+    fprintf(stderr, "  [sinegen] %.1f ms\n", now_ms() - t0);
 
     vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
-    vlog("  [stft] %.1f ms\n", now_ms() - t0);
+    fprintf(stderr, "  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
 
     vlog("Running HiFT decode...\n");
     t0 = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
-    vlog("  [hift_decode] %.1f ms\n", now_ms() - t0);
-    vlog("  [hift_total] %.1f ms\n", now_ms() - hift_t0);
+    fprintf(stderr, "  [hift_decode] %.1f ms\n", now_ms() - t0);
+    fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
-    if (verbose) fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
+    fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
     fprintf(stderr, "\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
             pipeline_total, audio_ms,
             pipeline_total / audio_ms,
