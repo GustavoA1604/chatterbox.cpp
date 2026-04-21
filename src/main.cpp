@@ -33,7 +33,8 @@
 #include <thread>
 #include <vector>
 
-#include "s3gen_pipeline.h"
+#include "qvac-tts/qvac-tts.h"
+#include "qvac-tts/chatterbox/s3gen_pipeline.h"
 #include "npy.h"
 #include "voice_features.h"
 #include "voice_encoder.h"
@@ -1327,7 +1328,7 @@ static void chatterbox_log_cb(ggml_log_level level, const char * text, void * /*
     }
 }
 
-int main(int argc, char ** argv) {
+int qvac_tts_cli_main(int argc, char ** argv) {
     ggml_time_init();
     cli_params params;
     if (!parse_args(argc, argv, params)) { print_usage(argv[0]); return 1; }

@@ -1262,7 +1262,7 @@ static std::vector<int32_t> read_tokens_file(const std::string & path) {
 // s3gen GGUF) and writes a 24 kHz wav.
 // ============================================================================
 
-#include "s3gen_pipeline.h"
+#include "qvac-tts/chatterbox/s3gen_pipeline.h"
 
 int s3gen_synthesize_to_wav(
     const std::vector<int32_t> & speech_tokens,

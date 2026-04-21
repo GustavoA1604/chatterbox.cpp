@@ -4,7 +4,7 @@
 // HiFT vocoder. Takes T3-generated speech tokens + reference voice conditioning
 // and writes a 24 kHz WAV.
 //
-// Implementation in src/s3gen_pipeline.cpp.
+// Implementation in src/chatterbox_tts.cpp.
 
 #include <cstdint>
 #include <string>
