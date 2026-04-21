@@ -1829,7 +1829,7 @@ int s3gen_synthesize_to_wav(
 
 int s3gen_preload(const std::string & s3gen_gguf_path, int n_gpu_layers) {
     try {
-        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers);
+        (void)s3gen_model_cache_get(s3gen_gguf_path, n_gpu_layers, /*verbose=*/false);
         return 0;
     } catch (const std::exception & e) {
         fprintf(stderr, "s3gen_preload: %s\n", e.what());
