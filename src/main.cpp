@@ -1671,13 +1671,25 @@ int main(int argc, char ** argv) {
         // The KV cache is indexed by position, so calling eval_prompt again
         // simply overwrites positions 0..prompt_len of the cache — no
         // explicit reset needed between segments.
+        // T3 autoregressive decode is interleaved *per segment* with S3Gen
+        // below — each segment's T3 runs immediately before its own S3Gen
+        // call, not all up-front.  This gives low first-audio-out latency
+        // (T3(seg0) + first S3Gen chunk ≈ 2–3 s regardless of paragraph
+        // length) while avoiding GPU contention from running T3 and S3Gen
+        // concurrently on the same device (which doubled per-chunk wall
+        // time on Metal when we tried a concurrent background-thread T3).
+        //
+        // The per-segment T3 loop is wrapped in this closure so both the
+        // batch and streaming S3Gen branches can call it uniformly.
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         std::mt19937 rng(params.seed);
-        std::vector<std::vector<int32_t>> seg_generated;
-        seg_generated.reserve(seg_text_tokens.size());
-        size_t total_t3_tokens = 0;
-        const int64_t _t3_infer_t0 = ggml_time_us();
-        for (size_t si = 0; si < seg_text_tokens.size(); ++si) {
+        const size_t N_SEG = seg_text_tokens.size();
+        std::vector<std::vector<int32_t>> seg_generated(N_SEG);
+        size_t t3_tokens_total = 0;
+        int64_t t3_total_ms    = 0;
+
+        auto run_t3_for_segment = [&](size_t si) {
+            const int64_t _t0 = ggml_time_us();
             std::vector<float> logits;
             int prompt_len = 0;
             if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
@@ -1703,19 +1715,25 @@ int main(int argc, char ** argv) {
             if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
                 generated.pop_back();
 
-            total_t3_tokens += generated.size();
             if (multi_seg) {
                 fprintf(stderr, "  [t3 segment %zu/%zu] %zu speech tokens\n",
-                        si + 1, seg_text_tokens.size(), generated.size());
+                        si + 1, N_SEG, generated.size());
             }
-            seg_generated.push_back(std::move(generated));
+            t3_tokens_total += generated.size();
+            t3_total_ms     += (ggml_time_us() - _t0) / 1000;
+            seg_generated[si] = std::move(generated);
+        };
+
+        // Legacy --output tokens file: run T3 on the first segment early and
+        // dump its tokens.  Downstream S3Gen for that same segment will
+        // reuse seg_generated[0] without re-running T3.
+        if (!params.output.empty()) {
+            run_t3_for_segment(0);
+            write_token_file(params.output, seg_generated[0]);
         }
-
-        const int64_t _t3_infer_ms = (ggml_time_us() - _t3_infer_t0) / 1000;
-        fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
-                (long long)_t3_infer_ms, total_t3_tokens);
-
-        if (!params.output.empty()) write_token_file(params.output, seg_generated.front());
+        std::vector<bool> seg_t3_done(N_SEG, false);
+        if (!params.output.empty()) seg_t3_done[0] = true;
+        auto ensure_t3 = [&](size_t si) { if (!seg_t3_done[si]) { run_t3_for_segment(si); seg_t3_done[si] = true; } };
 
         // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
         if (!params.s3gen_gguf.empty()) {
@@ -1759,7 +1777,8 @@ int main(int argc, char ** argv) {
             if (params.stream_chunk_tokens <= 0 && !multi_seg) {
                 // Single-shot: let s3gen_synthesize_to_wav write the wav
                 // directly and print its own "Wrote ..." line.
-                int rc = s3gen_synthesize_to_wav(seg_generated.front(), opts);
+                ensure_t3(0);
+                int rc = s3gen_synthesize_to_wav(seg_generated[0], opts);
                 if (rc != 0) return rc;
             } else if (params.stream_chunk_tokens <= 0) {
                 // Auto-split multi-segment batch mode: render each segment
@@ -1768,13 +1787,14 @@ int main(int argc, char ** argv) {
                 const int sr = opts.sr ? opts.sr : 24000;
                 std::vector<float> full_pcm;
                 const int64_t _seg_t0 = ggml_time_us();
-                for (size_t si = 0; si < seg_generated.size(); ++si) {
+                for (size_t si = 0; si < N_SEG; ++si) {
+                    ensure_t3(si);
                     s3gen_synthesize_opts copts = opts;
                     std::vector<float> seg_pcm;
                     copts.out_wav_path = "";
                     copts.pcm_out      = &seg_pcm;
                     fprintf(stderr, "\n--- segment %zu/%zu: %zu speech tokens ---\n",
-                            si + 1, seg_generated.size(), seg_generated[si].size());
+                            si + 1, N_SEG, seg_generated[si].size());
                     int rc = s3gen_synthesize_to_wav(seg_generated[si], copts);
                     if (rc != 0) return rc;
                     append_pcm_crossfade(full_pcm, seg_pcm, sr, params.crossfade_ms);
@@ -1783,7 +1803,7 @@ int main(int argc, char ** argv) {
                 const double audio_ms = 1000.0 * (double)full_pcm.size() / (double)sr;
                 fprintf(stderr,
                         "\n=== auto-split: %zu segments, %.0f ms for %.0f ms audio (RTF=%.2f) ===\n",
-                        seg_generated.size(), seg_total_ms, audio_ms,
+                        N_SEG, seg_total_ms, audio_ms,
                         audio_ms > 0.0 ? seg_total_ms / audio_ms : 0.0);
                 stream_write_wav(params.out_wav, full_pcm, sr);
                 fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
@@ -1816,7 +1836,7 @@ int main(int argc, char ** argv) {
 
                 if (multi_seg) {
                     fprintf(stderr, "\n=== streaming synthesis: %zu segments, %d-token chunks%s ===\n",
-                            seg_generated.size(), chunk_n,
+                            N_SEG, chunk_n,
                             to_stdout ? " → stdout (raw s16le @ 24 kHz mono)" : "");
                 } else {
                     fprintf(stderr, "\n=== streaming synthesis: %d-token chunks%s ===\n",
@@ -1829,7 +1849,8 @@ int main(int argc, char ** argv) {
                 double first_chunk_t_ms = -1.0;
                 int global_chunk_idx = 0;
 
-                for (size_t si = 0; si < seg_generated.size(); ++si) {
+                for (size_t si = 0; si < N_SEG; ++si) {
+                    ensure_t3(si);
                     std::vector<int32_t> seg_toks = seg_generated[si];
                     seg_toks.push_back(S3GEN_SIL);
                     seg_toks.push_back(S3GEN_SIL);
@@ -1852,7 +1873,7 @@ int main(int argc, char ** argv) {
 
                     if (multi_seg) {
                         fprintf(stderr, "\n[segment %zu/%zu: %d tokens → %d chunks]\n",
-                                si + 1, seg_generated.size(), total_n,
+                                si + 1, N_SEG, total_n,
                                 (int)boundaries.size() - 1);
                     }
 
@@ -1920,10 +1941,14 @@ int main(int argc, char ** argv) {
             // Legacy: print the tokens to stdout too (handy for piping).
             // In auto-split mode this prints the first segment's tokens only;
             // real callers who want all segments pass --s3gen-gguf and --out.
-            const auto & toks = seg_generated.front();
+            ensure_t3(0);
+            const auto & toks = seg_generated[0];
             for (size_t i = 0; i < toks.size(); ++i) { if (i) printf(","); printf("%d", toks[i]); }
             printf("\n");
         }
+
+        fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
+                (long long)t3_total_ms, t3_tokens_total);
 
         ggml_gallocr_free(allocr);
         ggml_backend_buffer_free(model.buffer_w);
