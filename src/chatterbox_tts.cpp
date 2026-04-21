@@ -1373,7 +1373,14 @@ int s3gen_synthesize_to_wav(
     // n_gpu_layers) so switching backends still works.  Verbose gates the
     // banner prints but the BENCH line always goes out for perf checks.
     model_ctx & m = *s3gen_model_cache_get(gguf_path, opts.n_gpu_layers, verbose);
-    fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", s3gen_model_cache_last_load_ms());
+    {
+        const double load_ms = s3gen_model_cache_last_load_ms();
+        // Only emit the BENCH line on an actual GGUF load — on cache hits
+        // the value is always 0 and repeating it per chunk adds noise.
+        if (load_ms > 0.0 || verbose) {
+            fprintf(stderr, "BENCH: S3GEN_LOAD_MS=%.0f\n", load_ms);
+        }
+    }
 
     // HiFT-side graphs (f0_predictor, STFT, hift_decode) used to need a
     // dedicated CPU copy of the S3Gen GGUF on Metal because conv_transpose_1d,
@@ -1444,7 +1451,7 @@ int s3gen_synthesize_to_wav(
     vlog("Running encoder (T=%d)...\n", n_total);
     double encoder_t0 = now_ms();
     std::vector<float> mu_T = run_encoder(m, input_embed, n_total, D);
-    fprintf(stderr, "  [encoder] %.1f ms\n", now_ms() - encoder_t0);
+    vlog("  [encoder] %.1f ms\n", now_ms() - encoder_t0);
     int T_mu = 2 * n_total;
     vlog("  encoder output: (%d, 80) = %zu floats\n", T_mu, mu_T.size());
 
@@ -1463,7 +1470,7 @@ int s3gen_synthesize_to_wav(
         }
         T_mu -= trim;
         mu_T.resize((size_t)T_mu * MEL);  // numpy layout (T_mu, 80): drop last `trim` rows
-        fprintf(stderr, "  streaming: trimmed %d mel frames -> T_mu=%d\n", trim, T_mu);
+        vlog("  streaming: trimmed %d mel frames -> T_mu=%d\n", trim, T_mu);
     }
 
     if (debug_mode) {
@@ -1668,7 +1675,7 @@ int s3gen_synthesize_to_wav(
 
         double step_t0 = now_ms();
         auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
-        fprintf(stderr, "  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
+        vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
         if (debug_mode) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
@@ -1691,7 +1698,7 @@ int s3gen_synthesize_to_wav(
 
         for (size_t i = 0; i < z.size(); ++i) z[i] = z[i] + dt * dxdt[i];
     }
-    fprintf(stderr, "  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
+    vlog("  [cfm_total] %.1f ms\n", now_ms() - cfm_t0);
 
     // 8) Slice mel = z[:, mel_len1:] -> shape (80, T_mu - mel_len1).
     //
@@ -1753,7 +1760,7 @@ int s3gen_synthesize_to_wav(
     vlog("Running f0_predictor...\n");
     double t0 = now_ms();
     auto f0 = run_f0_predictor(m_hift, mel, T_mel);
-    fprintf(stderr, "  [f0_predictor] %.1f ms\n", now_ms() - t0);
+    vlog("  [f0_predictor] %.1f ms\n", now_ms() - t0);
     int upsample = 8 * 5 * 3 * 4;
     int T_wav = T_mel * upsample;
     std::vector<float> f0_up(T_wav);
@@ -1769,7 +1776,7 @@ int s3gen_synthesize_to_wav(
     float l_linear_b;
     ggml_backend_tensor_get(llb, &l_linear_b, 0, sizeof(float));
     auto src = sinegen_source(f0_up, sr, 8, 0.1f, 0.003f, 10.0f, l_linear_w, l_linear_b, (uint32_t)(seed + 1));
-    fprintf(stderr, "  [sinegen] %.1f ms\n", now_ms() - t0);
+    vlog("  [sinegen] %.1f ms\n", now_ms() - t0);
 
     // Streaming: splice in the previous chunk's source tail so the F0 phase
     // (and hence the vocoded waveform) stays continuous at the chunk seam.
@@ -1790,14 +1797,14 @@ int s3gen_synthesize_to_wav(
     vlog("Running STFT...\n");
     t0 = now_ms();
     auto s_stft = run_stft(m_hift, src);
-    fprintf(stderr, "  [stft] %.1f ms\n", now_ms() - t0);
+    vlog("  [stft] %.1f ms\n", now_ms() - t0);
     int T_stft = (int)(s_stft.size() / 18);
 
     vlog("Running HiFT decode...\n");
     t0 = now_ms();
     auto wav = run_hift_decode(m_hift, mel, T_mel, s_stft, T_stft);
-    fprintf(stderr, "  [hift_decode] %.1f ms\n", now_ms() - t0);
-    fprintf(stderr, "  [hift_total] %.1f ms\n", now_ms() - hift_t0);
+    vlog("  [hift_decode] %.1f ms\n", now_ms() - t0);
+    vlog("  [hift_total] %.1f ms\n", now_ms() - hift_t0);
     vlog("  wav: %zu samples (%.3fs @ %d Hz)\n", wav.size(), (float)wav.size() / sr, sr);
 
     // First-chunk / batch-mode: apply raised-cosine fade-in to mask HiFT's
@@ -1820,11 +1827,11 @@ int s3gen_synthesize_to_wav(
     double pipeline_total = now_ms() - pipeline_t0;
     double audio_ms = 1000.0 * wav.size() / sr;
     fprintf(stderr, "BENCH: S3GEN_INFER_MS=%.0f AUDIO_MS=%.0f\n", pipeline_total, audio_ms);
-    fprintf(stderr, "\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
-            pipeline_total, audio_ms,
-            pipeline_total / audio_ms,
-            audio_ms / pipeline_total >= 1.0 ? audio_ms / pipeline_total : pipeline_total / audio_ms,
-            audio_ms >= pipeline_total ? "faster than real-time" : "slower than real-time");
+    vlog("\n=== pipeline: %.1f ms for %.1f ms of audio (RTF=%.2f, %.1fx %s) ===\n",
+         pipeline_total, audio_ms,
+         pipeline_total / audio_ms,
+         audio_ms / pipeline_total >= 1.0 ? audio_ms / pipeline_total : pipeline_total / audio_ms,
+         audio_ms >= pipeline_total ? "faster than real-time" : "slower than real-time");
 
     if (opts.pcm_out) {
         *opts.pcm_out = wav;

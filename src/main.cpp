@@ -1960,10 +1960,12 @@ int main(int argc, char ** argv) {
                         copts.cfm_steps                 = params.stream_cfm_steps;
 
                         ++global_chunk_idx;
-                        fprintf(stderr, "\n--- %schunk %d/%d: tokens_total=%d finalize=%s ---\n",
-                                multi_seg ? "seg " : "",
-                                k, (int)boundaries.size() - 1, end,
-                                is_last_in_seg ? "true" : "false");
+                        if (params.verbose) {
+                            fprintf(stderr, "\n--- %schunk %d/%d: tokens_total=%d finalize=%s ---\n",
+                                    multi_seg ? "seg " : "",
+                                    k, (int)boundaries.size() - 1, end,
+                                    is_last_in_seg ? "true" : "false");
+                        }
                         int rc = s3gen_synthesize_to_wav(toks, copts);
                         if (rc != 0) return rc;
 
