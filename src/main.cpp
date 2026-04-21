@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -85,6 +86,134 @@ static void stream_emit_pcm_stdout(const std::vector<float> & wav) {
         std::fwrite(&s16, sizeof(s16), 1, stdout);
     }
     std::fflush(stdout);
+}
+
+// Split `text` into TTS-friendly segments of at most `max_chars` characters.
+//
+// Motivation: Chatterbox Turbo's T3 was trained on utterances of 5–15 s and
+// degrades (prosody drift, hallucinated phonemes, timbre wandering) on much
+// longer autoregressive outputs.  Reproducible on every backend (ggml / ONNX
+// / upstream Python).  The only reliable fix is sentence-level segmentation
+// above the model.
+//
+// The splitter does three passes:
+//   1. Break at `. ? !` followed by whitespace / EOF.
+//   2. For any sentence longer than `max_chars`, break further at `, : ;`
+//      (preferring boundaries past max_chars/2 so we don't fragment into
+//      unpronouncable stubs).  Last-resort: hard-break every max_chars.
+//   3. Greedily merge consecutive short fragments forward while their
+//      combined length stays <= max_chars, so very short sentences ride
+//      with their neighbours rather than stand alone.
+//
+// Abbreviations like "e.g." are not treated specially; in practice the
+// greedy merge pass absorbs false splits on them back into the next segment.
+static std::vector<std::string> split_text_for_tts(const std::string & text, int max_chars) {
+    std::vector<std::string> out;
+    if (text.empty() || max_chars <= 0) { out.push_back(text); return out; }
+
+    auto is_ws = [](unsigned char c) { return std::isspace(c) != 0; };
+
+    // Pass 1: sentence split.
+    std::vector<std::string> sentences;
+    {
+        std::string cur;
+        size_t i = 0;
+        while (i < text.size()) {
+            cur += text[i];
+            const char c = text[i];
+            const bool at_end = (i + 1 == text.size());
+            const bool nx_ws  = !at_end && is_ws((unsigned char)text[i + 1]);
+            if ((c == '.' || c == '?' || c == '!') && (at_end || nx_ws)) {
+                size_t j = i + 1;
+                while (j < text.size() && is_ws((unsigned char)text[j])) { cur += text[j]; ++j; }
+                sentences.push_back(cur);
+                cur.clear();
+                i = j;
+            } else {
+                ++i;
+            }
+        }
+        if (!cur.empty()) sentences.push_back(cur);
+    }
+
+    // Pass 2: refine any sentence longer than max_chars.
+    std::vector<std::string> refined;
+    refined.reserve(sentences.size());
+    for (auto & s : sentences) {
+        if ((int)s.size() <= max_chars) { refined.push_back(std::move(s)); continue; }
+        std::string acc;
+        size_t k = 0;
+        while (k < s.size()) {
+            acc += s[k];
+            const char c = s[k];
+            const bool nx_ws = (k + 1 < s.size()) && is_ws((unsigned char)s[k + 1]);
+            const bool soft_break = (c == ',' || c == ':' || c == ';') && nx_ws &&
+                                    (int)acc.size() > max_chars / 2;
+            if (soft_break) {
+                size_t j = k + 1;
+                while (j < s.size() && is_ws((unsigned char)s[j])) { acc += s[j]; ++j; }
+                refined.push_back(acc);
+                acc.clear();
+                k = j;
+                continue;
+            }
+            if ((int)acc.size() >= max_chars) {
+                // Last-resort hard break at a space if we can find one in the
+                // tail quarter; otherwise just cut.
+                size_t back = acc.size();
+                while (back > (size_t)(max_chars * 3 / 4) && !is_ws((unsigned char)acc[back - 1])) --back;
+                if (back <= (size_t)(max_chars / 2)) back = acc.size();
+                refined.push_back(acc.substr(0, back));
+                acc.erase(0, back);
+            }
+            ++k;
+        }
+        if (!acc.empty()) refined.push_back(acc);
+    }
+
+    // Pass 3: greedy forward merge of short fragments.
+    for (auto & s : refined) {
+        if (!out.empty() && (int)(out.back().size() + s.size()) <= max_chars) {
+            out.back() += s;
+        } else {
+            out.push_back(std::move(s));
+        }
+    }
+
+    // Strip trailing whitespace per segment.
+    for (auto & s : out) {
+        while (!s.empty() && is_ws((unsigned char)s.back())) s.pop_back();
+    }
+    // Drop empty segments (paranoia).
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const std::string & s) { return s.empty(); }),
+              out.end());
+    if (out.empty()) out.push_back(text);
+    return out;
+}
+
+// Append `src` PCM to `dst`, crossfading the last `fade_ms` of `dst` with the
+// leading `fade_ms` of `src` via a raised-cosine ramp.  Removes clicks at
+// segment seams in auto-split mode.
+static void append_pcm_crossfade(std::vector<float> & dst, const std::vector<float> & src,
+                                 int sr, int fade_ms) {
+    if (src.empty()) return;
+    if (dst.empty() || fade_ms <= 0) {
+        dst.insert(dst.end(), src.begin(), src.end());
+        return;
+    }
+    int fade_n = sr * fade_ms / 1000;
+    fade_n = std::min(fade_n, (int)dst.size());
+    fade_n = std::min(fade_n, (int)src.size());
+    if (fade_n <= 0) { dst.insert(dst.end(), src.begin(), src.end()); return; }
+
+    const size_t ofs = dst.size() - fade_n;
+    for (int i = 0; i < fade_n; ++i) {
+        const float t = (float)(i + 1) / (float)(fade_n + 1);
+        const float w = 0.5f * (1.0f - std::cos((float)M_PI * t));  // 0 → 1 cosine ramp
+        dst[ofs + i] = dst[ofs + i] * (1.0f - w) + src[i] * w;
+    }
+    dst.insert(dst.end(), src.begin() + fade_n, src.end());
 }
 
 static bool validate_reference_audio(const std::string & path) {
@@ -483,6 +612,27 @@ struct cli_params {
     // to 2 (matches Python's meanflow); setting 1 halves CFM cost at the
     // price of a bit of extra high-frequency noise.
     int32_t stream_cfm_steps          = 0;
+
+    // Auto-split the input text into sentences before running the pipeline.
+    // Chatterbox Turbo's T3 degrades badly on autoregressive outputs longer
+    // than ~15 s (well outside its training distribution), so anything over
+    // a few sentences comes out as garbled prosody, hallucinated phonemes
+    // or drifting timbre — regardless of backend (reproduced on Python and
+    // ONNX too).  Splitting at sentence boundaries keeps each T3 call
+    // in-distribution.  Segments are concatenated with a short raised-cosine
+    // crossfade at the seams.
+    //
+    //   max_sentence_chars      Target length per segment in characters.
+    //                           When a sentence exceeds this, we split
+    //                           further at `, : ;`.  Set to 0 to disable
+    //                           auto-split entirely (single-shot, old
+    //                           behaviour; matches --no-auto-split).
+    //                           Default 180 ≈ 5–8 s of audio.
+    //
+    //   crossfade_ms            Raised-cosine crossfade length at segment
+    //                           seams, in ms.  Default 30.
+    int32_t max_sentence_chars        = 180;
+    int32_t crossfade_ms              = 30;
 };
 
 static void print_usage(const char * argv0) {
@@ -538,6 +688,13 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "                          as --stream-chunk-tokens)\n");
     fprintf(stderr, "  --stream-cfm-steps N    CFM Euler step count per chunk.  Python uses 2 for\n");
     fprintf(stderr, "                          meanflow; 1 halves CFM cost.  (default: 0 = 2)\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "  --max-sentence-chars N  Split --text into segments of at most N chars, running\n");
+    fprintf(stderr, "                          T3+S3Gen+HiFT per segment and concatenating the PCM with\n");
+    fprintf(stderr, "                          a raised-cosine crossfade.  Works around Chatterbox Turbo's\n");
+    fprintf(stderr, "                          degradation on > ~15 s outputs.  (default: 180)\n");
+    fprintf(stderr, "  --no-auto-split         Disable the above (single-shot T3 over the full text).\n");
+    fprintf(stderr, "  --crossfade-ms N        Crossfade length between segments in ms.  (default: 30)\n");
     fprintf(stderr, "  -h, --help\n");
 }
 
@@ -569,6 +726,9 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
         else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
         else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
+        else if (arg == "--max-sentence-chars") { auto v = next("--max-sentence-chars"); if (!v) return false; params.max_sentence_chars = std::stoi(v); }
+        else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
+        else if (arg == "--crossfade-ms")   { auto v = next("--crossfade-ms");   if (!v) return false; params.crossfade_ms = std::stoi(v); }
         else if (arg == "--stream-chunk-tokens") { auto v = next("--stream-chunk-tokens"); if (!v) return false; params.stream_chunk_tokens = std::stoi(v); }
         else if (arg == "--stream-first-chunk-tokens") { auto v = next("--stream-first-chunk-tokens"); if (!v) return false; params.stream_first_chunk_tokens = std::stoi(v); }
         else if (arg == "--stream-cfm-steps") { auto v = next("--stream-cfm-steps"); if (!v) return false; params.stream_cfm_steps = std::stoi(v); }
@@ -1442,7 +1602,14 @@ int main(int argc, char ** argv) {
                 "%s: no T3 override; keeping built-in T3 voice\n", __func__);
         }
 
-        std::vector<int32_t> text_tokens;
+        // ----------- Segment planning & tokenization ------------------
+        //
+        // When --text is given and --max-sentence-chars > 0, split the
+        // text into TTS-friendly segments and tokenize each separately.
+        // Auto-split is suppressed when the tokens-file path is used,
+        // when --stream-chunk-tokens requests streaming output, and when
+        // --dump-tokens-only prints a single token list.
+        gpt2_bpe bpe;
         if (!params.text.empty()) {
             if (model.tok_tokens.empty()) {
                 fprintf(stderr,
@@ -1451,63 +1618,105 @@ int main(int argc, char ** argv) {
                     "       with tokenizer.ggml.* metadata.\n");
                 return 1;
             }
-            gpt2_bpe bpe;
             bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
+        }
 
-            std::string normalized = gpt2_bpe::punc_norm(params.text);
-            text_tokens = bpe.tokenize(normalized);
+        const bool auto_split_enabled =
+            !params.text.empty() &&
+            params.max_sentence_chars > 0 &&
+            params.stream_chunk_tokens <= 0 &&
+            !params.dump_tokens_only;
 
+        std::vector<std::string> text_segments;
+        if (auto_split_enabled) {
+            auto segs = split_text_for_tts(params.text, params.max_sentence_chars);
+            if (segs.size() > 1) text_segments = std::move(segs);
+        }
+        if (text_segments.empty() && !params.text.empty()) text_segments.push_back(params.text);
+
+        std::vector<std::vector<int32_t>> seg_text_tokens;
+        if (!params.text.empty()) {
+            seg_text_tokens.reserve(text_segments.size());
+            for (size_t si = 0; si < text_segments.size(); ++si) {
+                std::string normalized = gpt2_bpe::punc_norm(text_segments[si]);
+                seg_text_tokens.push_back(bpe.tokenize(normalized));
+                if (params.verbose) {
+                    fprintf(stderr, "%s: text[%zu]: \"%s\" (%zu bpe)\n", __func__,
+                            si, normalized.c_str(), seg_text_tokens.back().size());
+                }
+            }
             if (params.dump_tokens_only) {
-                for (size_t i = 0; i < text_tokens.size(); ++i) {
+                // --dump-tokens-only only ever has one segment (auto-split disabled).
+                for (size_t i = 0; i < seg_text_tokens[0].size(); ++i) {
                     if (i) printf(",");
-                    printf("%d", text_tokens[i]);
+                    printf("%d", seg_text_tokens[0][i]);
                 }
                 printf("\n");
                 return 0;
             }
-
-            if (params.verbose) {
-                fprintf(stderr, "%s: text: \"%s\"\n", __func__, normalized.c_str());
-                fprintf(stderr, "%s: %zu text tokens\n", __func__, text_tokens.size());
-            }
         } else {
-            text_tokens = read_token_file(params.tokens_file);
+            seg_text_tokens.push_back(read_token_file(params.tokens_file));
         }
-        if (text_tokens.empty()) throw std::runtime_error("empty token input");
+        for (auto & tt : seg_text_tokens) {
+            if (tt.empty()) throw std::runtime_error("empty token input");
+        }
 
+        const bool multi_seg = (seg_text_tokens.size() > 1);
+        if (multi_seg) {
+            fprintf(stderr, "main: auto-split: %zu segments (max-sentence-chars=%d)\n",
+                    seg_text_tokens.size(), params.max_sentence_chars);
+        }
+
+        // ----------- T3 autoregressive decode (per segment) ------------
+        //
+        // The KV cache is indexed by position, so calling eval_prompt again
+        // simply overwrites positions 0..prompt_len of the cache — no
+        // explicit reset needed between segments.
         ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(model.backend));
         std::mt19937 rng(params.seed);
-        std::vector<float> logits;
-        int prompt_len = 0;
+        std::vector<std::vector<int32_t>> seg_generated;
+        seg_generated.reserve(seg_text_tokens.size());
+        size_t total_t3_tokens = 0;
         const int64_t _t3_infer_t0 = ggml_time_us();
-        if (!eval_prompt(model, allocr, params.n_threads, text_tokens, logits, prompt_len))
-            throw std::runtime_error("prompt eval failed");
+        for (size_t si = 0; si < seg_text_tokens.size(); ++si) {
+            std::vector<float> logits;
+            int prompt_len = 0;
+            if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
+                throw std::runtime_error("prompt eval failed");
 
-        int n_past = prompt_len;
-        std::vector<int32_t> generated;
-        generated.reserve(params.n_predict + 1);
+            int n_past = prompt_len;
+            std::vector<int32_t> generated;
+            generated.reserve(params.n_predict + 1);
 
-        int32_t current = sample_next_token(logits, generated, params, rng);
-        generated.push_back(current);
-
-        for (int i = 0; i < params.n_predict; ++i) {
-            if (current == model.hparams.stop_speech_token) break;
-            if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-            if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                throw std::runtime_error("step eval failed");
-            ++n_past;
-            current = sample_next_token(logits, generated, params, rng);
+            int32_t current = sample_next_token(logits, generated, params, rng);
             generated.push_back(current);
-        }
 
-        if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
-            generated.pop_back();
+            for (int i = 0; i < params.n_predict; ++i) {
+                if (current == model.hparams.stop_speech_token) break;
+                if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+                if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
+                    throw std::runtime_error("step eval failed");
+                ++n_past;
+                current = sample_next_token(logits, generated, params, rng);
+                generated.push_back(current);
+            }
+
+            if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
+                generated.pop_back();
+
+            total_t3_tokens += generated.size();
+            if (multi_seg) {
+                fprintf(stderr, "  [t3 segment %zu/%zu] %zu speech tokens\n",
+                        si + 1, seg_text_tokens.size(), generated.size());
+            }
+            seg_generated.push_back(std::move(generated));
+        }
 
         const int64_t _t3_infer_ms = (ggml_time_us() - _t3_infer_t0) / 1000;
         fprintf(stderr, "BENCH: T3_INFER_MS=%lld tokens=%zu\n",
-                (long long)_t3_infer_ms, generated.size());
+                (long long)_t3_infer_ms, total_t3_tokens);
 
-        if (!params.output.empty()) write_token_file(params.output, generated);
+        if (!params.output.empty()) write_token_file(params.output, seg_generated.front());
 
         // If --s3gen-gguf is set, chain into the S3Gen + HiFT vocoder to write a wav.
         if (!params.s3gen_gguf.empty()) {
@@ -1548,9 +1757,37 @@ int main(int argc, char ** argv) {
                                        opts.prompt_feat_rows_override);
                 }
             }
-            if (params.stream_chunk_tokens <= 0) {
-                int rc = s3gen_synthesize_to_wav(generated, opts);
+            if (params.stream_chunk_tokens <= 0 && !multi_seg) {
+                // Single-shot: let s3gen_synthesize_to_wav write the wav
+                // directly and print its own "Wrote ..." line.
+                int rc = s3gen_synthesize_to_wav(seg_generated.front(), opts);
                 if (rc != 0) return rc;
+            } else if (params.stream_chunk_tokens <= 0) {
+                // Auto-split multi-segment batch mode: render each segment
+                // into in-memory PCM, concatenate with a raised-cosine
+                // crossfade at the seams, write a single wav at the end.
+                const int sr = opts.sr ? opts.sr : 24000;
+                std::vector<float> full_pcm;
+                const int64_t _seg_t0 = ggml_time_us();
+                for (size_t si = 0; si < seg_generated.size(); ++si) {
+                    s3gen_synthesize_opts copts = opts;
+                    std::vector<float> seg_pcm;
+                    copts.out_wav_path = "";
+                    copts.pcm_out      = &seg_pcm;
+                    fprintf(stderr, "\n--- segment %zu/%zu: %zu speech tokens ---\n",
+                            si + 1, seg_generated.size(), seg_generated[si].size());
+                    int rc = s3gen_synthesize_to_wav(seg_generated[si], copts);
+                    if (rc != 0) return rc;
+                    append_pcm_crossfade(full_pcm, seg_pcm, sr, params.crossfade_ms);
+                }
+                const double seg_total_ms = 1e-3 * (ggml_time_us() - _seg_t0);
+                const double audio_ms = 1000.0 * (double)full_pcm.size() / (double)sr;
+                fprintf(stderr,
+                        "\n=== auto-split: %zu segments, %.0f ms for %.0f ms audio (RTF=%.2f) ===\n",
+                        seg_generated.size(), seg_total_ms, audio_ms,
+                        audio_ms > 0.0 ? seg_total_ms / audio_ms : 0.0);
+                stream_write_wav(params.out_wav, full_pcm, sr);
+                fprintf(stderr, "Wrote %s\n", params.out_wav.c_str());
             } else {
                 // Streaming synthesis: chunk the speech tokens, carry
                 // cache_source across chunks, apply trim_fade only on chunk 0,
@@ -1560,7 +1797,7 @@ int main(int argc, char ** argv) {
                 // S3GEN_SIL tokens ONCE at the end of the full sequence so
                 // each call's `append_lookahead_silence=false` is safe.
                 constexpr int S3GEN_SIL = 4299;
-                std::vector<int32_t> full_tokens = generated;
+                std::vector<int32_t> full_tokens = seg_generated.front();
                 full_tokens.push_back(S3GEN_SIL);
                 full_tokens.push_back(S3GEN_SIL);
                 full_tokens.push_back(S3GEN_SIL);
@@ -1658,7 +1895,10 @@ int main(int argc, char ** argv) {
             }
         } else {
             // Legacy: print the tokens to stdout too (handy for piping).
-            for (size_t i = 0; i < generated.size(); ++i) { if (i) printf(","); printf("%d", generated[i]); }
+            // In auto-split mode this prints the first segment's tokens only;
+            // real callers who want all segments pass --s3gen-gguf and --out.
+            const auto & toks = seg_generated.front();
+            for (size_t i = 0; i < toks.size(); ++i) { if (i) printf(","); printf("%d", toks[i]); }
             printf("\n");
         }
 
