@@ -1902,6 +1902,31 @@ int main(int argc, char ** argv) {
                         boundaries.push_back(cursor);
                     }
 
+                    // Absorb a short trailing chunk into the previous one.
+                    // When total_n isn't a clean multiple of the chunk
+                    // stride, the final chunk can emit only a handful of
+                    // new tokens — but S3Gen still pays the full encoder+
+                    // CFM cost on the cumulative mel, so it shows up as a
+                    // cosmetically-bad RTF (e.g. "520 ms compute for 160 ms
+                    // audio, RTF=3.25") and burns one wasted encoder+CFM
+                    // dispatch.  Merging saves ~500 ms of compute per
+                    // segment with no audible impact because the same
+                    // audio is still emitted, just in one dispatch instead
+                    // of two.
+                    //
+                    // Threshold: compute ≈ fixed (~500 ms) per chunk; audio
+                    // emitted ≈ tail_len × 40 ms.  Break-even (RTF ≈ 1) is
+                    // at ~12 tokens.  chunk_n / 3 catches anything
+                    // noticeably worse than that for the usual 25-token
+                    // stride, and scales for larger strides too.
+                    const int min_tail = std::max(6, chunk_n / 3);
+                    if (boundaries.size() >= 3) {
+                        const int tail_len = boundaries.back() - boundaries[boundaries.size() - 2];
+                        if (tail_len < min_tail) {
+                            boundaries.erase(boundaries.end() - 2);
+                        }
+                    }
+
                     std::vector<float> hift_cache_source;       // reset per segment
                     std::vector<float> seg_streamed_wav;
                     int prev_mels_emitted = 0;
