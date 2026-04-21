@@ -1281,7 +1281,15 @@ int s3gen_synthesize_to_wav(
     // it can be disabled with `--verbose` unset.  Errors and machine-parseable
     // BENCH: lines stay unconditional below.
     auto vlog = [&](const char * fmt, auto... args) {
-        if (verbose) fprintf(stderr, fmt, args...);
+        if (!verbose) return;
+        // `fmt` is always a string literal at call sites but the compiler
+        // can't prove that through the variadic lambda.  Android NDK's
+        // default `-Werror=format-security` (together with `_FORTIFY_SOURCE=2`)
+        // then refuses to build unless we silence the warning locally.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-security"
+        fprintf(stderr, fmt, args...);
+#pragma GCC diagnostic pop
     };
 
     int n_threads = opts.n_threads;
