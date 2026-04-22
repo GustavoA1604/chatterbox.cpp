@@ -1592,12 +1592,14 @@ int main(int argc, char ** argv) {
             }
         }
 
-        if ((have_se || have_ct) && params.verbose) {
-            fprintf(stderr,
-                "%s: T3 voice override — speaker_emb=%s, cond_prompt_tokens=%s\n",
-                __func__,
-                have_se ? (params.reference_audio.empty() ? "ref_dir" : "C++ VoiceEncoder") : "built-in",
-                have_ct ? (ct_from_cpp ? "C++ S3TokenizerV2" : "ref_dir") : "built-in");
+        if (have_se || have_ct) {
+            if (params.verbose) {
+                fprintf(stderr,
+                    "%s: T3 voice override — speaker_emb=%s, cond_prompt_tokens=%s\n",
+                    __func__,
+                    have_se ? (params.reference_audio.empty() ? "ref_dir" : "C++ VoiceEncoder") : "built-in",
+                    have_ct ? (ct_from_cpp ? "C++ S3TokenizerV2" : "ref_dir") : "built-in");
+            }
         } else if (!params.ref_dir.empty() || !params.reference_audio.empty()) {
             fprintf(stderr,
                 "%s: no T3 override; keeping built-in T3 voice\n", __func__);
