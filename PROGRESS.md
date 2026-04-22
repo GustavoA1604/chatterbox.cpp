@@ -56,7 +56,7 @@ numbers in this table is in §3.13.
 ## Repository layout
 
 ```
-qvac-chatterbox.cpp/
+chatterbox.cpp/
   ggml/                           vendored ggml checkout (see patches/)
   patches/
     ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
@@ -111,7 +111,7 @@ flow-matching steps** (fast inference).
 
 Bootstrapped the repo by cloning the latest `ggml` and the reference
 `resemble-ai/chatterbox` side-by-side, then built a standalone
-`qvac-chatterbox.cpp/` with `ggml/` as a vendored subdirectory (no modifications
+`chatterbox.cpp/` with `ggml/` as a vendored subdirectory (no modifications
 inside `ggml/`).
 
 **Issues hit in this phase:**
@@ -447,9 +447,9 @@ byte-for-byte against C++ with the same seed.
 
 ### 3.10  Benchmark: chatterbox.cpp vs ONNX addon on the same machine
 
-Compared end-to-end throughput against the in-house
-`qvac-lib-infer-onnx-tts` addon (ONNX Runtime backend, pre-built q4
-Chatterbox models at 692 MB on disk). Same 10-core EPYC host, same
+Compared end-to-end throughput against an in-house ONNX Runtime TTS
+addon (pre-built q4 Chatterbox models at 692 MB on disk). Same 10-core
+EPYC host, same
 prompt ("Hello from native C plus plus. This audio was generated end
 to end on CPU using ggml."), built-in voice on both sides, `--threads
 10` for ggml, ORT's own default threading for ONNX. Instrumented the
@@ -900,8 +900,8 @@ load time):
 | Metal M3 Ultra (Q4_0)         |  766 ms |  596 ms   | 0.128     | 1.87 s | 7.8×          |
 | ONNX q4 addon (CPU, Linux)    |     — (not exposed) |     — | 1.06      | 13.91 s | 0.94×        |
 
-The ONNX addon is shown as a baseline because it's what
-`qvac-lib-infer-onnx-tts` ships today. Every ggml configuration —
+The ONNX addon is shown as a baseline because it's the current
+in-house reference TTS implementation. Every ggml configuration —
 including CPU F16 on the same host — beats it.
 
 ---
@@ -933,8 +933,8 @@ Precision regressions are immediately visible: a change that drops rel to
 ## How to re-run everything
 
 ```bash
-ssh gianni@qvac-dev-linux-x64
-cd ~/qvac-chatterbox.cpp
+ssh gianni@dev-linux-x64
+cd ~/chatterbox.cpp
 
 # One-time: build the binaries
 cmake -S . -B build

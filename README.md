@@ -1,4 +1,4 @@
-# qvac-chatterbox.cpp
+# chatterbox.cpp
 
 **Chatterbox Turbo** (Resemble AI, MIT-licensed zero-shot text-to-speech)
 ported to [`ggml`](https://github.com/ggml-org/ggml). Pure C++/ggml inference
@@ -14,7 +14,7 @@ reference wav (T3 + S3Gen + HiFT, warm runs, excludes model load):
 | Metal (Mac Studio M3 Ultra, Q4_0)    |   985 ms  | 0.16   | 6.4×         | 17.5× faster    |
 | CPU (AMD Ryzen 9 9950X, AVX, Q4_0)   | 5 397 ms  | 0.82   | 1.2×         | 1.2× faster     |
 | CPU (Mac Studio M3 Ultra, NEON)      | 7 568 ms  | 1.05   | 0.96×        | 2.3× faster     |
-| Reference (qvac-onnx-tts, CPU Q4)    | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
+| Reference (ONNX Runtime, CPU Q4)     | 6.4–17 s  | 1.2–3.2 | 0.3–0.85×   | —               |
 
 See the [full benchmark](#performance) section below for the per-stage
 breakdown, or [`PROGRESS.md`](PROGRESS.md) for the full chronological
@@ -75,17 +75,23 @@ cd -
 git clone git@github.com:gianni-cor/chatterbox.cpp.git
 cd chatterbox.cpp
 
-# ggml is vendored as a sibling subdirectory
-git clone https://github.com/ggml-org/ggml.git ggml
-
-# Apply our Metal op fixes (diag_mask_inf, pad_ext, faster conv_transpose_1d).
-# Skip this if you're not building with -DGGML_METAL=ON.
-(cd ggml && git apply ../patches/ggml-metal-chatterbox-ops.patch)
+# Clone ggml at the pinned commit and apply our Metal op patches.
+# Skip the patch part (i.e. just `git clone ... ggml`) if you're not
+# building with -DGGML_METAL=ON.
+./scripts/setup-ggml.sh
 
 # Configure + build every target in one shot.
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 ```
+
+`scripts/setup-ggml.sh` is idempotent: it clones upstream
+[`ggml`](https://github.com/ggml-org/ggml) into `./ggml`, checks out the
+commit our patch is pinned against (`GGML_COMMIT` at the top of the
+script), and applies
+[`patches/ggml-metal-chatterbox-ops.patch`](patches/ggml-metal-chatterbox-ops.patch).
+Re-running it is a no-op; bump the pinned commit inside the script
+whenever the patch is re-generated against a newer upstream.
 
 To enable GPU acceleration, add the matching backend flag at configure
 time: `-DGGML_METAL=ON` on Apple Silicon, `-DGGML_VULKAN=ON` on
@@ -271,8 +277,8 @@ ffplay /tmp/out.wav         # any OS with ffmpeg
 <a id="performance"></a>
 ## Performance
 
-Reproducible perf check vs the `@qvac/tts-onnx` package (ONNX Runtime
-Q4 quantization, same architecture) on the same machine.  Shared setup:
+Reproducible perf check vs an ONNX Runtime Q4 baseline (same
+architecture) on the same machine.  Shared setup:
 
 - Text: *"Hello from native C plus plus. This audio was generated end
   to end on CPU using ggml."*
@@ -285,7 +291,7 @@ Q4 quantization, same architecture) on the same machine.  Shared setup:
 |---------------------------------------|-----------------|-------------------:|---------------:|----------------:|------:|-------------:|
 | **`chatterbox.cpp` Q4_0**             | **Metal**       |  573 ms / 155 tok  |    412 ms      |   **985 ms**    | 0.16  | **6.4×**     |
 | `chatterbox.cpp` Q4_0                 | CPU (NEON+Accel)| 2 045 ms / 178 tok |  5 523 ms      |    7 568 ms     | 1.05  | 0.96×        |
-| `@qvac/tts-onnx` Q4 (ONNX Runtime)    | CPU             |        —           |      —         |   17 190 ms     | 3.18  | 0.31×        |
+| ONNX Runtime Q4 baseline              | CPU             |        —           |      —         |   17 190 ms     | 3.18  | 0.31×        |
 
 `chatterbox.cpp` (Metal) is **17.5× faster than ONNX Runtime** on the
 same machine; the CPU-only build is still 2.3× faster.
@@ -296,12 +302,12 @@ same machine; the CPU-only build is still 2.3× faster.
 |---------------------------------------|-----------------|-------------------:|---------------:|----------------:|------:|-------------:|
 | **`chatterbox.cpp` Q4_0**             | **Vulkan**      |  241 ms / 161 tok  |    222 ms      |    **463 ms**   | 0.07  | **14.2×**    |
 | `chatterbox.cpp` Q4_0                 | CPU (AVX)       | 2 161 ms / 161 tok |  3 236 ms      |    5 397 ms     | 0.82  | 1.2×         |
-| `@qvac/tts-onnx` Q4 (ONNX Runtime)    | CPU             |        —           |      —         |    6 373 ms     | 1.18  | 0.85×        |
+| ONNX Runtime Q4 baseline              | CPU             |        —           |      —         |    6 373 ms     | 1.18  | 0.85×        |
 
 `chatterbox.cpp` (Vulkan) is **13.8× faster than ONNX Runtime** on the
-same machine.  Note that the `@qvac/tts-onnx` package only ships the
+same machine.  Note that the ONNX Runtime baseline here only uses the
 CPU execution provider; a CUDA build would narrow the gap, but is not
-available in the published addon today.
+included in this comparison.
 
 ### Per-stage S3Gen + HiFT breakdown (GPU builds)
 
