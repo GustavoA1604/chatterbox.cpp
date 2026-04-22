@@ -160,27 +160,27 @@ python scripts/dump-s3gen-reference.py \
 
 ### Optional: quantize the models (smaller + faster)
 
-Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0` (light
-quality loss, 3× smaller).  T3 supports `--quant` in its converter; the
-S3Gen GGUF is re-quantized with a small standalone tool because
-`llama-quantize` doesn't know the `chatterbox-s3gen` architecture.
+Both GGUFs can be quantized to `Q8_0` (near-lossless) or `Q4_0`
+(different CFM sample but same subjective quality, smaller).
+`llama-quantize` doesn't recognize the `chatterbox` / `chatterbox-s3gen`
+custom architectures, so we ship a small standalone rewriter that
+works on either model:
 
 ```bash
-# T3: quantize at conversion time.  Choose q8_0 / q5_0 / q4_0.
-python scripts/convert-t3-turbo-to-gguf.py \
-  --out models/t3-q8_0.gguf --quant q8_0
-python scripts/convert-t3-turbo-to-gguf.py \
-  --out models/t3-q4_0.gguf --quant q4_0
+# T3
+python scripts/requantize-gguf.py \
+  models/chatterbox-t3-turbo.gguf \
+  models/t3-q8_0.gguf q8_0
 
-# S3Gen: re-quantize the already-converted F32 GGUF in place.
-python scripts/requantize-s3gen.py \
+# S3Gen
+python scripts/requantize-gguf.py \
   models/chatterbox-s3gen.gguf \
   models/chatterbox-s3gen-q8_0.gguf q8_0
-
-python scripts/requantize-s3gen.py \
-  models/chatterbox-s3gen.gguf \
-  models/chatterbox-s3gen-q4_0.gguf q4_0
 ```
+
+Swap `q8_0` → `q4_0` (or `q5_0`) for a more aggressive variant.  T3's
+original converter also accepts `--quant` if you prefer to quantize at
+conversion time instead of after.
 
 Measured on the QVAC paragraph (M3 Ultra, Metal, streaming mode
 `--stream-chunk-tokens 25 --max-sentence-chars 100`):

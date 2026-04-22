@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
-"""Requantize an existing F32/F16 S3Gen GGUF to a smaller dtype.
+"""Requantize a chatterbox GGUF (T3 or S3Gen) to a smaller dtype.
 
-The upstream `convert-s3gen-to-gguf.py` emits every tensor as F32 (or
-F16 for a few fallbacks).  Running `llama-quantize` on the result
-fails because llama.cpp doesn't know the custom `chatterbox-s3gen`
-architecture.  This tool walks the GGUF tensor-by-tensor and
-rewrites it with the big 2D weight matrices stored as `Q8_0` or
-`Q4_0`, leaving the numerically-sensitive tensors (embedding table,
-biases, norm scales, filterbank bases, builtin voice conditioning)
-at full precision.
+`llama-quantize` refuses to touch either GGUF because neither
+`chatterbox` nor `chatterbox-s3gen` is a llama.cpp-known arch.  This
+tool walks the GGUF tensor-by-tensor and rewrites it with the big 2-D
+weight matrices stored as `Q8_0` / `Q5_0` / `Q4_0`, leaving the
+numerically-sensitive tensors (embedding tables accessed via get_rows,
+biases, norm scales, filterbank / STFT bases, positional embeddings,
+builtin voice conditioning) at their source dtype.
 
-Quality trade-off on the QVAC paragraph (Metal, M3 Ultra):
-  F32 (default) — baseline
-  Q8_0         — essentially bit-exact, <1e-3 cos-diff vs F32 mel
-  Q4_0         — audibly identical for prose, minor artefacts on
-                 expressive content; ~3x size reduction
+Works for both models because the deny-list covers the union of
+patterns that either side uses for "keep-as-F32/F16".
 
 Usage:
 
-    python scripts/requantize-s3gen.py \\
-        models/chatterbox-s3gen.gguf \\
-        models/chatterbox-s3gen-q8_0.gguf \\
-        q8_0
+    # T3 Q8_0
+    python scripts/requantize-gguf.py \\
+        models/chatterbox-t3-turbo.gguf \\
+        models/t3-q8_0.gguf q8_0
 
-    python scripts/requantize-s3gen.py \\
+    # S3Gen Q8_0
+    python scripts/requantize-gguf.py \\
         models/chatterbox-s3gen.gguf \\
-        models/chatterbox-s3gen-q4_0.gguf \\
-        q4_0
+        models/chatterbox-s3gen-q8_0.gguf q8_0
+
+    # Q4_0 is the same, last arg is just `q4_0`.
+
+Quality trade-off (measured on the QVAC paragraph, Metal / M3 Ultra):
+  F32 (default)   — baseline
+  Q8_0            — essentially bit-exact, cos-sim > 0.99 vs baseline
+  Q4_0            — different CFM ODE trajectory → different sample;
+                    subjective quality equal, cos-sim falls to ~0.66
 """
 
 from __future__ import annotations
@@ -39,25 +43,45 @@ import numpy as np
 import gguf
 
 
-# Names we NEVER touch: they're read as raw F32 by the C++ loader or
-# they're numerically sensitive (filterbanks, STFT bases, voice
-# conditioning tensors with strict shape contracts).
+# Names we NEVER touch: they're read as raw F32 by the C++ loader, or
+# they're accessed via ggml_get_rows (embedding tables), or they're
+# numerically sensitive (filterbanks, STFT bases, voice conditioning,
+# position embeddings, norm/bias params).  Works for both T3 (GPT-2-
+# style names) and S3Gen (custom per-module names).
 _DENY_SUBSTRINGS = (
-    "flow/input_embedding",     # read as raw F32 for CPU-side embedding lookup
-    "/builtin/",                # voice conditioning, loaded as F32
-    "stft_basis",               # STFT analysis / synthesis (bit-exact numerics)
-    "mel_filterbank",           # mel filterbank, same story
-    "pos_emb",                  # positional embeddings — tiny, keep F32
-    "pe/pe",                    # conformer pos enc, tiny
-    "/b",                       # legacy biases named "/b"
-    "/bias",                    # biases
+    # Raw-F32 access in the C++ loader
+    "flow/input_embedding",     # S3Gen speech embedding table (read as F32 for CPU-side lookup)
+    "/builtin/",                # voice conditioning tensors, loaded directly
+    # Embedding tables (accessed via ggml_get_rows — safer as F16/F32)
+    "text_emb",                 # T3 text token embedding
+    "speech_emb",               # T3 speech token embedding
+    "wte",                      # GPT-2 word token embedding
+    "wpe",                      # GPT-2 learned position embedding
+    # Spectral bases / positional encodings (bit-exact numerics)
+    "stft_basis",               # STFT analysis / synthesis
+    "mel_filterbank",           # mel filterbank
+    "pos_emb",                  # positional embeddings — small, keep F32
+    "pe/pe",                    # conformer pos enc
+    # Biases / norms / scale params — always 1-D or near-1-D
+    "/b",                       # legacy biases (gpt-2 /b, s3gen /b)
+    "/bias",                    # pytorch-style bias
     "/bn/",                     # batchnorm params
     "/norm/",                   # layernorms
+    "/ln_",                     # GPT-2 style layernorms (ln_1, ln_2, ln_f)
+    "/g",                       # GPT-2 style norm scale (matches /g, /ga[mma], /gate — accept the occasional false deny)
     "/s",                       # legacy scale weights
     "alpha",                    # Snake activation alphas
     "beta",
     "gamma",
 )
+
+
+# Tensor element dtypes we're willing to quantize from.  F16 is T3's
+# default for its big projection weights; F32 is S3Gen's default.
+_QUANTIZABLE_SRC_DTYPES = {
+    gguf.GGMLQuantizationType.F32,
+    gguf.GGMLQuantizationType.F16,
+}
 
 
 _QUANT_TYPE = {
@@ -166,7 +190,7 @@ def main() -> int:
         data = np.asarray(t.data)
         src_bytes += data.nbytes
 
-        if t.tensor_type == gguf.GGMLQuantizationType.F32 and should_quantize(t.name, shape, qtype):
+        if t.tensor_type in _QUANTIZABLE_SRC_DTYPES and should_quantize(t.name, shape, qtype):
             # Reshape to natural (shape).  GGUF raw data is contiguous in
             # the original order, but reversed() above gives element-shape
             # which is what `quantize()` expects.
