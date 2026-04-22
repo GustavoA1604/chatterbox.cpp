@@ -33,6 +33,8 @@
 // helpers in src/chatterbox_t3_internal.h.
 
 #include <cstdint>
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -94,10 +96,46 @@ struct EngineOptions {
     // S3Gen side.  0 = library default (2-step meanflow).
     int cfm_steps = 0;
 
+    // ---------------- Streaming synthesis ----------------------------
+    //
+    // When `stream_chunk_tokens > 0` AND the caller passes a non-empty
+    // chunk callback to `synthesize()`, the engine runs the chunked
+    // S3Gen+HiFT loop and invokes the callback with each chunk's 24 kHz
+    // float32 PCM as it's produced.  The callback is called synchronously
+    // from the same thread as `synthesize()`.
+    //
+    //   stream_chunk_tokens        Number of T3 speech tokens per chunk
+    //                              (25 ~= 1 s of audio, 50 ~= 2 s).
+    //                              0 = non-streaming (batch).
+    //
+    //   stream_first_chunk_tokens  Override for the *first* chunk so first
+    //                              audio lands early while later chunks
+    //                              stay large and keep overall RTF low.
+    //                              0 = same as stream_chunk_tokens.
+    //
+    //   stream_cfm_steps           CFM Euler step count for streaming
+    //                              chunks.  0 = library default (2).
+    //                              Setting 1 halves CFM cost with a small
+    //                              quality penalty on Turbo's meanflow
+    //                              sampler.
+    int stream_chunk_tokens       = 0;
+    int stream_first_chunk_tokens = 0;
+    int stream_cfm_steps          = 0;
+
     // Pass-through of the CLI's --verbose behaviour: per-stage wall times
     // on stderr.  Errors always go through regardless of this flag.
     bool verbose = false;
 };
+
+// Per-chunk PCM callback.  Receives a pointer to `samples` consecutive
+// 24 kHz float32 mono samples.  The buffer is owned by the engine and
+// must not be retained past the callback; copy out if you need the data.
+//   `chunk_index`  0-based index of the chunk within the current utterance.
+//   `is_last`      true on the final chunk (after which synthesize() returns).
+// Throwing from this callback aborts synthesis (the exception propagates
+// out of synthesize()).
+using StreamCallback = std::function<void(
+    const float * pcm, std::size_t samples, int chunk_index, bool is_last)>;
 
 struct SynthesisResult {
     // 24 kHz mono PCM, float32 in [-1, 1].
@@ -133,6 +171,15 @@ public:
     //
     // Not safe to call concurrently on the same Engine instance.
     SynthesisResult synthesize(const std::string & text);
+
+    // Same as above, but when `options().stream_chunk_tokens > 0` and
+    // `on_chunk` is non-empty, runs the chunked S3Gen+HiFT loop and
+    // invokes `on_chunk` with each chunk's PCM in order.  The returned
+    // SynthesisResult.pcm still contains the concatenated audio (the
+    // callback is an *addition*, not a replacement).  Falls through to
+    // the batch path when streaming is disabled.
+    SynthesisResult synthesize(const std::string & text,
+                               const StreamCallback & on_chunk);
 
     // Best-effort cancel of an in-flight synthesize() call on another
     // thread.  Safe to call concurrently with synthesize() or from any

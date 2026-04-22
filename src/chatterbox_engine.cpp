@@ -345,29 +345,17 @@ struct Engine::Impl {
         return generated;
     }
 
-    SynthesisResult synthesize(const std::string & text) {
-        if (text.empty()) {
-            throw std::runtime_error("Engine: text is empty");
-        }
-        cancel_flag.store(false, std::memory_order_relaxed);
-
-        const auto t3_t0 = std::chrono::steady_clock::now();
-        std::vector<int32_t> speech_tokens = run_t3(text);
-        const auto t3_t1 = std::chrono::steady_clock::now();
-
-        wait_for_preload(s3gen_preload_thread);
-
-        s3gen_synthesize_opts sopts;
+    // Populate the fixed fields of s3gen_synthesize_opts (paths, threads,
+    // seed, voice overrides, backend hints).  Streaming-specific fields
+    // (finalize, hift_cache_source, skip_mel_frames, ...) are set per
+    // chunk by `synthesize_streaming` below.
+    void fill_common_s3gen_opts(s3gen_synthesize_opts & sopts) {
         sopts.s3gen_gguf_path = opts.s3gen_gguf_path;
-        sopts.out_wav_path    = "";   // we want PCM, not a file
+        sopts.out_wav_path    = "";
         sopts.seed            = opts.seed;
         sopts.n_threads       = resolve_thread_count(opts.n_threads);
         sopts.verbose         = opts.verbose;
         sopts.n_gpu_layers    = opts.n_gpu_layers;
-        sopts.cfm_steps       = opts.cfm_steps;
-
-        SynthesisResult result;
-        sopts.pcm_out = &result.pcm;
 
         if (!s3gen_prompt_feat.empty()) {
             sopts.prompt_feat_override      = s3gen_prompt_feat;
@@ -379,6 +367,16 @@ struct Engine::Impl {
         if (!s3gen_prompt_token.empty()) {
             sopts.prompt_token_override = s3gen_prompt_token;
         }
+    }
+
+    SynthesisResult synthesize_batch(const std::vector<int32_t> & speech_tokens,
+                                     SynthesisResult && partial) {
+        s3gen_synthesize_opts sopts;
+        fill_common_s3gen_opts(sopts);
+        sopts.cfm_steps = opts.cfm_steps;
+
+        SynthesisResult result = std::move(partial);
+        sopts.pcm_out = &result.pcm;
 
         const auto s3_t0 = std::chrono::steady_clock::now();
         const int rc = s3gen_synthesize_to_wav(speech_tokens, sopts);
@@ -391,9 +389,130 @@ struct Engine::Impl {
         result.sample_rate   = 24000;
         result.t3_tokens     = (int) speech_tokens.size();
         result.audio_samples = (int) result.pcm.size();
-        result.t3_ms         = std::chrono::duration<double, std::milli>(t3_t1 - t3_t0).count();
         result.s3gen_ms      = std::chrono::duration<double, std::milli>(s3_t1 - s3_t0).count();
         return result;
+    }
+
+    // Ports main.cpp's --stream-chunk-tokens loop.  Splits speech_tokens
+    // into chunks of stream_chunk_tokens (with an optional smaller first
+    // chunk), carries `hift_cache_source` and `skip_mel_frames` across
+    // chunks for phase-continuous seams, and invokes `on_chunk` with
+    // each chunk's PCM as it's produced.  Accumulates the full PCM in
+    // the returned SynthesisResult so batch callers get the same shape.
+    SynthesisResult synthesize_streaming(
+        const std::vector<int32_t> & speech_tokens,
+        const StreamCallback & on_chunk,
+        SynthesisResult && partial) {
+
+        constexpr int S3GEN_SIL = 4299;
+
+        std::vector<int32_t> seg_toks = speech_tokens;
+        seg_toks.push_back(S3GEN_SIL);
+        seg_toks.push_back(S3GEN_SIL);
+        seg_toks.push_back(S3GEN_SIL);
+        const int total_n = (int) seg_toks.size();
+
+        const int chunk_n       = opts.stream_chunk_tokens;
+        const int first_chunk_n = opts.stream_first_chunk_tokens > 0
+                                    ? opts.stream_first_chunk_tokens
+                                    : chunk_n;
+
+        std::vector<int> boundaries = {0};
+        int cursor = std::min(first_chunk_n, total_n);
+        boundaries.push_back(cursor);
+        while (cursor < total_n) {
+            cursor = std::min(cursor + chunk_n, total_n);
+            boundaries.push_back(cursor);
+        }
+        // Absorb a tiny trailing chunk into the previous one (avoids
+        // paying the full encoder+CFM cost for a handful of new tokens;
+        // matches main.cpp's tail-merge heuristic).
+        const int min_tail = std::max(6, chunk_n / 3);
+        if (boundaries.size() >= 3) {
+            const int tail_len = boundaries.back() - boundaries[boundaries.size() - 2];
+            if (tail_len < min_tail) boundaries.erase(boundaries.end() - 2);
+        }
+
+        std::vector<float> hift_cache_source;
+        int prev_mels_emitted = 0;
+
+        SynthesisResult result = std::move(partial);
+        result.pcm.clear();
+
+        const int n_chunks = (int) boundaries.size() - 1;
+        double s3gen_ms_total = 0.0;
+
+        for (int k = 1; k <= n_chunks; ++k) {
+            if (cancel_flag.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("Engine: synthesis cancelled during streaming");
+            }
+            const int end              = boundaries[k];
+            const bool is_last_in_seg  = (end == total_n);
+            std::vector<int32_t> toks(seg_toks.begin(), seg_toks.begin() + end);
+
+            s3gen_synthesize_opts copts;
+            fill_common_s3gen_opts(copts);
+            std::vector<float> chunk_pcm;
+            copts.pcm_out                   = &chunk_pcm;
+            copts.append_lookahead_silence  = false;
+            copts.finalize                  = is_last_in_seg;
+            copts.skip_mel_frames           = prev_mels_emitted;
+            copts.apply_trim_fade           = (k == 1);
+            copts.hift_cache_source         = hift_cache_source;
+            std::vector<float> tail_out;
+            copts.hift_source_tail_out      = &tail_out;
+            copts.source_tail_samples       = 480;
+            copts.cfm_steps                 = opts.stream_cfm_steps;
+
+            const auto s3_t0 = std::chrono::steady_clock::now();
+            const int rc = s3gen_synthesize_to_wav(toks, copts);
+            const auto s3_t1 = std::chrono::steady_clock::now();
+            if (rc != 0) {
+                throw std::runtime_error(
+                    "Engine: streaming chunk " + std::to_string(k) +
+                    " failed with code " + std::to_string(rc));
+            }
+            s3gen_ms_total += std::chrono::duration<double, std::milli>(s3_t1 - s3_t0).count();
+
+            on_chunk(chunk_pcm.data(), chunk_pcm.size(), k - 1, is_last_in_seg);
+
+            result.pcm.insert(result.pcm.end(), chunk_pcm.begin(), chunk_pcm.end());
+            hift_cache_source = std::move(tail_out);
+            const size_t chunk_samples = chunk_pcm.size();
+            prev_mels_emitted += (int)(chunk_samples / 480);
+        }
+
+        result.sample_rate   = 24000;
+        result.t3_tokens     = (int) speech_tokens.size();
+        result.audio_samples = (int) result.pcm.size();
+        result.s3gen_ms      = s3gen_ms_total;
+        return result;
+    }
+
+    SynthesisResult synthesize(const std::string & text,
+                               const StreamCallback & on_chunk) {
+        if (text.empty()) {
+            throw std::runtime_error("Engine: text is empty");
+        }
+        cancel_flag.store(false, std::memory_order_relaxed);
+
+        const auto t3_t0 = std::chrono::steady_clock::now();
+        std::vector<int32_t> speech_tokens = run_t3(text);
+        const auto t3_t1 = std::chrono::steady_clock::now();
+
+        wait_for_preload(s3gen_preload_thread);
+
+        SynthesisResult partial;
+        partial.t3_ms = std::chrono::duration<double, std::milli>(t3_t1 - t3_t0).count();
+
+        const bool use_streaming = on_chunk && opts.stream_chunk_tokens > 0;
+        return use_streaming
+            ? synthesize_streaming(speech_tokens, on_chunk, std::move(partial))
+            : synthesize_batch(speech_tokens, std::move(partial));
+    }
+
+    SynthesisResult synthesize(const std::string & text) {
+        return synthesize(text, StreamCallback{});
     }
 };
 
@@ -406,6 +525,11 @@ Engine & Engine::operator=(Engine &&) noexcept = default;
 
 SynthesisResult Engine::synthesize(const std::string & text) {
     return pimpl_->synthesize(text);
+}
+
+SynthesisResult Engine::synthesize(const std::string & text,
+                                   const StreamCallback & on_chunk) {
+    return pimpl_->synthesize(text, on_chunk);
 }
 
 void Engine::cancel() {
