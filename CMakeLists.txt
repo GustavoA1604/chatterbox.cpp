@@ -16,8 +16,19 @@ option(QVAC_TTS_BUILD_LIBRARY     "qvac-tts: build the static qvac-tts library" 
 option(QVAC_TTS_BUILD_EXECUTABLES "qvac-tts: build the qvac-tts CLI + mel2wav demo"             ${QVAC_TTS_STANDALONE_DEFAULT})
 option(QVAC_TTS_BUILD_TESTS       "qvac-tts: build per-stage numerical validation harnesses"    ${QVAC_TTS_STANDALONE_DEFAULT})
 option(QVAC_TTS_INSTALL           "qvac-tts: generate install rules"                            ON)
+option(QVAC_TTS_USE_SYSTEM_GGML   "qvac-tts: use system-installed GGML library"                 OFF)
 
-add_subdirectory(ggml)
+if (NOT TARGET ggml)
+    if (QVAC_TTS_USE_SYSTEM_GGML)
+        find_package(ggml CONFIG REQUIRED)
+        if (NOT ggml_FOUND)
+            message(FATAL_ERROR "System-installed GGML library not found.")
+        endif()
+        add_library(ggml ALIAS ggml::ggml)
+    else()
+        add_subdirectory(ggml)
+    endif()
+endif()
 
 find_package(OpenMP)
 
