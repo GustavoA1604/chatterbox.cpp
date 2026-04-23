@@ -813,7 +813,31 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
-        else { fprintf(stderr, "error: unknown argument: %s\n", arg.c_str()); return false; }
+        else {
+            // Surface two common shell typos that would otherwise produce
+            // cryptic messages: (a) an argument that's entirely whitespace
+            // — symptom of `\<space>` at end of a continuation line, the
+            // backslash escapes the space instead of the newline; (b) a
+            // leading backslash on the arg itself, symptom of the same
+            // thing on the previous line.
+            bool all_ws = !arg.empty();
+            for (char c : arg) if (!std::isspace((unsigned char)c)) { all_ws = false; break; }
+            if (all_ws) {
+                fprintf(stderr, "error: empty / whitespace-only argument at position %d. "
+                                "This usually means you have a trailing space after '\\' at the "
+                                "end of a continuation line — remove it so the shell treats the "
+                                "next newline as the line break.\n", i);
+            } else if (!arg.empty() && arg[0] == '\\') {
+                fprintf(stderr, "error: argument starts with a backslash: %s\n  "
+                                "You probably have a trailing space after '\\' on the *previous* "
+                                "line, which escaped the space instead of the newline.  Remove "
+                                "the trailing space so the next line is treated as a continuation.\n",
+                        arg.c_str());
+            } else {
+                fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+            }
+            return false;
+        }
     }
     if (params.dump_tokens_only) {
         if (params.text.empty()) {
