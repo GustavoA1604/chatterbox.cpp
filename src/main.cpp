@@ -1,4 +1,5 @@
 #include "gpt2_bpe.h"
+#include "mtl_tokenizer.h"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
@@ -508,6 +509,14 @@ struct cli_params {
     float   temp           = 0.8f;
     float   repeat_penalty = 1.2f;
 
+    // Multilingual-only knobs. Python ChatterboxMultilingualTTS.generate()
+    // defaults: cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
+    // min_p=0.05, top_p=1.0 (top_k unused).
+    float       cfg_weight = 0.5f;   // classifier-free guidance strength
+    float       min_p      = 0.05f;  // minimum-probability warp (0 = off)
+    std::string language;            // tier-1 lang code when variant = t3_mtl
+    float       exaggeration = 0.5f; // emotion_adv scalar (0..1)
+
     // Streaming synthesis (PROGRESS.md B1).  When > 0, speech tokens from
     // T3 are fed to S3Gen+HiFT in chunks of this size, with `cache_source`
     // carried across chunks for phase continuity and `trim_fade` only on
@@ -588,6 +597,13 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --top-p P               (default: 0.95)\n");
     fprintf(stderr, "  --temp T                (default: 0.8)\n");
     fprintf(stderr, "  --repeat-penalty R      (default: 1.2)\n");
+    fprintf(stderr, "\nmultilingual (variant=t3_mtl) options:\n");
+    fprintf(stderr, "  --language CODE         Required for t3_mtl GGUFs. Tier-1: en, es, fr, de, it,\n");
+    fprintf(stderr, "                          pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko.\n");
+    fprintf(stderr, "                          (ja/he/ru/zh/hi not supported in this build.)\n");
+    fprintf(stderr, "  --cfg-weight F          Classifier-free guidance strength (default: 0.5)\n");
+    fprintf(stderr, "  --min-p F               Minimum-probability warp (default: 0.05)\n");
+    fprintf(stderr, "  --exaggeration F        Emotion intensity 0..1 (default: 0.5)\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --stream-chunk-tokens N Synthesize the wav in streaming chunks of N speech\n");
     fprintf(stderr, "                          tokens each (~1 s audio per 25-token chunk).  With\n");
@@ -638,6 +654,10 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { auto v = next("--top-p");          if (!v) return false; params.top_p = std::stof(v); }
         else if (arg == "--temp")           { auto v = next("--temp");           if (!v) return false; params.temp = std::stof(v); }
         else if (arg == "--repeat-penalty") { auto v = next("--repeat-penalty"); if (!v) return false; params.repeat_penalty = std::stof(v); }
+        else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
+        else if (arg == "--cfg-weight")     { auto v = next("--cfg-weight");     if (!v) return false; params.cfg_weight = std::stof(v); }
+        else if (arg == "--min-p")          { auto v = next("--min-p");          if (!v) return false; params.min_p = std::stof(v); }
+        else if (arg == "--exaggeration")   { auto v = next("--exaggeration");   if (!v) return false; params.exaggeration = std::stof(v); }
         else if (arg == "--max-sentence-chars") { auto v = next("--max-sentence-chars"); if (!v) return false; params.max_sentence_chars = std::stoi(v); }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
         else if (arg == "--crossfade-ms")   { auto v = next("--crossfade-ms");   if (!v) return false; params.crossfade_ms = std::stoi(v); }
@@ -769,6 +789,18 @@ ggml_backend_t init_backend(int n_gpu_layers) {
 // --------------------------------------------------------------------------
 
 bool load_model_gguf(const std::string & path, chatterbox_model & model, int requested_ctx, int n_gpu_layers) {
+    {
+        gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
+        gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
+        if (peek_ctx) {
+            const int64_t vk = gguf_find_key(peek_ctx, KEY_VARIANT);
+            std::string variant = (vk >= 0) ? std::string(gguf_get_val_str(peek_ctx, vk)) : std::string("t3_turbo");
+            gguf_free(peek_ctx);
+            if (variant == "t3_mtl") {
+                return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
+            }
+        }
+    }
     ggml_context * tmp_ctx = nullptr;
     gguf_init_params gguf_params = { /*.no_alloc=*/ false, /*.ctx=*/ &tmp_ctx };
     gguf_context * gguf_ctx = gguf_init_from_file(path.c_str(), gguf_params);
@@ -776,6 +808,7 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
 
     try {
         auto & hp = model.hparams;
+        hp.variant = CHBX_VARIANT_TURBO;
         hp.n_text_vocab       = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_TEXT_VOCAB_SIZE));
         hp.n_speech_vocab     = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_SPEECH_VOCAB_SIZE));
         hp.start_speech_token = (int32_t) gguf_get_val_u32(gguf_ctx, require_key(gguf_ctx, KEY_START_SPEECH));
@@ -1516,12 +1549,14 @@ int qvac_tts_cli_main(int argc, char ** argv) {
             }
         }
 
-        if ((have_se || have_ct) && params.verbose) {
-            fprintf(stderr,
-                "%s: T3 voice override — speaker_emb=%s, cond_prompt_tokens=%s\n",
-                __func__,
-                have_se ? (params.reference_audio.empty() ? "ref_dir" : "C++ VoiceEncoder") : "built-in",
-                have_ct ? (ct_from_cpp ? "C++ S3TokenizerV2" : "ref_dir") : "built-in");
+        if (have_se || have_ct) {
+            if (params.verbose) {
+                fprintf(stderr,
+                    "%s: T3 voice override — speaker_emb=%s, cond_prompt_tokens=%s\n",
+                    __func__,
+                    have_se ? (params.reference_audio.empty() ? "ref_dir" : "C++ VoiceEncoder") : "built-in",
+                    have_ct ? (ct_from_cpp ? "C++ S3TokenizerV2" : "ref_dir") : "built-in");
+            }
         } else if (!params.ref_dir.empty() || !params.reference_audio.empty()) {
             fprintf(stderr,
                 "%s: no T3 override; keeping built-in T3 voice\n", __func__);
@@ -1535,15 +1570,44 @@ int qvac_tts_cli_main(int argc, char ** argv) {
         // when --stream-chunk-tokens requests streaming output, and when
         // --dump-tokens-only prints a single token list.
         gpt2_bpe bpe;
+        mtl_tokenizer mtl_tok;
+        const bool is_mtl = (model.hparams.variant == CHBX_VARIANT_MTL);
         if (!params.text.empty()) {
-            if (model.tok_tokens.empty()) {
-                fprintf(stderr,
-                    "error: this GGUF has no embedded tokenizer. Re-run\n"
-                    "       scripts/convert-t3-turbo-to-gguf.py to produce a fresh GGUF\n"
-                    "       with tokenizer.ggml.* metadata.\n");
-                return 1;
+            if (is_mtl) {
+                if (model.mtl_tokenizer_json.empty()) {
+                    fprintf(stderr,
+                        "error: this t3_mtl GGUF has no embedded MTL tokenizer. Re-run\n"
+                        "       scripts/convert-t3-mtl-to-gguf.py.\n");
+                    return 1;
+                }
+                if (!mtl_tok.load_from_json(model.mtl_tokenizer_json)) {
+                    fprintf(stderr, "error: failed to parse embedded MTL tokenizer\n");
+                    return 1;
+                }
+                if (params.language.empty()) {
+                    fprintf(stderr,
+                        "error: t3_mtl variant requires --language CODE (tier-1: en, es, fr,\n"
+                        "       de, it, pt, nl, pl, tr, sv, da, fi, no, el, ms, sw, ar, ko).\n");
+                    return 1;
+                }
+                if (!mtl_tok.is_language_supported(params.language)) {
+                    fprintf(stderr,
+                        "error: language '%s' is not supported in this build.\n"
+                        "       Supported tier-1 codes: ", params.language.c_str());
+                    for (const auto & l : mtl_tokenizer::supported_languages()) fprintf(stderr, "%s ", l.c_str());
+                    fprintf(stderr, "\n");
+                    return 1;
+                }
+            } else {
+                if (model.tok_tokens.empty()) {
+                    fprintf(stderr,
+                        "error: this GGUF has no embedded tokenizer. Re-run\n"
+                        "       scripts/convert-t3-turbo-to-gguf.py to produce a fresh GGUF\n"
+                        "       with tokenizer.ggml.* metadata.\n");
+                    return 1;
+                }
+                bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
             }
-            bpe.load_from_arrays(model.tok_tokens, model.tok_merges);
         }
 
         const bool auto_split_enabled =
@@ -1562,6 +1626,25 @@ int qvac_tts_cli_main(int argc, char ** argv) {
         if (!params.text.empty()) {
             seg_text_tokens.reserve(text_segments.size());
             for (size_t si = 0; si < text_segments.size(); ++si) {
+                if (is_mtl) {
+                    // MTLTokenizer applies its own normalization (NFKD +
+                    // lowercase + language prefix); skip gpt2_bpe::punc_norm.
+                    std::vector<int32_t> ids = mtl_tok.encode(text_segments[si], params.language);
+                    // Python ChatterboxMultilingualTTS.generate pads with
+                    // start_text_token (255) + ids + stop_text_token (0).
+                    std::vector<int32_t> padded;
+                    padded.reserve(ids.size() + 2);
+                    padded.push_back(model.hparams.start_text_token);
+                    padded.insert(padded.end(), ids.begin(), ids.end());
+                    padded.push_back(model.hparams.stop_text_token);
+                    seg_text_tokens.push_back(std::move(padded));
+                    if (params.verbose) {
+                        fprintf(stderr, "%s: text[%zu] [lang=%s]: \"%s\" (%zu tokens incl. SOT/EOT)\n",
+                                __func__, si, params.language.c_str(),
+                                text_segments[si].c_str(), seg_text_tokens.back().size());
+                    }
+                    continue;
+                }
                 std::string normalized = gpt2_bpe::punc_norm(text_segments[si]);
                 seg_text_tokens.push_back(bpe.tokenize(normalized));
                 if (params.verbose) {
@@ -1615,26 +1698,57 @@ int qvac_tts_cli_main(int argc, char ** argv) {
 
         auto run_t3_for_segment = [&](size_t si) {
             const int64_t _t0 = ggml_time_us();
-            std::vector<float> logits;
-            int prompt_len = 0;
-            if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
-                throw std::runtime_error("prompt eval failed");
-
-            int n_past = prompt_len;
+            int n_past = 0;
             std::vector<int32_t> generated;
             generated.reserve(params.n_predict + 1);
 
-            int32_t current = sample_next_token(logits, generated, params, rng);
-            generated.push_back(current);
+            if (is_mtl) {
+                chatterbox_sampling_params sp;
+                sp.top_k          = params.top_k;
+                sp.top_p          = params.top_p;
+                sp.temp           = params.temp;
+                sp.repeat_penalty = params.repeat_penalty;
+                sp.min_p          = params.min_p;
+                sp.cfg_weight     = params.cfg_weight;
 
-            for (int i = 0; i < params.n_predict; ++i) {
-                if (current == model.hparams.stop_speech_token) break;
-                if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-                if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                    throw std::runtime_error("step eval failed");
-                ++n_past;
-                current = sample_next_token(logits, generated, params, rng);
+                std::vector<float> logits_c, logits_u;
+                int prompt_len = 0;
+                if (!eval_prompt_mtl(model, allocr, params.n_threads,
+                                     seg_text_tokens[si], params.exaggeration,
+                                     logits_c, logits_u, prompt_len))
+                    throw std::runtime_error("prompt eval failed");
+                n_past = prompt_len;
+
+                int32_t current = sample_next_token_mtl(logits_c, logits_u, generated, sp, rng);
                 generated.push_back(current);
+
+                for (int i = 0; i < params.n_predict; ++i) {
+                    if (current == model.hparams.stop_speech_token) break;
+                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+                    if (!eval_step_mtl(model, allocr, params.n_threads, n_past, current,
+                                       logits_c, logits_u))
+                        throw std::runtime_error("step eval failed");
+                    ++n_past;
+                    current = sample_next_token_mtl(logits_c, logits_u, generated, sp, rng);
+                    generated.push_back(current);
+                }
+            } else {
+                std::vector<float> logits;
+                int prompt_len = 0;
+                if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
+                    throw std::runtime_error("prompt eval failed");
+                n_past = prompt_len;
+                int32_t current = sample_next_token(logits, generated, params, rng);
+                generated.push_back(current);
+                for (int i = 0; i < params.n_predict; ++i) {
+                    if (current == model.hparams.stop_speech_token) break;
+                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+                    if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
+                        throw std::runtime_error("step eval failed");
+                    ++n_past;
+                    current = sample_next_token(logits, generated, params, rng);
+                    generated.push_back(current);
+                }
             }
 
             if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)

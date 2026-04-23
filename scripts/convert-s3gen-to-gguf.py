@@ -33,15 +33,51 @@ from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 
 
-REPO_ID = "ResembleAI/chatterbox-turbo"
+TURBO_REPO_ID = "ResembleAI/chatterbox-turbo"
+MTL_REPO_ID   = "ResembleAI/chatterbox"
+
+VARIANTS = {
+    "turbo": {
+        "repo_id": TURBO_REPO_ID,
+        "allow_patterns": ["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
+        "ckpt_filename": "s3gen_meanflow.safetensors",
+        "loader": "safetensors",
+        "gguf_name": "Chatterbox Turbo S3Gen",
+        "gguf_description": "S3Gen flow + mel2wav (HiFT) for ggml port.",
+        "meanflow": True,
+        "n_timesteps": 2,
+        "cfg_rate": 0.0,
+    },
+    "mtl": {
+        "repo_id": MTL_REPO_ID,
+        "allow_patterns": ["ve.pt", "t3_mtl23ls_v2.safetensors", "s3gen.pt",
+                           "grapheme_mtl_merged_expanded_v1.json", "conds.pt", "Cangjie5_TC.json"],
+        "ckpt_filename": "s3gen.pt",
+        "loader": "torch",
+        "gguf_name": "Chatterbox Multilingual S3Gen",
+        "gguf_description": "S3Gen standard-CFM (10-step Euler, CFG) + HiFT vocoder for ggml port.",
+        "meanflow": False,
+        "n_timesteps": 10,
+        "cfg_rate": 0.7,
+    },
+}
 
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--variant", choices=list(VARIANTS.keys()), default="turbo",
+                    help="Which S3Gen checkpoint to convert. 'turbo' = meanflow (2-step),"
+                         " 'mtl' = standard CFM (10-step + CFG).")
     ap.add_argument("--ckpt-dir", type=Path)
-    ap.add_argument("--out", type=Path, default=Path("models/chatterbox-s3gen.gguf"))
+    ap.add_argument("--out", type=Path, default=None,
+                    help="Defaults to models/chatterbox-s3gen.gguf (turbo) or "
+                         "models/chatterbox-s3gen-mtl.gguf (mtl).")
     ap.add_argument("--hf-token")
-    return ap.parse_args()
+    args = ap.parse_args()
+    if args.out is None:
+        args.out = Path("models/chatterbox-s3gen-mtl.gguf") if args.variant == "mtl" \
+                   else Path("models/chatterbox-s3gen.gguf")
+    return args
 
 
 def as_numpy(tensor: torch.Tensor, *, dtype=None) -> np.ndarray:
@@ -123,17 +159,24 @@ def export_conformer_block(writer: gguf.GGUFWriter, state: dict, prefix: str, gg
 
 def main():
     args = parse_args()
+    cfg = VARIANTS[args.variant]
     if args.ckpt_dir:
         ckpt_dir = args.ckpt_dir
     else:
         ckpt_dir = Path(snapshot_download(
-            repo_id=REPO_ID, token=args.hf_token,
-            allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
+            repo_id=cfg["repo_id"], token=args.hf_token,
+            allow_patterns=cfg["allow_patterns"],
         ))
     args.out.parent.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading s3gen_meanflow from {ckpt_dir}")
-    raw = load_file(ckpt_dir / "s3gen_meanflow.safetensors")
+    ckpt_path = ckpt_dir / cfg["ckpt_filename"]
+    print(f"Loading {ckpt_path}")
+    if cfg["loader"] == "safetensors":
+        raw = load_file(ckpt_path)
+    elif cfg["loader"] == "torch":
+        raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    else:
+        raise ValueError(f"unknown loader: {cfg['loader']}")
     state = expand_weight_norm(raw)
 
     print(f"Resolved {len([k for k in raw if 'parametrizations' in k])} weight_norm entries")
@@ -142,8 +185,13 @@ def main():
     gen = conds["gen"]
 
     writer = gguf.GGUFWriter(str(args.out), "chatterbox-s3gen")
-    writer.add_name("Chatterbox Turbo S3Gen")
-    writer.add_description("S3Gen flow + mel2wav (HiFT) for ggml port.")
+    writer.add_name(cfg["gguf_name"])
+    writer.add_description(cfg["gguf_description"])
+
+    writer.add_string("s3gen.variant", args.variant)
+    writer.add_bool("s3gen.meanflow", cfg["meanflow"])
+    writer.add_uint32("s3gen.n_timesteps", cfg["n_timesteps"])
+    writer.add_float32("s3gen.cfg_rate", cfg["cfg_rate"])
 
     # Meta / hparams
     writer.add_uint32("s3gen.speech_vocab_size", 6561)
@@ -247,7 +295,7 @@ def main():
     # -------------------------------------------------------------------------
     speaker_keys = [k for k in state if k.startswith("speaker_encoder.")]
     if not speaker_keys:
-        print("warning: no speaker_encoder.* tensors found in s3gen.safetensors")
+        print(f"warning: no speaker_encoder.* tensors found in {ckpt_path}")
     else:
         BN_EPS = 1e-5  # torch.nn.BatchNorm default
 
@@ -369,7 +417,7 @@ def main():
     # -------------------------------------------------------------------------
     tok_keys = [k for k in state if k.startswith("tokenizer.")]
     if not tok_keys:
-        print("warning: no tokenizer.* tensors found in s3gen.safetensors")
+        print(f"warning: no tokenizer.* tensors found in {ckpt_path}")
     else:
         n_tok = 0
         for k in tok_keys:

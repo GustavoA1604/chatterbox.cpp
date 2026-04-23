@@ -85,6 +85,15 @@ struct model_ctx {
     ggml_context * ctx_w = nullptr;
     ggml_backend_buffer_t buffer_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
+
+    // Variant metadata read from GGUF once at load time.
+    //   meanflow=true  : Turbo (2-step Euler, time_embed_mixer, noised_mels overlay,
+    //                    no CFG on the CFM side)
+    //   meanflow=false : Multilingual (10-step Euler with cosine t_schedule,
+    //                    classifier-free-guidance via cfg_rate)
+    bool  meanflow    = true;
+    int   n_timesteps = 2;
+    float cfg_rate    = 0.0f;
 };
 
 static ggml_backend_t s3gen_init_backend(int n_gpu_layers, bool verbose) {
@@ -211,6 +220,21 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
         ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
     }
+
+    {
+        int64_t k_mf = gguf_find_key(g, "s3gen.meanflow");
+        int64_t k_ts = gguf_find_key(g, "s3gen.n_timesteps");
+        int64_t k_cf = gguf_find_key(g, "s3gen.cfg_rate");
+        m.meanflow    = (k_mf >= 0) ? gguf_get_val_bool(g, k_mf) : true;
+        m.n_timesteps = (k_ts >= 0) ? (int) gguf_get_val_u32(g, k_ts) : (m.meanflow ? 2 : 10);
+        m.cfg_rate    = (k_cf >= 0) ? gguf_get_val_f32(g, k_cf) : (m.meanflow ? 0.0f : 0.7f);
+        if (verbose) {
+            fprintf(stderr, "  s3gen variant: %s (n_timesteps=%d, cfg_rate=%.2f)\n",
+                    m.meanflow ? "meanflow" : "standard CFM + CFG",
+                    m.n_timesteps, m.cfg_rate);
+        }
+    }
+
     gguf_free(g);
     ggml_free(tmp_ctx);
     return m;
@@ -1598,19 +1622,23 @@ int s3gen_synthesize_to_wav(
         fprintf(stderr, "  [mu vs step0_mu] max_abs=%.4e rms=%.4e vs ref\n", ma, std::sqrt(rsum / nm));
     }
 
-    // 6) For meanflow: z = randn(80, T_mu); then z[:, prompt_len:] = noised_mels (randn(80, T_speech*2))
-    vlog("Initializing CFM noise (seed=%d, meanflow)...\n", seed);
+    // 6) Initial CFM noise.  Layout mirrors Python: z has shape (80, T_mu).
+    //
+    //  - meanflow (Turbo):   randn everywhere, then replace the speech region
+    //                        with a second independent randn draw (matches
+    //                        `flow_matching.forward`'s `noised_mels` overlay).
+    //  - standard CFM (MTL): randn(80, T_mu) once; no overlay.  The speech
+    //                        region is implicitly conditioned through `cond`
+    //                        instead of via an extra noise tensor.
+    const bool meanflow = m.meanflow;
+    vlog("Initializing CFM noise (seed=%d, %s)...\n", seed,
+            meanflow ? "meanflow" : "standard CFM + CFG");
     std::vector<float> z(T_mu * MEL);
     int n_speech_part = 2 * (int)padded.size();
     int prompt_len_in_mu = T_mu - n_speech_part;
     vlog("  T_mu=%d prompt_len_in_mu=%d n_speech_part=%d\n",
             T_mu, prompt_len_in_mu, n_speech_part);
     if (!opts.cfm_z0_override.empty()) {
-        // Streaming validation path: use the exact noise Python used for
-        // this chunk so we can get bit-exact mel parity.  This override must
-        // be the FINAL z passed to the CFM estimator (i.e. including the
-        // speech-region overwrite that flow_matching.forward applies when
-        // `noised_mels` is not None in meanflow mode).
         if ((int64_t)opts.cfm_z0_override.size() != (int64_t)T_mu * MEL) {
             fprintf(stderr, "error: cfm_z0_override has %zu elements but T_mu*MEL=%d\n",
                     opts.cfm_z0_override.size(), T_mu * MEL);
@@ -1619,16 +1647,14 @@ int s3gen_synthesize_to_wav(
         std::memcpy(z.data(), opts.cfm_z0_override.data(), z.size() * sizeof(float));
         fprintf(stderr, "  [stream] loaded %zu elems of CFM z0 from cfm_z0_override\n",
                 opts.cfm_z0_override.size());
-    } else if (debug_mode) {
+    } else if (debug_mode && meanflow) {
         npy_array z_npy = npy_load(ref_dir + "/cfm_z0_raw.npy");
         std::memcpy(z.data(), z_npy.data.data(), z.size() * sizeof(float));
         fprintf(stderr, "  [debug] loaded z from cfm_z0_raw.npy\n");
-        // Overwrite z[:, prompt_len:] with noised_mels
         npy_array nm_npy = npy_load(ref_dir + "/cfm_noised_mels.npy");
         const float * nm = (const float*)nm_npy.data.data();
         int nm_T = (int)nm_npy.shape[1];
         fprintf(stderr, "  [debug] overlay noised_mels (80, %d) at pos %d\n", nm_T, prompt_len_in_mu);
-        // z ne=[T_mu, MEL]; write rows [prompt_len_in_mu .. prompt_len_in_mu+nm_T) of each channel
         for (int m2 = 0; m2 < MEL; ++m2)
             for (int t = 0; t < nm_T; ++t)
                 z[m2 * T_mu + (prompt_len_in_mu + t)] = nm[m2 * nm_T + t];
@@ -1636,24 +1662,39 @@ int s3gen_synthesize_to_wav(
         std::mt19937 rng(seed);
         std::normal_distribution<float> gauss(0.0f, 1.0f);
         for (size_t i = 0; i < z.size(); ++i) z[i] = gauss(rng);
-        // For meanflow production, also resample the non-prompt region independently:
-        // (Python: noise = torch.randn(1, 80, speech_tokens.size(-1)*2); z[..., prompt_len:] = noise)
-        std::mt19937 rng2(seed + 2);
-        std::normal_distribution<float> gauss2(0.0f, 1.0f);
-        for (int m2 = 0; m2 < MEL; ++m2)
-            for (int t = prompt_len_in_mu; t < T_mu; ++t)
-                z[m2 * T_mu + t] = gauss2(rng2);
+        if (meanflow) {
+            std::mt19937 rng2(seed + 2);
+            std::normal_distribution<float> gauss2(0.0f, 1.0f);
+            for (int m2 = 0; m2 < MEL; ++m2)
+                for (int t = prompt_len_in_mu; t < T_mu; ++t)
+                    z[m2 * T_mu + t] = gauss2(rng2);
+        }
     }
 
-    // 7) CFM loop: default 2-step meanflow (t_span = [0, 0.5, 1]); streaming
-    // callers can override via opts.cfm_steps = 1 for a single Euler jump
-    // (~2× CFM speedup at the cost of a small quality degradation — Turbo
-    // is meanflow-trained so 1-step is a valid sampling mode, just noisier).
+    // 7) CFM loop.
+    //  - meanflow:      t_span linearly spaced on [0,1], default 2 steps,
+    //                   one estimator call per step, t_emb mixed with r via
+    //                   the meanflow-only time_embed_mixer.
+    //  - standard CFM:  t_span cosine-scheduled, default 10 steps, two
+    //                   estimator calls per step (cond + uncond with zeroed
+    //                   mu/spks/cond) combined via cfg_rate.
     std::vector<float> t_span;
-    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps : 2;
+    const int cfm_steps = opts.cfm_steps > 0 ? opts.cfm_steps :
+                          (meanflow ? 2 : m.n_timesteps);
     t_span.reserve(cfm_steps + 1);
-    for (int i = 0; i <= cfm_steps; ++i)
-        t_span.push_back((float)i / (float)cfm_steps);
+    for (int i = 0; i <= cfm_steps; ++i) {
+        float tau = (float)i / (float)cfm_steps;
+        if (!meanflow) {
+            tau = 1.0f - std::cos(tau * 0.5f * (float)M_PI);
+        }
+        t_span.push_back(tau);
+    }
+
+    const float cfg_rate = m.cfg_rate;
+    const std::vector<float> zero_mu  (T_mu * MEL, 0.0f);
+    const std::vector<float> zero_cond(T_mu * MEL, 0.0f);
+    const std::vector<float> zero_spks(MEL, 0.0f);
+
     cfm_estimator_cache cfm_cache;
     double cfm_t0 = now_ms();
     for (size_t s = 0; s < t_span.size() - 1; ++s) {
@@ -1661,10 +1702,15 @@ int s3gen_synthesize_to_wav(
         float dt = r - t;
         vlog("CFM step %zu: t=%g r=%g dt=%g...\n", s, t, r, dt);
         auto t_mlp = compute_time_mlp(m, t);
-        auto r_mlp = compute_time_mlp(m, r);
-        auto t_emb = compute_time_mixed(m, t_mlp, r_mlp);
+        std::vector<float> t_emb;
+        if (meanflow) {
+            auto r_mlp = compute_time_mlp(m, r);
+            t_emb = compute_time_mixed(m, t_mlp, r_mlp);
+        } else {
+            t_emb = std::move(t_mlp);
+        }
 
-        if (debug_mode) {
+        if (debug_mode && meanflow) {
             npy_array ref = npy_load(ref_dir + "/cfm_t_mix_call" + std::to_string(s) + ".npy");
             const float * r_ = (const float*)ref.data.data();
             size_t n = std::min(t_emb.size(), ref.n_elements());
@@ -1672,7 +1718,6 @@ int s3gen_synthesize_to_wav(
             for (size_t i = 0; i < n; ++i) { float d = t_emb[i] - r_[i]; ma = std::max(ma, std::fabs(d)); rsum += d*d; }
             fprintf(stderr, "    [t_emb step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / n));
 
-            // Dump my x_in and see if it matches reference cfm_step{s}_x_in.npy
             npy_array ref_x = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_x_in.npy");
             const float * rx = (const float*)ref_x.data.data();
             size_t nx = std::min(z.size(), ref_x.n_elements());
@@ -1682,10 +1727,18 @@ int s3gen_synthesize_to_wav(
         }
 
         double step_t0 = now_ms();
-        auto dxdt = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
+        auto dxdt_cond = cfm_estimator_forward(m, cfm_cache, z, mu, t_emb, spks, cond, T_mu);
+        if (!meanflow && cfg_rate != 0.0f) {
+            auto dxdt_uncond = cfm_estimator_forward(m, cfm_cache, z, zero_mu, t_emb,
+                                                     zero_spks, zero_cond, T_mu);
+            for (size_t i = 0; i < dxdt_cond.size(); ++i) {
+                dxdt_cond[i] = (1.0f + cfg_rate) * dxdt_cond[i] - cfg_rate * dxdt_uncond[i];
+            }
+        }
+        auto & dxdt = dxdt_cond;
         vlog("  [cfm_step%zu] %.1f ms\n", s, now_ms() - step_t0);
 
-        if (debug_mode) {
+        if (debug_mode && meanflow) {
             npy_array ref = npy_load(ref_dir + "/cfm_step" + std::to_string(s) + "_dxdt.npy");
             const float * r_ = (const float*)ref.data.data();
             size_t n = std::min(dxdt.size(), ref.n_elements());
@@ -1694,7 +1747,6 @@ int s3gen_synthesize_to_wav(
             fprintf(stderr, "    [dxdt step%zu] max_abs=%.4e rms=%.4e vs ref\n", s, ma, std::sqrt(rsum / n));
         }
 
-        // Streaming: dump step0 dxdt for per-chunk bisection.
         if (s == 0 && !opts.dump_mel_path.empty()) {
             std::string base = opts.dump_mel_path;
             if (base.size() > 4 && base.substr(base.size() - 4) == ".npy")
