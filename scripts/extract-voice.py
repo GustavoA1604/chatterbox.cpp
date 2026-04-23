@@ -48,9 +48,21 @@ SAMPLE_RATE     = 24000
 
 # ---------------------------------------------------------------------------
 # Filter chains — tuned for Chatterbox's 80-channel log-mel pipeline.
-# The "lossy" chain restores presence / air that low-bitrate codecs throw away
-# and loudness-normalises so the speaker embedding doesn't drift on the
-# shouted/whispered axis.  The "clean" chain trusts the source.
+#
+# "clean"     — minimal (highpass + alimiter), trust the source.  Right
+#               thing for WAV/FLAC and high-bitrate AAC/MP3.
+# "lossy"     — restores presence / air that low-bitrate codecs strip and
+#               loudness-normalises so the speaker embedding doesn't drift
+#               on the shouted/whispered axis.  Good for short sources
+#               without a usable silent region.
+# "noisered"  — SoX noiseprof + noisered: profile the file's silent head,
+#               spectrally subtract that codec noise floor from the speech
+#               window, then highpass + peak-normalise.  On an 18 kbps
+#               Opus source this beat the "lossy" chain cleanly in our
+#               A/B testing (the voice encoder preferred cleaner-but-
+#               duller over synthetic-brightness-tacked-on).  Requires
+#               SoX and at least ~0.3 s of silence at the start of the
+#               file (ffprobed via silencedetect).
 # ---------------------------------------------------------------------------
 FILTER_CHAIN_CLEAN = (
     "highpass=f=60,"
@@ -65,6 +77,12 @@ FILTER_CHAIN_LOSSY = (
     "loudnorm=I=-18:TP=-2:LRA=8,"
     "alimiter=limit=0.85:level=disabled"
 )
+
+# "noisered" is executed via SoX, not as an ffmpeg -af string.  See
+# extract_via_sox_noisered() below.
+NOISERED_MIN_SILENT_HEAD = 0.3   # s of silence at the start of the file
+                                 # required before we can build a noise
+                                 # profile.
 
 # Sources with any of these codec + bitrate combinations are treated as "lossy".
 LOSSY_CODECS = {"opus", "vorbis"}
@@ -104,6 +122,11 @@ class SourceInfo:
     bitrate:    int         # bps; 0 = unknown
     channels:   int
     sample_rate: int
+    silent_head:  float = 0.0    # duration of silence at start of file (s)
+    # (start, length) of the longest internal silence block in the file;
+    # (0, 0) if nothing found.  Used as the noise-profile source when
+    # silent_head is too short.
+    longest_silence: tuple = (0.0, 0.0)
 
     @property
     def is_lossy(self) -> bool:
@@ -111,6 +134,31 @@ class SourceInfo:
             return True
         thr = LOSSY_BITRATE_THRESHOLD.get(self.codec)
         return thr is not None and 0 < self.bitrate <= thr
+
+    def noise_profile_source(self) -> tuple[float, float] | None:
+        """
+        Pick the best (start, length) window to use as noise profile source.
+        Preference order:
+          1. Any internal silence block >= NOISERED_MIN_SILENT_HEAD (we take
+             a 0.3 s slice from its middle — more likely to be true room
+             tone than the edges, which often contain breath tails).
+          2. The silent head of the file, if long enough.
+          3. The first 0.3 s of the file even when it's speech.  SoX's
+             spectral subtraction of "speech-tonality" content empirically
+             produces a result the voice encoder likes on heavily
+             Opus-damaged sources (beats the EQ-boost chain in A/B).
+        Returns None only when the file is too short for any profile.
+        """
+        st, ln = self.longest_silence
+        if ln >= NOISERED_MIN_SILENT_HEAD:
+            prof_len = min(0.3, ln - 0.05)
+            prof_start = st + (ln - prof_len) / 2.0
+            return prof_start, prof_len
+        if self.silent_head >= NOISERED_MIN_SILENT_HEAD:
+            return 0.0, min(0.3, self.silent_head - 0.05)
+        if self.duration >= 0.4:
+            return 0.0, 0.3
+        return None
 
 
 def probe(path: Path) -> SourceInfo:
@@ -175,6 +223,25 @@ def find_speech_regions(info: SourceInfo,
         cursor = e
     if cursor < info.duration:
         regions.append(Region(cursor, info.duration))
+
+    # Record how much silence (if any) sits at the head of the file, so
+    # the caller can decide whether a SoX-noiseprof noise-subtraction
+    # pass is viable.  silencedetect brackets SILENCE intervals, so the
+    # first silence_end is effectively the length of leading silence.
+    if ends and (not starts or ends[0] < starts[0]):
+        info.silent_head = ends[0]
+
+    # Also track the longest internal silence block so the noisered chain
+    # has an in-file noise sample even when the file starts with speech.
+    # silencedetect gives us paired (start, end) intervals.
+    best_len = 0.0
+    best_st  = 0.0
+    for s, e in zip(starts, ends):
+        ln = e - s
+        if ln > best_len:
+            best_len = ln
+            best_st  = s
+    info.longest_silence = (best_st, best_len)
 
     # Drop micro-fragments; they're usually plosives / sniffs, not speech.
     return [r for r in regions if r.length >= 1.0]
@@ -266,53 +333,160 @@ def plan_window(regions: list[Region],
 
 
 # ---------------------------------------------------------------------------
-# ffmpeg extraction
+# Extraction — ffmpeg chain OR SoX noiseprof pipeline
 # ---------------------------------------------------------------------------
-def extract(info: SourceInfo, plan: WindowPlan, out_wav: Path,
-            force_chain: str | None = None, verbose: bool = False) -> None:
-    chain = force_chain or (FILTER_CHAIN_LOSSY if info.is_lossy else FILTER_CHAIN_CLEAN)
+def _pick_chain(info: SourceInfo, override: str | None) -> str:
+    """Pick the chain name: 'clean' | 'lossy' | 'noisered'."""
+    if override:
+        return override
+    if info.is_lossy:
+        # Prefer the SoX noise-profile pipeline; it beat the EQ-boost
+        # "lossy" chain on 18 kbps Opus in A/B testing.  noise_profile_
+        # source() falls back to sampling the first 0.3 s of the file
+        # even when that's speech (SoX's spectral subtraction happens
+        # to produce a voice-encoder-friendly signal in that case too).
+        if shutil.which("sox") and info.noise_profile_source() is not None:
+            return "noisered"
+        return "lossy"
+    return "clean"
 
+
+def _extract_ffmpeg_chain(info: SourceInfo, plan: WindowPlan, out_wav: Path,
+                          chain_str: str, verbose: bool) -> None:
+    """Run a standard ffmpeg -af chain over the window(s)."""
     if len(plan.segments) == 1:
         seg = plan.segments[0]
         cmd = [
             "ffmpeg", "-y", "-v", "error",
             "-ss", f"{seg.start:.3f}", "-i", str(info.path), "-t", f"{seg.length:.3f}",
             "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
-            "-af", chain,
+            "-af", chain_str,
             str(out_wav),
         ]
         if verbose:
             sys.stderr.write("$ " + " ".join(cmd) + "\n")
         _run(cmd)
-    else:
-        # Run each segment through the filter chain separately (so e.g.
-        # loudnorm sees consistent material within a segment), then concat.
-        tmp_files: list[Path] = []
-        for i, seg in enumerate(plan.segments):
-            tmp = out_wav.with_suffix(f".part{i}.wav")
-            cmd = [
-                "ffmpeg", "-y", "-v", "error",
-                "-ss", f"{seg.start:.3f}", "-i", str(info.path), "-t", f"{seg.length:.3f}",
-                "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
-                "-af", chain,
-                str(tmp),
-            ]
-            if verbose:
-                sys.stderr.write("$ " + " ".join(cmd) + "\n")
-            _run(cmd)
-            tmp_files.append(tmp)
+        return
 
-        # Concat via ffmpeg's concat demuxer.
-        list_txt = out_wav.with_suffix(".concat.txt")
-        list_txt.write_text("".join(f"file '{p.resolve()}'\n" for p in tmp_files))
-        cmd = ["ffmpeg", "-y", "-v", "error",
-               "-f", "concat", "-safe", "0", "-i", str(list_txt),
-               "-c", "copy", str(out_wav)]
+    # Multiple segments: filter each separately (so loudnorm etc. sees
+    # consistent material), concat via the concat demuxer.
+    tmp_files: list[Path] = []
+    for i, seg in enumerate(plan.segments):
+        tmp = out_wav.with_suffix(f".part{i}.wav")
+        cmd = [
+            "ffmpeg", "-y", "-v", "error",
+            "-ss", f"{seg.start:.3f}", "-i", str(info.path), "-t", f"{seg.length:.3f}",
+            "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
+            "-af", chain_str,
+            str(tmp),
+        ]
         if verbose:
             sys.stderr.write("$ " + " ".join(cmd) + "\n")
         _run(cmd)
-        for p in tmp_files + [list_txt]:
+        tmp_files.append(tmp)
+
+    # Concat via ffmpeg's concat demuxer.
+    list_txt = out_wav.with_suffix(".concat.txt")
+    list_txt.write_text("".join(f"file '{p.resolve()}'\n" for p in tmp_files))
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-f", "concat", "-safe", "0", "-i", str(list_txt),
+           "-c", "copy", str(out_wav)]
+    if verbose:
+        sys.stderr.write("$ " + " ".join(cmd) + "\n")
+    _run(cmd)
+    for p in tmp_files + [list_txt]:
+        p.unlink(missing_ok=True)
+
+
+def _extract_sox_noisered(info: SourceInfo, plan: WindowPlan, out_wav: Path,
+                          verbose: bool) -> None:
+    """
+    Two-pass pipeline: sox noiseprof on a silent snippet from the head of
+    the file, then sox noisered on the ffmpeg-extracted speech window.
+    The final signal is highpass-filtered at 60 Hz and peak-normalised to
+    -3 dBFS, matching the 'S' variant that won the A/B test.
+    """
+    _require("sox")
+    prof = info.noise_profile_source()
+    if prof is None:
+        sys.exit(f"error: 'noisered' chain needs at least 0.3 s of source to sample "
+                 f"as a noise profile (file is only {info.duration:.2f} s)")
+    prof_start, prof_len = prof
+    noise_wav  = out_wav.with_suffix(".noise.wav")
+    noise_prof = out_wav.with_suffix(".noise.prof")
+    raw_wav    = out_wav.with_suffix(".raw.wav")
+
+    # 1) Extract noise snippet as 24 kHz mono s16le.
+    cmd = ["ffmpeg", "-y", "-v", "error",
+           "-ss", f"{prof_start:.3f}", "-t", f"{prof_len:.3f}", "-i", str(info.path),
+           "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
+           str(noise_wav)]
+    if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+    _run(cmd)
+
+    # 2) Build the noise profile.
+    cmd = ["sox", str(noise_wav), "-n", "noiseprof", str(noise_prof)]
+    if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+    _run(cmd)
+
+    # 3) Extract the speech window (possibly concat if the plan is
+    #    two regions) to a raw 24 kHz mono s16le wav.
+    if len(plan.segments) == 1:
+        seg = plan.segments[0]
+        cmd = ["ffmpeg", "-y", "-v", "error",
+               "-ss", f"{seg.start:.3f}", "-i", str(info.path), "-t", f"{seg.length:.3f}",
+               "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
+               str(raw_wav)]
+        if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+        _run(cmd)
+    else:
+        tmp_parts: list[Path] = []
+        for i, seg in enumerate(plan.segments):
+            p = out_wav.with_suffix(f".part{i}.wav")
+            cmd = ["ffmpeg", "-y", "-v", "error",
+                   "-ss", f"{seg.start:.3f}", "-i", str(info.path), "-t", f"{seg.length:.3f}",
+                   "-ac", "1", "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
+                   str(p)]
+            if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+            _run(cmd)
+            tmp_parts.append(p)
+        list_txt = out_wav.with_suffix(".concat.txt")
+        list_txt.write_text("".join(f"file '{p.resolve()}'\n" for p in tmp_parts))
+        cmd = ["ffmpeg", "-y", "-v", "error",
+               "-f", "concat", "-safe", "0", "-i", str(list_txt),
+               "-c", "copy", str(raw_wav)]
+        if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+        _run(cmd)
+        for p in tmp_parts + [list_txt]:
             p.unlink(missing_ok=True)
+
+    # 4) Apply noise reduction + highpass + normalise to -3 dBFS.
+    cmd = ["sox", str(raw_wav), str(out_wav),
+           "noisered", str(noise_prof), "0.2",
+           "highpass", "60",
+           "gain", "-n", "-3"]
+    if verbose: sys.stderr.write("$ " + " ".join(cmd) + "\n")
+    _run(cmd)
+
+    # Clean up intermediates.
+    for p in (noise_wav, noise_prof, raw_wav):
+        p.unlink(missing_ok=True)
+
+
+def extract(info: SourceInfo, plan: WindowPlan, out_wav: Path,
+            chain: str, verbose: bool = False) -> None:
+    """
+    Dispatch on `chain` (one of "clean" / "lossy" / "noisered") and run
+    the matching extraction pipeline.
+    """
+    if chain == "noisered":
+        _extract_sox_noisered(info, plan, out_wav, verbose)
+    elif chain == "lossy":
+        _extract_ffmpeg_chain(info, plan, out_wav, FILTER_CHAIN_LOSSY, verbose)
+    elif chain == "clean":
+        _extract_ffmpeg_chain(info, plan, out_wav, FILTER_CHAIN_CLEAN, verbose)
+    else:
+        sys.exit(f"internal error: unknown chain {chain!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +533,9 @@ def main() -> None:
                     help="silencedetect noise threshold in dBFS (default: -30)")
     ap.add_argument("--silence-min", type=float, default=0.3,
                     help="silencedetect min-silence duration in seconds (default: 0.3)")
-    ap.add_argument("--force-chain", choices=["clean", "lossy"], default=None,
-                    help="Override auto filter-chain pick (default: auto by codec/bitrate)")
+    ap.add_argument("--force-chain", choices=["clean", "lossy", "noisered"], default=None,
+                    help="Override auto filter-chain pick.  'noisered' requires SoX on "
+                         "PATH and at least 0.3 s of silence at the start of the source.")
     ap.add_argument("--bake", action="store_true",
                     help="After extracting, call ./build/chatterbox --save-voice to "
                          "pre-compute the 5 conditioning tensors (faster future runs).")
@@ -383,15 +558,22 @@ def main() -> None:
     ref_wav = args.out_dir / f"{name}.wav"
 
     info = probe(args.input)
-    chain = "lossy" if info.is_lossy else "clean"
-    if args.force_chain:
-        chain = args.force_chain
+
+    # silencedetect runs first because we need info.silent_head in order
+    # to decide whether the 'noisered' chain is viable.
+    regions = find_speech_regions(info, args.silence_db, args.silence_min)
+    chain = _pick_chain(info, args.force_chain)
 
     print(f"source:  {info.path}")
     print(f"         {info.duration:.2f}s, {info.codec}@{info.bitrate//1000 if info.bitrate else '?'}kbps, "
-          f"{info.channels}ch @ {info.sample_rate}Hz  -> filter chain: {chain}")
-
-    regions = find_speech_regions(info, args.silence_db, args.silence_min)
+          f"{info.channels}ch @ {info.sample_rate}Hz")
+    print(f"         lossy={info.is_lossy}, silent_head={info.silent_head:.2f}s, "
+          f"longest_silence={info.longest_silence[1]:.2f}s  -> chain: {chain}")
+    if chain == "noisered":
+        prof = info.noise_profile_source()
+        if prof:
+            ps, pl = prof
+            print(f"         noise profile: [{ps:.2f}..{ps+pl:.2f}]  ({pl:.2f}s)")
     print(f"speech regions ({len(regions)}):")
     for r in regions:
         print(f"  [{r.start:7.2f}..{r.end:7.2f}]  ({r.length:5.2f}s)")
@@ -402,8 +584,7 @@ def main() -> None:
         print(f"         extract [{s.start:.2f}..{s.end:.2f}]  ({s.length:.2f}s)")
     print(f"total:   {plan.total:.2f}s")
 
-    force_chain_str = FILTER_CHAIN_LOSSY if chain == "lossy" else FILTER_CHAIN_CLEAN
-    extract(info, plan, ref_wav, force_chain=force_chain_str, verbose=args.verbose)
+    extract(info, plan, ref_wav, chain, verbose=args.verbose)
     print(f"wrote:   {ref_wav}")
 
     if args.bake:
