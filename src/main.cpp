@@ -428,6 +428,8 @@ static bool compute_speech_tokens_native(const std::string & wav_path,
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 // Save the five voice-conditioning tensors to a directory as .npy so later
 // runs can reuse them via --ref-dir (no --reference-audio needed), skipping
@@ -1800,8 +1802,15 @@ int main(int argc, char ** argv) {
             gpt2_bpe bpe_live;
             bpe_live.load_from_arrays(model.tok_tokens, model.tok_merges);
 
-            FILE * in_fp = fopen(params.input_file.c_str(), "rb");
-            if (!in_fp) {
+            // Use open()/read() on a plain fd rather than fopen()/fread()
+            // because macOS/Linux stdio keeps its own readahead buffer; once
+            // a FILE* hits EOF the buffer can happily keep returning 0 for
+            // many subsequent reads even after the writer appended new
+            // bytes and we called clearerr().  read() always asks the
+            // kernel for the current state, which is what `tail -f`
+            // semantics require.
+            int in_fd = open(params.input_file.c_str(), O_RDONLY);
+            if (in_fd < 0) {
                 fprintf(stderr, "error: cannot open --input-file '%s': %s\n",
                         params.input_file.c_str(), std::strerror(errno));
                 free_t3();
@@ -1894,8 +1903,17 @@ int main(int argc, char ** argv) {
                     char c = pending[i];
                     if (c != '.' && c != '!' && c != '?' && c != '\n') continue;
                     const bool at_end = (i + 1 == pending.size());
-                    const bool nx_ws  = !at_end && is_ws((unsigned char)pending[i + 1]);
-                    if (c == '\n' || at_end || nx_ws) {
+                    const unsigned char nx =
+                        at_end ? 0 : (unsigned char)pending[i + 1];
+                    const bool nx_ws     = !at_end && is_ws(nx);
+                    // Writers that pack sentences back-to-back without a
+                    // space after the terminator (e.g. "Hello.World." from
+                    // an LLM that forgot punctuation spacing) would
+                    // otherwise bundle everything into one utterance.
+                    // Accept "<.!?> + <uppercase letter>" as a sentence
+                    // break too.
+                    const bool nx_upper  = !at_end && nx >= 'A' && nx <= 'Z';
+                    if (c == '\n' || at_end || nx_ws || nx_upper) {
                         size_t j = i + 1;
                         while (j < pending.size() && is_ws((unsigned char)pending[j])) ++j;
                         out.assign(pending, 0, j);
@@ -2052,7 +2070,11 @@ int main(int argc, char ** argv) {
             int loop_rc = 0;
             auto last_data_at = std::chrono::steady_clock::now();
             while (!live_stop.load()) {
-                const size_t n = fread(read_buf.data(), 1, read_buf.size(), in_fp);
+                ssize_t r;
+                do {
+                    r = read(in_fd, read_buf.data(), read_buf.size());
+                } while (r < 0 && errno == EINTR);
+                const size_t n = (r > 0) ? (size_t)r : 0;
                 if (n > 0) {
                     pending.append(read_buf.data(), n);
                     last_data_at = std::chrono::steady_clock::now();
@@ -2063,9 +2085,12 @@ int main(int argc, char ** argv) {
                             saw_eof_marker = true;
                         }
                     }
-                } else if (feof(in_fp)) {
-                    clearerr(in_fp);   // let tail -f keep polling past EOF
                 }
+                // r == 0 means "no new bytes right now" — the writer may
+                // append more later.  Do NOT close the fd; we'll sleep
+                // below and try again.  read() reliably returns the new
+                // bytes as soon as they are appended, without the stdio
+                // readahead-buffer gotcha that plagued the fread() version.
 
                 // Drain every complete sentence currently in the buffer.
                 std::string sentence;
@@ -2118,7 +2143,7 @@ int main(int argc, char ** argv) {
                 }
             }
 
-            fclose(in_fp);
+            close(in_fd);
             const double total_ms = 1e-3 * ggml_time_us() - live_t0_ms;
             fprintf(stderr,
                     "\n=== live input done: %zu sentences, "
