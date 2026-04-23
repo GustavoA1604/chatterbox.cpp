@@ -669,6 +669,8 @@ struct cli_params {
                                          // after this many ms of inactivity
                                          // even without a sentence terminator
     std::string input_eof_marker;        // optional; stops reading when seen
+    bool        input_by_line    = false; // one request per \n; don't split
+                                          // on . ! ? within a line
 };
 
 static void print_usage(const char * argv0) {
@@ -747,6 +749,13 @@ static void print_usage(const char * argv0) {
     fprintf(stderr, "  --input-eof-marker STR  When this string is seen in the input, flush any\n");
     fprintf(stderr, "                          preceding text, synthesise it, and exit cleanly.\n");
     fprintf(stderr, "                          (default: none = run until SIGINT)\n");
+    fprintf(stderr, "  --input-by-line         Treat one newline-terminated line as one request.\n");
+    fprintf(stderr, "                          . ! ? inside a line no longer split it into multiple\n");
+    fprintf(stderr, "                          synthesis runs (and the 150 ms gap that goes with them);\n");
+    fprintf(stderr, "                          the full line is sent to T3 as a single utterance.\n");
+    fprintf(stderr, "                          Ideal when each upstream message is one 'request' and\n");
+    fprintf(stderr, "                          internal punctuation is meant as prosody, not as a\n");
+    fprintf(stderr, "                          hard boundary.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "  --max-sentence-chars N  Split --text into segments of at most N chars, running\n");
     fprintf(stderr, "                          T3+S3Gen+HiFT per segment and concatenating the PCM with\n");
@@ -827,6 +836,7 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--input-poll-ms")    { if (!parse_int("--input-poll-ms",  params.input_poll_ms))  return false; }
         else if (arg == "--input-flush-ms")   { if (!parse_int("--input-flush-ms", params.input_flush_ms)) return false; }
         else if (arg == "--input-eof-marker") { auto v = next("--input-eof-marker"); if (!v) return false; params.input_eof_marker = v; }
+        else if (arg == "--input-by-line")    { params.input_by_line = true; }
         else if (arg == "--dump-tokens-only") { params.dump_tokens_only = true; }
         else if (arg == "-h" || arg == "--help") { print_usage(argv[0]); std::exit(0); }
         else {
@@ -1904,14 +1914,17 @@ int main(int argc, char ** argv) {
             }
             const char * stop_hint =
                 stdin_is_tty
-                    ? "type a sentence + Enter (Ctrl-D to exit)"
+                    ? (params.input_by_line
+                          ? "type a request + Enter (Ctrl-D to exit)"
+                          : "type a sentence + Enter (Ctrl-D to exit)")
                     : (params.input_eof_marker.empty()
                           ? "Ctrl-C to stop"
                           : "stops at eof-marker or Ctrl-C");
             const char * src_label =
                 input_from_stdin ? "<stdin>" : params.input_file.c_str();
-            fprintf(stderr, "\n=== live input: %s (%s%s) ===\n",
-                    src_label, stop_hint, live_banner_suffix.c_str());
+            const char * mode_label = params.input_by_line ? ", line-mode" : "";
+            fprintf(stderr, "\n=== live input: %s (%s%s%s) ===\n",
+                    src_label, stop_hint, mode_label, live_banner_suffix.c_str());
             if (stdin_is_tty) {
                 // Prompt lives on stderr so it doesn't collide with the
                 // raw-PCM stream on stdout.
@@ -1929,6 +1942,18 @@ int main(int argc, char ** argv) {
                 if (pending.empty()) return false;
                 for (size_t i = 0; i < pending.size(); ++i) {
                     char c = pending[i];
+                    // --input-by-line: only a literal newline ends a
+                    // request, so internal . ! ? stay inside the same
+                    // utterance and T3 gets the whole thing as a single
+                    // prompt (no mid-line restart + 150 ms gap).
+                    if (params.input_by_line) {
+                        if (c != '\n') continue;
+                        size_t j = i + 1;
+                        while (j < pending.size() && is_ws((unsigned char)pending[j])) ++j;
+                        out.assign(pending, 0, j);
+                        pending.erase(0, j);
+                        return true;
+                    }
                     if (c != '.' && c != '!' && c != '?' && c != '\n') continue;
                     const bool at_end = (i + 1 == pending.size());
                     const unsigned char nx =
