@@ -2188,30 +2188,82 @@ int main(int argc, char ** argv) {
 
         auto run_t3_for_segment = [&](size_t si) {
             const int64_t _t0 = ggml_time_us();
-            std::vector<float> logits;
-            int prompt_len = 0;
-            if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
-                throw std::runtime_error("prompt eval failed");
 
-            int n_past = prompt_len;
-            std::vector<int32_t> generated;
-            generated.reserve(params.n_predict + 1);
+            // Early-stop heuristic.  T3 occasionally samples `stop_speech_token`
+            // way too soon when the speaker conditioning is out-of-distribution
+            // (most visible with cloned voices).  Python doesn't hit this
+            // because a different RNG stream happens to dodge the bad draw;
+            // our std::mt19937 seeded the same way draws differently and
+            // sometimes lands on a truncating sequence.
+            //
+            // Guard: if T3 exits via stop-token and the output length is
+            // implausibly short vs. the input text, replay with a
+            // different RNG offset.  Floor of 8 tokens covers very short
+            // inputs ("Hi."); the 5x multiplier on BPE-token count is a
+            // conservative lower bound (Python's reference averages ~5.5x
+            // speech tokens per BPE token for English).  If every retry
+            // still comes out short, we keep the *longest* attempt rather
+            // than whatever the last draw happened to produce.
+            const int min_tokens = std::max(8, (int)(seg_text_tokens[si].size() * 5));
+            constexpr int MAX_RETRIES = 3;
+            auto rng_snapshot = rng;
 
-            int32_t current = sample_next_token(logits, generated, params, rng);
-            generated.push_back(current);
+            std::vector<int32_t> generated, best_generated;
+            for (int attempt = 0; attempt <= MAX_RETRIES; ++attempt) {
+                rng = rng_snapshot;
+                rng.discard((size_t)attempt * 1009);   // move to a different RNG stream each retry
 
-            for (int i = 0; i < params.n_predict; ++i) {
-                if (current == model.hparams.stop_speech_token) break;
-                if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
-                if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
-                    throw std::runtime_error("step eval failed");
-                ++n_past;
-                current = sample_next_token(logits, generated, params, rng);
+                std::vector<float> logits;
+                int prompt_len = 0;
+                if (!eval_prompt(model, allocr, params.n_threads, seg_text_tokens[si], logits, prompt_len))
+                    throw std::runtime_error("prompt eval failed");
+
+                int n_past = prompt_len;
+                generated.clear();
+                generated.reserve(params.n_predict + 1);
+
+                int32_t current = sample_next_token(logits, generated, params, rng);
                 generated.push_back(current);
-            }
 
-            if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
-                generated.pop_back();
+                bool stopped_by_stop_token = false;
+                for (int i = 0; i < params.n_predict; ++i) {
+                    if (current == model.hparams.stop_speech_token) { stopped_by_stop_token = true; break; }
+                    if (n_past + 1 > model.hparams.n_ctx) { fprintf(stderr, "KV cache full\n"); break; }
+                    if (!eval_step(model, allocr, params.n_threads, n_past, current, logits))
+                        throw std::runtime_error("step eval failed");
+                    ++n_past;
+                    current = sample_next_token(logits, generated, params, rng);
+                    generated.push_back(current);
+                }
+
+                if (!generated.empty() && generated.back() == model.hparams.stop_speech_token)
+                    generated.pop_back();
+
+                // Keep the longest attempt as the fallback in case every
+                // retry still comes out short.
+                if (generated.size() > best_generated.size()) best_generated = generated;
+
+                const bool plausible = (int)generated.size() >= min_tokens;
+                if (!stopped_by_stop_token || plausible) {
+                    if (attempt > 0) {
+                        fprintf(stderr, "  [t3 segment %zu/%zu] recovered after %d retries (%zu tokens)\n",
+                                si + 1, N_SEG, attempt, generated.size());
+                    }
+                    break;
+                }
+
+                if (attempt < MAX_RETRIES) {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] early-stop at %zu tokens "
+                                    "(expected >= %d for %zu BPE tokens); retrying %d/%d\n",
+                            si + 1, N_SEG, generated.size(), min_tokens,
+                            seg_text_tokens[si].size(), attempt + 1, MAX_RETRIES);
+                } else {
+                    fprintf(stderr, "  [t3 segment %zu/%zu] all %d retries produced short output; "
+                                    "keeping longest (%zu tokens)\n",
+                            si + 1, N_SEG, MAX_RETRIES + 1, best_generated.size());
+                    generated = best_generated;
+                }
+            }
 
             if (multi_seg) {
                 fprintf(stderr, "  [t3 segment %zu/%zu] %zu speech tokens\n",
