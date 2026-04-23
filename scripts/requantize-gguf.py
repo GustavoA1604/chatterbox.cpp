@@ -60,6 +60,7 @@ _DENY_SUBSTRINGS = (
     # Spectral bases / positional encodings (bit-exact numerics)
     "stft_basis",               # STFT analysis / synthesis
     "mel_filterbank",           # mel filterbank
+    "mel_fb",                   # T3 VoiceEncoder and S3Gen mel filterbank tensors
     "pos_emb",                  # positional embeddings — small, keep F32
     "pe/pe",                    # conformer pos enc
     # Biases / norms / scale params — always 1-D or near-1-D
@@ -73,6 +74,17 @@ _DENY_SUBSTRINGS = (
     "alpha",                    # Snake activation alphas
     "beta",
     "gamma",
+    # Voice-cloning preprocessing encoders — NEVER quantize.  These are
+    # small specialised models whose dynamic range is too tight for Q4/Q8
+    # block quantization; the resulting encoder output drifts so badly that
+    # the voice-cloning tensors become unusable (we've seen speaker_emb
+    # collapse to zeros, prompt_token to a single constant value, and
+    # CAMPPlus embedding go antipodal to its F32 counterpart).  Keeping
+    # them at source dtype costs ~40 MB across both GGUFs but is the
+    # difference between a working clone and garbage audio.
+    "voice_encoder/",           # T3 VoiceEncoder (3-layer bi-LSTM + projection)
+    "campplus/",                # S3Gen CAMPPlus (TDNN x-vector extractor)
+    "s3tokv2/",                 # S3Gen S3TokenizerV2 (conformer + FSQ quantizer)
 )
 
 
