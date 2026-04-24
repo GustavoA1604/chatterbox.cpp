@@ -4,15 +4,24 @@
 [`README.md`](../README.md)), so any fixes we need in it live here as
 standalone patches and are applied after the clone.
 
-| Patch | When you need it |
-|--------|------------------|
-| `ggml-metal-chatterbox-ops.patch` | Building with **Metal** (Apple Silicon T3 + full pipeline). |
-| `ggml-opencl-chatterbox-ops.patch` | Building with **OpenCL** (e.g. Android / Termux + Adreno: `CONV_TRANSPOSE_1D` for HiFT, `SIN`, backend notes). |
-| (none) | **CPU** / **CUDA** / **Vulkan** only — stock upstream `ggml` is enough. |
+Three patches ship today:
 
-`setup-ggml.sh` always applies **both** patches in order (Metal, then
-OpenCL).  Extra OpenCL code is inert when you configure without
-`GGML_OPENCL=ON`.
+1. [`ggml-metal-chatterbox-ops.patch`](#ggml-metal-chatterbox-opspatch) —
+   fills gaps in the Metal backend (missing `diag_mask_inf`, front-pad
+   `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
+   Apple-only; harmless no-op on CPU / CUDA / OpenCL / Vulkan builds.
+2. [`ggml-opencl-chatterbox-ops.patch`](#ggml-opencl-chatterbox-opspatch) —
+   fills gaps in the OpenCL backend (`CONV_TRANSPOSE_1D` for HiFT, `SIN`,
+   backend-init nullability docs).  Active when `-DGGML_OPENCL=ON`;
+   inert on builds that don't link OpenCL.
+3. [`ggml-vulkan-pipeline-cache.patch`](#ggml-vulkan-pipeline-cachepatch)
+   — persists the `VkPipelineCache` across processes so cold-start
+   shader compile (seconds on fresh machines / containers / driver
+   upgrades) drops to tens of ms.  Active whenever `-DGGML_VULKAN=ON`
+   is in the build.
+
+`scripts/setup-ggml.sh` applies all three in order; the patches stack
+cleanly on the same pinned upstream commit.
 
 ## Apply
 
@@ -20,45 +29,54 @@ The top-level [`scripts/setup-ggml.sh`](../scripts/setup-ggml.sh) does
 everything for you:
 
 ```bash
-# From the repo root.  Clones ggml if needed, hard-resets to the pinned
-# commit, and applies both patch files.  Re-running overwrites any local
-# edits under ./ggml.
+# From the repo root.  Clones ggml if needed, checks out the pinned
+# commit, and applies every patch under patches/.  Idempotent —
+# re-running is a no-op.
 ./scripts/setup-ggml.sh
 ```
 
-Then configure + build as usual, for example:
+Then configure + build as usual.  Pick the backend flags for your
+platform:
 
 ```bash
-# Metal (macOS)
+# Apple Silicon — picks up the Metal patch
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
-cmake --build build -j$(sysctl -n hw.ncpu)
 
-# OpenCL (e.g. Termux) — set LD_LIBRARY_PATH to your OpenCL/ggml DSOs
+# Android / Termux — picks up the OpenCL patch
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL=ON
-cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+# Linux / Windows / Android — picks up the Vulkan pipeline-cache patch
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
+
+cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
-If you'd rather run the steps by hand (e.g. to pin a different upstream
-commit), the script is effectively:
+If you'd rather run the steps by hand (e.g. to pin a different
+upstream commit), the script is effectively:
 
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml
 cd ggml && git reset --hard $GGML_COMMIT && git clean -fdq
 git apply ../patches/ggml-metal-chatterbox-ops.patch
 git apply ../patches/ggml-opencl-chatterbox-ops.patch
+git apply ../patches/ggml-vulkan-pipeline-cache.patch
 ```
 
 `GGML_COMMIT` lives at the top of `scripts/setup-ggml.sh` as the
-single source of truth — bump it when re-generating patches
-against a newer upstream ggml.  To confirm they applied:
+single source of truth — bump it when re-generating the patches
+against a newer upstream ggml.  To confirm everything applied
+cleanly:
 
 ```bash
 (cd ggml && git status --short)
-# Expected: files under src/ggml-metal/, include/ggml-opencl.h, src/ggml-opencl/…
+# Expected: ~7 modified files under src/ggml-metal/
+#           include/ggml-opencl.h + a handful under src/ggml-opencl/
+#           1 modified file under src/ggml-vulkan/
 ```
 
-Skip `setup-ggml.sh` only if you use `-DTTS_CPP_USE_SYSTEM_GGML=ON` with
-another ggml; otherwise the pin + patches keep builds deterministic.
+Skip `setup-ggml.sh` only if you use `-DTTS_CPP_USE_SYSTEM_GGML=ON`
+with another ggml; otherwise the pin + patches keep builds
+deterministic.
 
 ## `ggml-metal-chatterbox-ops.patch`
 
@@ -117,10 +135,99 @@ git -C ggml apply --check ../patches/ggml-opencl-chatterbox-ops.patch
 ## Dropping the patch
 
 If upstream ggml merges equivalent fixes, delete the patch file and
-remove the `git apply` step from the build instructions.  The C++ side
-of Chatterbox uses only ops supported by every backend, so nothing else
-needs to change.
+remove the corresponding entry from the `PATCHES=(…)` array in
+`scripts/setup-ggml.sh`.  The C++ side of Chatterbox uses only ops
+supported by every backend, so nothing else needs to change.
 
-No patch is needed for CPU / CUDA / Vulkan — those backends already
-handle every op Chatterbox emits, except where OpenCL still trails;
-use this OpenCL patch when targeting OpenCL.
+No patch is needed for CPU / CUDA — those backends already handle
+every op Chatterbox emits.
+
+## `ggml-vulkan-pipeline-cache.patch`
+
+Base commit: same as above (`58c3805`).
+
+Adds an opt-in persistent `VkPipelineCache` to `ggml-vulkan`.  Upstream
+ggml today calls `createComputePipeline(VK_NULL_HANDLE, …)`, i.e. no
+pipeline cache at all, so every new process re-pays the driver's shader
+compile wave (tens of ms to multiple seconds, dominated by the initial
+`ggml_vk_load_shaders` call).  Drivers with aggressive system-wide
+caches (recent NVIDIA, ANV) partially hide this; Mesa/RADV, Android
+Adreno / Mali, fresh installs, and containers do not.
+
+### What the patch does
+
+1. Adds two fields to `vk_device_struct`:
+
+   ```cpp
+   vk::PipelineCache pipeline_cache = VK_NULL_HANDLE;
+   std::string       pipeline_cache_path;
+   ```
+
+2. In `ggml_vk_get_device()` (right before `ggml_vk_load_shaders`), it
+   resolves a cache directory from (in order)
+   `$GGML_VK_PIPELINE_CACHE_DIR` → `$XDG_CACHE_HOME/ggml/vulkan` →
+   `$HOME/.cache/ggml/vulkan`, `mkdir -p`'s it, loads any blob at
+   `<dir>/<vendorID>-<deviceID>-<driverVersion>.pcache`, and calls
+   `createPipelineCache(… seed …)`.  The feature is disabled by setting
+   `GGML_VK_PIPELINE_CACHE_DIR=""`.
+
+3. Changes the single `createComputePipeline(VK_NULL_HANDLE, …)` call
+   to `createComputePipeline(device->pipeline_cache, …)`.  When caching
+   is disabled the field is `VK_NULL_HANDLE` and behaviour is byte-
+   identical to upstream.
+
+4. Adds a helper `ggml_vk_save_pipeline_cache(vk_device &)` invoked
+   from `ggml_vk_cleanup()` that dumps `getPipelineCacheData()` to the
+   same path via atomic `<path>.tmp` + `rename`.  Doing the flush from
+   `~vk_device_struct()` is unreliable — pipelines and helpers hold
+   `shared_ptr<vk_device_struct>` refs that keep the refcount non-zero
+   past typical process-exit, so the device destructor often never
+   runs.
+
+5. The destructor still calls `destroyPipelineCache` for resource
+   cleanup in the event that refcounts do drop (e.g. a long-running
+   server that tears down and re-creates backends).
+
+Vulkan itself validates the pipeline-cache-header UUIDs / driver
+version; if the on-disk blob becomes stale (driver bump, different
+shader bundle, different GPU) it's silently ignored and pipelines are
+recompiled into a fresh cache.  No manual invalidation needed.
+
+### Measured impact (RTX 5090 + NVIDIA driver 590.48 + Vulkan 1.4)
+
+Using `build/chatterbox` on the Turbo Q4_0 GGUFs, same prompt and seed.
+"Cold" = target cache wiped via `rm -rf ~/.cache/{ggml,nvidia}`; "warm"
+= left alone.  Each run is a fresh process:
+
+| Scenario                                   | T3 infer | S3Gen infer | Wall   |
+|--------------------------------------------|---------:|------------:|-------:|
+| Both caches cold (fresh machine)           |  947 ms  |  1 741 ms   | 2 688 ms |
+| ggml cache warm, driver cache cold         |   80 ms  |    166 ms   |   246 ms |
+| Both caches warm (normal steady state)     |   69 ms  |    154 ms   |   223 ms |
+
+Cold → ggml-warm saves **2.44 s** per process on fresh Linux — 91 % of
+the full steady-state recovery.  On Android / Mesa / containers where
+the driver cache doesn't help, this is the dominant wall-time cost and
+the patch essentially eliminates it.  See
+[`PROGRESS.md §3.11`](../PROGRESS.md) / the QVAC-17872 investigation
+notes for the per-op profile that motivated this.
+
+`build/test-*` binaries that don't call `ggml_backend_free` on exit
+still get the cache seeded (from a prior process) but don't flush
+updates on shutdown; this is fine — they only compile a subset of
+pipelines each, and the main `chatterbox` / `chatterbox-tts` binaries
+always write the superset.
+
+### Caveats / follow-ups
+
+* No opportunistic flush during long-running processes.  Shipping a
+  second dispatcher that snapshots the cache every N minutes would
+  make server-mode deployments resilient to crashes, but it's not
+  needed for the CLI use cases today.
+* We key the filename on `vendorID / deviceID / driverVersion`.  Two
+  GPUs of the same model with different driver versions would reuse
+  the same filename only when the driver matches, which is the
+  intended sharing.
+* No attempt to cap the on-disk size.  NVIDIA blobs land at ~1 MB for
+  Turbo, ~2 MB for Turbo + MTL shared pipelines.  If this ever becomes
+  a concern on mobile, wrap the write with a size check.
