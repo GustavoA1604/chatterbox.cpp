@@ -660,10 +660,15 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    // (INNER, T) -> (HD, H, T) -> (HD, T, H) contiguous for flash-attn
-    q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, HD, H, T), 0, 2, 1, 3));
-    k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, HD, H, T), 0, 2, 1, 3));
-    v = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, v, HD, H, T), 0, 2, 1, 3));
+    // Zero-cont Q/K/V for flash-attn (see PROGRESS.md 3.14).  After
+    // mul_mat the result is (INNER, T) contiguous; INNER = H * HD.
+    // Metal's flash_attn_ext takes strided (HD, T, H) views directly,
+    // so drop the reshape+permute+cont triple.
+    const size_t col_stride  = (size_t) INNER * sizeof(float);
+    const size_t head_stride = (size_t) HD    * sizeof(float);
+    q = ggml_view_3d(ctx, q, HD, T, H, col_stride, head_stride, 0);
+    k = ggml_view_3d(ctx, k, HD, T, H, col_stride, head_stride, 0);
+    v = ggml_view_3d(ctx, v, HD, T, H, col_stride, head_stride, 0);
 
     // Fused softmax(QK^T / sqrt(HD)) @ V, streaming (no materialized T x T attn matrix).
     // Output layout is (HD, H, T) internally ((D, H, N) per flash_attn_ext docs).
@@ -746,10 +751,15 @@ static ggml_tensor * basic_tfm_b(ggml_context * ctx, const basic_tfm_w & w,
     ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);                        // (INNER, T, B)
     ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
     ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
-    // (INNER, T, B) -> (HD, H, T, B) -> (HD, T, H, B) for flash_attn_ext.
-    q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, q, HD, H, T, B), 0, 2, 1, 3));
-    k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, k, HD, H, T, B), 0, 2, 1, 3));
-    v = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_4d(ctx, v, HD, H, T, B), 0, 2, 1, 3));
+    // Zero-cont Q/K/V (see PROGRESS.md 3.14): express the
+    // (HD, T, H, B) layout expected by flash_attn_ext as a strided view
+    // on the already-contiguous (INNER, T, B) mul_mat output.
+    const size_t col_stride   = (size_t) INNER   * sizeof(float);
+    const size_t head_stride  = (size_t) HD      * sizeof(float);
+    const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+    q = ggml_view_4d(ctx, q, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    k = ggml_view_4d(ctx, k, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
+    v = ggml_view_4d(ctx, v, HD, T, H, B, col_stride, head_stride, batch_stride, 0);
     ggml_tensor * attn_fa = ggml_flash_attn_ext(ctx, q, k, v, /*mask=*/nullptr,
                                                 1.0f / std::sqrt((float)HD), 0.0f, 0.0f);
     // flash_attn_ext output ne=[HD, H, T, B].  Reshape back to (INNER, T, B).
