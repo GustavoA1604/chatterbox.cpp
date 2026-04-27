@@ -22,45 +22,69 @@ because this is upstream-targeted patch work, not a release).
 
 ## [Unreleased]
 
-Work-in-progress on top of `446f94b`, ready for a `part 5: build-
-system regression tests + comparative finding` commit.
+Work-in-progress on top of the round-6 commit (3-op fusion).
 
 ### Added
-- `scripts/test-build-system.sh` — 4-phase build-system regression
-  guard.  Verifies (1) `setup-ggml.sh` idempotency, (2) clean
-  recovery from manually-corrupted ggml state, (3) every patch in
-  `patches/*.patch` applies cleanly to the pinned `GGML_COMMIT`,
-  (4) the modified-file count matches the README's claim.  Caught
-  the `setup-ggml.sh` `--check` bug fixed below.
-- `scripts/test-chatterbox-cuda.sh` phase 4: env-var combination
-  matrix.  Runs 7 combinations of `GGML_CUDA_FORCE_GRAPHS`,
-  `GGML_CUDA_DISABLE_FUSION`, `GGML_CUDA_DISABLE_GRAPHS`, and
-  `GGML_CUDA_PERF_LOGGER`, with three bit-identity invariants:
-  (a) `FORCE_GRAPHS` ≡ default, (b) `FORCE_GRAPHS` ≡ default with
-  `DISABLE_FUSION=1` too, (c) `DISABLE_GRAPHS` overrides
-  `FORCE_GRAPHS`.
+- **`GGML_CUDA_FATTN_KERNEL=tile|mma|wmma|vec` opt-in env var** that
+  overrides the FlashAttention picker on calls where the default
+  heuristic chose `MMA_F16` (large-batch / prompt-phase path).
+  Mirrors the diagnostic capability in `GGML_VK_*` env vars on
+  ggml-vulkan.  Per-arch availability (compiled-in SASS check) and
+  per-shape compatibility (`Q.ne[1]`, `K.ne[1] %
+  FATTN_KQ_STRIDE`) are validated; unsupported overrides fall back
+  to the default picker with a one-shot `GGML_LOG_WARN` — never
+  trip the dispatcher's `GGML_ABORT`.  ~140-line addition to
+  `ggml/src/ggml-cuda/fattn.cu` (4 helpers + a wrapper around the
+  existing picker, which is renamed to `_default`).  See
+  `patches/README.md` Part 5.
+- **Empirical finding** from the variant sweep on RTX 5090 + Turbo
+  Q4_0: `default` and overrides to `mma` / `wmma` / `vec` are all
+  bit-identical (`tile` is the only one that actually changes
+  kernel choice — and it's 4 % slower than MMA).  Conclusion:
+  picker is already optimal for chatterbox on Blackwell; the
+  remaining 67 ms / utterance flash-attn gap to Vulkan is
+  intrinsic to MMA_F16's kernel quality, not a picker selection
+  issue.  Out-of-scope kernel rewrite for this round.
+- 5 new flash-attn correctness cases in `src/test_cuda_ops.cpp`
+  (step n_q=1, step n_kv=383, prompt 383 masked, prompt 64
+  masked, tiny).  NMSE ≤ 5e-4 (matches ggml's
+  `test-backend-ops` threshold for fp16-accumulate ops).
+- `scripts/bench-fattn-variants.sh` — 3-phase variant sweep
+  benchmark.  Phase 1 measures T3 / S3Gen wall time per variant
+  (median of N runs), phase 2 collects per-op `FLASH_ATTN_EXT`
+  total via `GGML_CUDA_PERF_LOGGER=1`, phase 3 reports a ranking
+  + audio bit-identity vs the default-picker output.  Safe to run
+  on unpatched builds (env var is ignored, all variants
+  bit-identical).  Saved bench log:
+  `inputFilesForAI/qvac-17872-findings/bench-logs-cuda/fattn-variants-bench.log`.
 
-### Fixed
-- `scripts/setup-ggml.sh` idempotency check used `git apply --check`
-  to detect "patch already applied"; this falsely declared "applied"
-  on any tree dirty in unrelated ways (aborted previous run, manual
-  debug edit, file corruption).  Switched to `git apply --reverse
-  --check`, which is true only when the patch's exact output is
-  currently in the tree.  Caught by the new `test-build-system.sh`
-  phase 2.
+### Investigation log (per the user's "do code audit every time" directive)
 
-### Investigation (no shipped code change)
-- Comparative `GGML_CUDA_PERF_LOGGER` × `GGML_VK_PERF_LOGGER` profile
-  on a matched 231-token prompt identifies the remaining
-  CUDA ↔ Vulkan T3 gap (157 ms / utterance / 1.29×) as dominated by
-  (i) Vulkan's `MUL_MAT_VEC + ADD` / `+ ADD + ADD` kernel-level
-  fusion (CUDA missing this costs ~67 ms net), (ii) `flash_attn_ext`
-  2.05× slower on CUDA (+74 ms).  Documented in
-  `inputFilesForAI/qvac-17872-findings/FINDINGS_CUDA.md` § 5.1.d
-  with the full per-op bucket table; raw logs in
-  `bench-logs-cuda/perf-cuda-long-prompt.log` /
-  `perf-vulkan-long-prompt.log`.  Not shipped this branch — both
-  fixes are kernel-template-level reworks (1-2 days each).
+Each implementation pass was preceded by an audit:
+
+1. **Pre-implementation audit** of `fattn.cu` revealed all 4
+   variants are technically dispatchable for chatterbox shapes
+   (head_dim=64, F16 K/V); minimum-surface design is renaming
+   the existing picker to `_default` and wrapping it.
+2. **Mid-implementation audit (1)**: forcing WMMA on Blackwell
+   crashes with *"CUDA kernel has no device code compatible with
+   CUDA arch 1200"* — added `ggml_cuda_fattn_variant_available`
+   to mirror the picker's existing arch gates.
+3. **Mid-implementation audit (2)**: forcing VEC on chatterbox's
+   prompt-phase shape crashes with *"CUDA error: invalid
+   configuration argument"* — VEC's compile-time templates only
+   support `ncols ≤ 2`.  Added scope narrowing
+   (`def == MMA_F16`-only override) and a per-shape gate that
+   mirrors `can_use_vector_kernel` from the picker.
+4. **Mid-implementation audit (3)**: VEC override silently
+   crashed T3 (1001 garbage tokens instead of 18) — debug print
+   showed default picker actually selects MMA_F16 for step phase
+   too because `K.ne[1] % FATTN_KQ_STRIDE != 0` (KV cache grows
+   by 1 per token, FATTN_KQ_STRIDE=256).  Per-shape gate
+   strengthened to include the `K.ne[1]` divisibility check.
+5. **Final audit / regression**: 47 distinct PASS assertions
+   across 5 test suites, clean re-setup builds + binary
+   verifies on every variant override.
 
 ---
 

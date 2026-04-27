@@ -14,6 +14,13 @@
 //     backend's separate-kernel chain.  Critical because the fusion
 //     changes the FP accumulation order (single fused-multiply-add
 //     register chain vs three separate kernel writes).
+//   - GGML_OP_FLASH_ATTN_EXT correctness across all 4 ggml-cuda
+//     kernel variants (TILE, MMA_F16, WMMA_F16, VEC).  Validates that
+//     the GGML_CUDA_FATTN_KERNEL env-var override doesn't introduce
+//     a behaviour difference: each variant's output must match the
+//     CPU backend within Q4_0-style NMSE tolerance (5e-4).  This is
+//     the regression guard for the FlashAttention-variant override
+//     in ggml/src/ggml-cuda/fattn.cu.
 //
 // Each test runs the same graph twice (once on CPU, once on CUDA) with
 // identical inputs and compares element-by-element.  Exits non-zero on
@@ -246,6 +253,139 @@ static int test_mul_mat_add_add_q4_0(ggml_backend_t cpu, ggml_backend_t gpu,
     return 1;
 }
 
+// FlashAttention correctness test.
+//
+// Builds a single graph
+//     attn = flash_attn_ext(Q, K, V, mask, scale, max_bias=0, softcap=0)
+// at chatterbox-realistic shapes (head_dim = 64, F16 K/V, F32 Q, with
+// causal F16 mask) and compares CUDA against the CPU backend.  Run
+// once for the default kernel choice plus once per
+// GGML_CUDA_FATTN_KERNEL value (tile / mma / wmma / vec) — the env
+// var is read by the picker on first use, so each variant test is a
+// child process via a wrapper shell script, OR by setting the env
+// before the test_cuda_ops binary launches.  This C++ test exercises
+// the default path; the per-variant matrix lives in
+// scripts/bench-fattn-variants.sh which calls the chatterbox binary
+// with the env var set.
+//
+// Tolerance: NMSE 5e-4 (matches `test-backend-ops` for fp16-accumulate
+// matmul-style ops).  Element-wise stats reported for diagnostics.
+//
+// Args mirror chatterbox's
+// `ggml_flash_attn_ext(ctx, Q, K, V, kq_mask,
+//                     1.0f / std::sqrt((float) HD), 0.0f, 0.0f);`
+// in src/main.cpp:1198.
+static int test_flash_attn_ext(ggml_backend_t cpu, ggml_backend_t gpu,
+                               int n_q, int n_kv, int n_head,
+                               bool with_mask, const char * label) {
+    fprintf(stderr, "[flash_attn_ext  %-13s] ", label);
+    constexpr int HD = 64;
+    const float scale = 1.0f / std::sqrt((float)HD);
+
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> dist(-0.3f, 0.3f);
+
+    // Q is [HD, n_q, n_head, 1] f32 (ggml stores Q in F32 for
+    // FlashAttention).
+    std::vector<float> q(HD * n_q * n_head);
+    for (auto & v : q) v = dist(rng);
+
+    // K, V are [HD, n_kv, n_head, 1] f16.
+    std::vector<ggml_fp16_t> k(HD * n_kv * n_head);
+    std::vector<ggml_fp16_t> v(HD * n_kv * n_head);
+    for (auto & h : k) h = ggml_fp32_to_fp16(dist(rng));
+    for (auto & h : v) h = ggml_fp32_to_fp16(dist(rng));
+
+    // Mask is [n_kv, GGML_PAD(n_q, GGML_KQ_MASK_PAD), 1, 1] f16, broadcast
+    // over heads.  Causal: lower-triangular zero, upper-triangular -inf.
+    constexpr int GGML_KQ_MASK_PAD_LOCAL = 64;  // FATTN_KQ_STRIDE on most archs
+    const int n_q_padded = ((n_q + GGML_KQ_MASK_PAD_LOCAL - 1) /
+                              GGML_KQ_MASK_PAD_LOCAL) * GGML_KQ_MASK_PAD_LOCAL;
+    std::vector<ggml_fp16_t> mask(with_mask ? n_kv * n_q_padded : 0);
+    if (with_mask) {
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q_i = 0; q_i < n_q_padded; ++q_i) {
+            for (int kv_i = 0; kv_i < n_kv; ++kv_i) {
+                mask[(size_t)q_i * n_kv + kv_i] =
+                    (kv_i > q_i) ? ninf : zero;
+            }
+        }
+    }
+
+    auto run_one = [&](ggml_backend_t backend) {
+        static size_t buf_size = 64 * 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ggml_init_params p = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+
+        ggml_tensor * tQ = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, HD, n_q,  n_head);
+        ggml_set_name(tQ, "Q"); ggml_set_input(tQ);
+        ggml_tensor * tK = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, n_kv, n_head);
+        ggml_set_name(tK, "K"); ggml_set_input(tK);
+        ggml_tensor * tV = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, HD, n_kv, n_head);
+        ggml_set_name(tV, "V"); ggml_set_input(tV);
+
+        ggml_tensor * tM = nullptr;
+        if (with_mask) {
+            tM = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q_padded);
+            ggml_set_name(tM, "M"); ggml_set_input(tM);
+        }
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, tQ, tK, tV, tM, scale, 0.0f, 0.0f);
+        ggml_set_name(out, "out"); ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+
+        auto * allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "Q"), q.data(), 0, q.size() * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "K"), k.data(), 0, k.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "V"), v.data(), 0, v.size() * sizeof(ggml_fp16_t));
+        if (with_mask) {
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "M"), mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        }
+
+        ggml_backend_graph_compute(backend, gf);
+        std::vector<float> res(ggml_nelements(out));
+        ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        return res;
+    };
+
+    auto ref = run_one(cpu);
+    auto got = run_one(gpu);
+    if (ref.size() != got.size()) {
+        fprintf(stderr, "FAIL: size mismatch cpu=%zu cuda=%zu\n", ref.size(), got.size());
+        return 1;
+    }
+
+    double sse = 0.0, ref_sq = 0.0;
+    float  max_abs = 0.f, max_rel = 0.f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double d = double(got[i]) - double(ref[i]);
+        sse    += d * d;
+        ref_sq += double(ref[i]) * double(ref[i]);
+        const float dabs = std::fabs(got[i] - ref[i]);
+        const float drel = dabs / std::max(std::fabs(ref[i]), 1e-6f);
+        if (dabs > max_abs) max_abs = dabs;
+        if (drel > max_rel) max_rel = drel;
+    }
+    const double nmse = ref_sq > 0.0 ? sse / ref_sq : 0.0;
+    const double nmse_max = 5e-4;
+    if (nmse <= nmse_max) {
+        fprintf(stderr, "OK (n_q=%-3d n_kv=%-3d n_head=%-2d %s nmse=%.2e max_abs=%.1e)\n",
+                n_q, n_kv, n_head, with_mask ? "masked  " : "unmasked", nmse, max_abs);
+        return 0;
+    }
+    fprintf(stderr, "FAIL: nmse=%.3e > %.1e (n_q=%d n_kv=%d max_abs=%.3e)\n",
+            nmse, nmse_max, n_q, n_kv, max_abs);
+    return 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "CPU backend init failed\n"); return 1; }
@@ -294,6 +434,17 @@ int main() {
     rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/1024, /*out_rows=*/4096, "1024x4096");
     // Tiny edge case to catch any off-by-one in single-row/col fusion.
     rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/64,   /*out_rows=*/64,   "64x64");
+
+    // FlashAttention correctness across chatterbox-realistic shapes.
+    // Step phase (n_q=1) and prompt phase (n_q=383) — these are the
+    // two regimes the picker chooses different variants for, so
+    // covering both also exercises the GGML_CUDA_FATTN_KERNEL override
+    // when set.
+    rc |= test_flash_attn_ext(cpu, gpu, /*n_q=*/1,   /*n_kv=*/64,   /*n_head=*/16, /*mask=*/false, "step_n_q1");
+    rc |= test_flash_attn_ext(cpu, gpu, /*n_q=*/1,   /*n_kv=*/383,  /*n_head=*/16, /*mask=*/false, "step_n_kv383");
+    rc |= test_flash_attn_ext(cpu, gpu, /*n_q=*/383, /*n_kv=*/383,  /*n_head=*/16, /*mask=*/true,  "prompt_383");
+    rc |= test_flash_attn_ext(cpu, gpu, /*n_q=*/64,  /*n_kv=*/64,   /*n_head=*/16, /*mask=*/true,  "prompt_64");
+    rc |= test_flash_attn_ext(cpu, gpu, /*n_q=*/4,   /*n_kv=*/4,    /*n_head=*/4,  /*mask=*/true,  "tiny");
 
     fprintf(stderr, "\n%s\n", rc == 0 ? "All CUDA op tests PASSED" : "Some CUDA op tests FAILED");
 

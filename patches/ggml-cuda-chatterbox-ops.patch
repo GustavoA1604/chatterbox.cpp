@@ -205,6 +205,214 @@ index 6c2cf666..618b0900 100644
 +#define CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE 32
  
  void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/src/ggml-cuda/fattn.cu b/src/ggml-cuda/fattn.cu
+index addf9320..31d24768 100644
+--- a/src/ggml-cuda/fattn.cu
++++ b/src/ggml-cuda/fattn.cu
+@@ -6,6 +6,9 @@
+ #include "fattn-wmma-f16.cuh"
+ #include "fattn.cuh"
+ 
++#include <cctype>   // GGML_CUDA_FATTN_KERNEL env-var parser uses std::tolower
++#include <cstdlib>  // getenv
++
+ template <int DKQ, int DV, int ncols2>
+ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+@@ -296,7 +299,127 @@ enum best_fattn_kernel {
+     BEST_FATTN_KERNEL_MMA_F16  = 400,
+ };
+ 
+-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
++// =============================================================================
++// GGML_CUDA_FATTN_KERNEL env-var override.
++//
++// Forces the FlashAttention picker to return a specific variant on
++// calls where the default heuristic would have selected MMA_F16
++// (i.e. the prompt-phase / large-batch path).  Designed for
++// A/B-testing FlashAttention variants on workloads that may not be
++// optimal under the picker's defaults — e.g. chatterbox.cpp's
++// prompt-phase F16-K/V matmul where Vulkan's flash-attn shader is
++// ~2× faster than ggml-cuda's MMA_F16
++// (`inputFilesForAI/qvac-17872-findings/FINDINGS_CUDA.md` § 5.1.d).
++// Companion benchmark in `scripts/bench-fattn-variants.sh`.
++//
++// Accepted values (case-insensitive):
++//   "tile" / "mma" / "wmma" / "vec"  → corresponding BEST_FATTN_KERNEL_*
++//   anything else                    → no override (logs a warning once)
++//
++// Safety:
++//
++// * Only applies on calls where the default picker chose MMA_F16.
++//   Other choices (VEC for n_q==1, TILE for ALiBi/unmasked, WMMA on
++//   Volta/RDNA3) are shape-specialised — overriding them risks
++//   crashing the dispatcher with "CUDA error: invalid configuration
++//   argument" or "Unsupported head size".
++//
++// * Per-arch availability is validated.  GGML_CUDA_FATTN_KERNEL=wmma
++//   on Blackwell (where `ggml_cuda_should_use_wmma_fattn` returns
++//   false) silently falls back to the default picker with a one-shot
++//   warning, instead of dispatching to a kernel that has no
++//   compiled-in SASS for the device (would otherwise abort with
++//   "CUDA kernel … has no device code compatible with CUDA arch …").
++//
++// * Per-shape compatibility is validated for VEC.  VEC's compile-
++//   time kernel templates only support `Q.ne[1] <= 2 && Q.ne[3] == 1`
++//   small batch + `Q.ne[0] <= 256 && Q.ne[0] % 64 == 0 && K.ne[1] %
++//   FATTN_KQ_STRIDE == 0` matching `can_use_vector_kernel` in the
++//   default picker.  Calls outside that range fall back to the
++//   default kernel automatically.  TILE / WMMA / MMA dispatchers
++//   handle the picker's full head-dim list, so they're shape-OK once
++//   they're arch-OK.
++// =============================================================================
++static best_fattn_kernel ggml_cuda_parse_fattn_kernel_env() {
++    const char * env = getenv("GGML_CUDA_FATTN_KERNEL");
++    if (env == nullptr || *env == '\0') {
++        return BEST_FATTN_KERNEL_NONE;  // sentinel: no override
++    }
++    auto ieq = [](const char * a, const char * b) {
++        while (*a && *b) {
++            if (std::tolower((unsigned char)*a) != std::tolower((unsigned char)*b)) return false;
++            ++a; ++b;
++        }
++        return *a == *b;
++    };
++    if (ieq(env, "tile")) return BEST_FATTN_KERNEL_TILE;
++    if (ieq(env, "mma"))  return BEST_FATTN_KERNEL_MMA_F16;
++    if (ieq(env, "wmma")) return BEST_FATTN_KERNEL_WMMA_F16;
++    if (ieq(env, "vec"))  return BEST_FATTN_KERNEL_VEC;
++    static bool warned = false;
++    if (!warned) {
++        GGML_LOG_WARN("ggml_cuda: unrecognised GGML_CUDA_FATTN_KERNEL=%s "
++                      "(expected: tile|mma|wmma|vec); using default picker.\n", env);
++        warned = true;
++    }
++    return BEST_FATTN_KERNEL_NONE;
++}
++
++// True if the compiled binary contains device code for `kind` runnable
++// on `cc`.  Mirrors the per-arch gates the default picker uses (see
++// `ggml_cuda_get_best_fattn_kernel_default`); preserves them when the
++// override is set so we never dispatch to a kernel without
++// compiled-in SASS for the active device.
++static bool ggml_cuda_fattn_variant_available(best_fattn_kernel kind, int cc) {
++    switch (kind) {
++        case BEST_FATTN_KERNEL_TILE:
++        case BEST_FATTN_KERNEL_VEC:
++            return true;  // shape-only gates, no arch restriction
++        case BEST_FATTN_KERNEL_MMA_F16:
++            return turing_mma_available(cc)
++                || volta_mma_available(cc)
++                || amd_mfma_available(cc)
++                || amd_wmma_available(cc);
++        case BEST_FATTN_KERNEL_WMMA_F16:
++            return ggml_cuda_should_use_wmma_fattn(cc);
++        case BEST_FATTN_KERNEL_NONE:
++        default:
++            return false;
++    }
++}
++
++// True if `kind`'s dispatcher accepts the shape of `dst`.  VEC is the
++// only variant whose templates are shape-restrictive: it requires
++// `can_use_vector_kernel` (Q.ne[0] <= 256, head-dim multiple of 64,
++// K.ne[1] multiple of FATTN_KQ_STRIDE) plus small batch (Q.ne[1] <= 2,
++// Q.ne[3] == 1).  Chatterbox's autoregressive K-cache grows by 1 per
++// token so it's frequently NOT a multiple of FATTN_KQ_STRIDE — for
++// those calls the picker falls back to MMA, and so do we.
++static bool ggml_cuda_fattn_variant_shape_ok(best_fattn_kernel kind, const ggml_tensor * dst) {
++    switch (kind) {
++        case BEST_FATTN_KERNEL_VEC: {
++            const ggml_tensor * Q = dst->src[0];
++            const ggml_tensor * K = dst->src[1];
++            return Q->ne[1] <= 2
++                && Q->ne[3] == 1
++                && Q->ne[0] <= 256
++                && Q->ne[0] % 64 == 0
++                && K->ne[1] % FATTN_KQ_STRIDE == 0;
++        }
++        case BEST_FATTN_KERNEL_TILE:
++        case BEST_FATTN_KERNEL_WMMA_F16:
++        case BEST_FATTN_KERNEL_MMA_F16:
++            return true;  // dispatcher handles the picker's whole head-dim list
++        case BEST_FATTN_KERNEL_NONE:
++        default:
++            return false;
++    }
++}
++
++// Renamed from the original `ggml_cuda_get_best_fattn_kernel`; the
++// outer wrapper below now applies the env-var override on top of
++// this default-heuristic result.
++static best_fattn_kernel ggml_cuda_get_best_fattn_kernel_default(const int device, const ggml_tensor * dst) {
+ #ifndef FLASH_ATTN_AVAILABLE
+     GGML_UNUSED(device); GGML_UNUSED(dst);
+     return BEST_FATTN_KERNEL_NONE;
+@@ -497,6 +620,64 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
+     return BEST_FATTN_KERNEL_TILE;
+ }
+ 
++// Wrapper that applies the GGML_CUDA_FATTN_KERNEL env-var override
++// on top of the default heuristic.  All callers (including
++// `ggml_cuda_flash_attn_ext_supported`) go through this single entry
++// point so the "is this op supported?" decision and the "which kernel
++// does the override pick?" decision agree exactly.
++//
++// The override is parsed once on first use (function-local static),
++// so changing the env var mid-process has no effect — same lifetime
++// model as `disable_cuda_graphs_due_to_env` and the perf-logger's
++// `ggml_cuda_perf_logger_enabled`.
++//
++// Scope: only override calls where the default picker chose
++// MMA_F16 (i.e. the large-batch / prompt-phase path that's the
++// documented A/B target for QVAC-17873).  Other choices are
++// shape-specialised — see block comment above for why force-
++// overriding them is unsafe.
++static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
++    const best_fattn_kernel def = ggml_cuda_get_best_fattn_kernel_default(device, dst);
++    if (def == BEST_FATTN_KERNEL_NONE) {
++        return def;  // shape isn't supported by any variant — don't fake it
++    }
++    static const best_fattn_kernel override_kind = ggml_cuda_parse_fattn_kernel_env();
++    if (override_kind == BEST_FATTN_KERNEL_NONE) {
++        return def;  // no override set or unrecognised value
++    }
++    if (def != BEST_FATTN_KERNEL_MMA_F16) {
++        return def;  // shape-specialised default, leave alone
++    }
++    const int cc = ggml_cuda_info().devices[device].cc;
++    if (!ggml_cuda_fattn_variant_available(override_kind, cc)) {
++        static bool warned = false;
++        if (!warned) {
++            const char * names[] = { "none", "vec", "tile", "wmma", "mma" };
++            const int idx = override_kind == BEST_FATTN_KERNEL_VEC      ? 1
++                          : override_kind == BEST_FATTN_KERNEL_TILE     ? 2
++                          : override_kind == BEST_FATTN_KERNEL_WMMA_F16 ? 3
++                          : override_kind == BEST_FATTN_KERNEL_MMA_F16  ? 4 : 0;
++            GGML_LOG_WARN("ggml_cuda: GGML_CUDA_FATTN_KERNEL=%s not compiled for "
++                          "device cc=%d; falling back to default picker.\n",
++                          names[idx], cc);
++            warned = true;
++        }
++        return def;
++    }
++    if (!ggml_cuda_fattn_variant_shape_ok(override_kind, dst)) {
++        static bool warned = false;
++        if (!warned) {
++            const ggml_tensor * Q = dst->src[0];
++            GGML_LOG_WARN("ggml_cuda: GGML_CUDA_FATTN_KERNEL override not viable "
++                          "for shape (Q.ne[1]=%lld); falling back to default "
++                          "for those calls.\n", (long long)Q->ne[1]);
++            warned = true;
++        }
++        return def;
++    }
++    return override_kind;
++}
++
+ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     ggml_cuda_set_device(ctx.device);
+     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
 index 648124c0..8fb14883 100644
 --- a/src/ggml-cuda/ggml-cuda.cu

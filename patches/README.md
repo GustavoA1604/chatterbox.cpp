@@ -11,7 +11,7 @@ Two patches ship today:
    `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
    Apple-only; harmless no-op on CPU / CUDA / Vulkan builds.
 2. [`ggml-cuda-chatterbox-ops.patch`](#ggml-cuda-chatterbox-opspatch) —
-   four related ggml-cuda fixes / additions for chatterbox-style
+   five related ggml-cuda fixes / additions for chatterbox-style
    workloads:
    (a) replaces the scalar `conv_transpose_1d` CUDA kernel
    (one thread per output pixel scanning all `IC * IL` inputs with a
@@ -37,10 +37,20 @@ Two patches ship today:
    `mmvq.cu` / `mmvf.cu` to add the residual inline after bias and
    any GLU.  Saves ~47 ms / utterance on RTX 5090 (residual ADDs
    folded into the matmul-vec kernel); -12 % total GPU time and
-   closes the CUDA ↔ Vulkan gap from 1.29× → 1.13× on long prompts.
-   All four active whenever `-DGGML_CUDA=ON` is in the build;
-   force-graphs and perf-logger are opt-in via env vars,
-   conv_transpose patch and 3-op fusion are unconditional.
+   closes the CUDA ↔ Vulkan gap from 1.29× → 1.13× on long prompts;
+   (e) adds an opt-in `GGML_CUDA_FATTN_KERNEL=tile|mma|wmma|vec`
+   env var that overrides the FlashAttention picker on calls where
+   the default would have chosen MMA_F16.  Per-arch availability +
+   per-shape compatibility are validated — unsupported overrides
+   fall back to the default picker with a one-shot warning instead
+   of crashing the dispatcher.  Empirical finding for chatterbox on
+   RTX 5090: MMA_F16 is already optimal; TILE is 4 % slower, WMMA is
+   not arch-available on Blackwell, VEC isn't shape-applicable to
+   the prompt-phase pattern.  Patch ships as diagnostic
+   infrastructure + safety fallback for the existing picker.
+   All five active whenever `-DGGML_CUDA=ON` is in the build;
+   force-graphs / perf-logger / fattn-kernel are opt-in via env
+   vars, conv_transpose and 3-op fusion are unconditional.
 
 `scripts/setup-ggml.sh` applies both in order; the patches stack
 cleanly on the same pinned upstream commit.
@@ -88,7 +98,7 @@ cleanly:
 ```bash
 (cd ggml && git status --short)
 # Expected: 7 modified files under ggml/src/ggml-metal/
-#           6 modified files under ggml/src/ggml-cuda/
+#           7 modified files under ggml/src/ggml-cuda/
 ```
 
 CPU-only or Vulkan builds get the pinned commit but no useful patch
@@ -253,9 +263,9 @@ Metal patch's simdgroup-sum reduction introduces.
 
 ### Validation harness
 
-Four test artefacts ship with the patch.  The full suite is ~35
-distinct assertions and runs in ~2 minutes on RTX 5090.  Run all
-four after every rebase / upstream sync; they're CI-friendly (each
+Five test artefacts ship with the patch.  The full suite is ~47
+distinct assertions and runs in ~3 minutes on RTX 5090.  Run all
+five after every rebase / upstream sync; they're CI-friendly (each
 exits non-zero on first failure).
 
 ```bash
@@ -290,6 +300,16 @@ cmake --build build-cuda --target test-cuda-ops -j
 #    presence / graph-disable interaction / aggregate-time sanity.
 ./scripts/test-cuda-perf-logger.sh
 # Expected: "All GGML_CUDA_PERF_LOGGER tests PASSED"
+
+# 5. FlashAttention variant sweep + fall-back smoke test (NEW
+#    in Part 5).  Runs each of TILE / MMA / WMMA / VEC overrides
+#    with GGML_CUDA_FATTN_KERNEL set, verifies all complete without
+#    crashing (arch / shape fall-backs work), and reports a ranking
+#    by T3 wall time + per-op flash_attn time.  No regression
+#    guard for *which* variant wins (depends on GPU + workload),
+#    just that none of them crash.
+./scripts/bench-fattn-variants.sh
+# Expected: "Fastest variant by T3: <variant> (… ms, Δ=… ms / …% vs default)"
 ```
 
 `test-cuda-ops` is a no-op when CUDA isn't enabled (exits 0 with a
@@ -579,3 +599,112 @@ in all 7 env-var-matrix combinations of
   reduction-order change should be re-validated. A
   `test-cuda-ops` harness (matching `test-metal-ops`) would be
   the right place; not built today.
+
+### Part 5: `GGML_CUDA_FATTN_KERNEL` opt-in
+
+#### Background
+
+ggml-cuda exposes 4 FlashAttention kernel variants (TILE, MMA_F16,
+WMMA_F16, VEC), selected by a per-shape / per-arch heuristic in
+`ggml_cuda_get_best_fattn_kernel`.  The QVAC-17873 comparative
+profile (`FINDINGS_CUDA.md` § 5.1.d) showed that even after the
+3-op fusion (Part 4) the largest remaining CUDA ↔ Vulkan gap
+(~50 % of the total) is in `FLASH_ATTN_EXT` — Vulkan's flash-attn
+shader is ~2× faster than ggml-cuda's MMA_F16 on chatterbox shapes.
+
+The picker already chooses MMA_F16 for the prompt-phase /
+large-batch path on RTX 5090 (Blackwell).  This patch provides a
+diagnostic env-var override so an A/B sweep across the 4 variants
+can confirm whether the picker's choice is actually optimal for
+chatterbox-style workloads on a given GPU.
+
+#### What the env var does
+
+When `GGML_CUDA_FATTN_KERNEL=tile|mma|wmma|vec` is set, the picker's
+default heuristic is consulted first; if it would have selected
+`MMA_F16` for the call (the documented A/B target), the override
+kicks in and returns the requested variant — but only after two
+safety checks:
+
+1. **Per-arch availability** — mirrors the picker's existing arch
+   gates (`turing_mma_available`, `volta_mma_available`,
+   `ggml_cuda_should_use_wmma_fattn`, etc.).  If the requested
+   variant has no compiled-in SASS for the device's compute
+   capability (most commonly: `wmma` on Blackwell), fall back to
+   the default with a one-shot `GGML_LOG_WARN`.  Without this gate,
+   the dispatcher would `GGML_ABORT` with
+   *"CUDA kernel … has no device code compatible with CUDA arch …"*.
+
+2. **Per-shape compatibility** — VEC's compile-time templates only
+   instantiate for `Q.ne[1] <= 2 && Q.ne[3] == 1 && Q.ne[0] <= 256
+   && Q.ne[0] % 64 == 0 && K.ne[1] % FATTN_KQ_STRIDE == 0` (matches
+   `can_use_vector_kernel` in the default picker).  Forcing VEC on
+   shapes outside that range — e.g. chatterbox's prompt-phase
+   `Q.ne[1]=379` or autoregressive step calls where K's growing
+   length isn't a multiple of `FATTN_KQ_STRIDE=256` — would trip
+   *"CUDA error: invalid configuration argument"*.  Fall back
+   instead.
+
+Calls where the default picker chose VEC / TILE / WMMA are NEVER
+overridden — those choices are shape-specialised and force-
+overriding them is the surest way to crash.
+
+#### Empirical finding (RTX 5090 + CUDA 12.8 + Turbo Q4_0, 232-token prompt)
+
+`scripts/bench-fattn-variants.sh` runs the same prompt under each
+variant override + the default, takes a 3-run median:
+
+| variant   | T3 ms | S3Gen ms | FA total µs | wav vs default     |
+|-----------|------:|---------:|------------:|--------------------|
+| default   |   483 |      227 |     143 510 | —                  |
+| `tile`    |   504 |      232 |     149 293 | diverges (FP order)|
+| `mma`     |   485 |      229 |     142 980 | bit-identical      |
+| `wmma`    |   484 |      224 |     143 334 | bit-identical (falls back on Blackwell) |
+| `vec`     |   483 |      226 |     143 121 | bit-identical (falls back per-shape)    |
+
+* `tile` is **~4 % slower** than MMA on chatterbox shapes (and its
+  output diverges due to different FP reduction order — within
+  perceptual tolerance, but not bit-identical).
+* `wmma` falls back on Blackwell because
+  `ggml_cuda_should_use_wmma_fattn(120) == false`.
+* `vec` falls back on every chatterbox flash-attn call because
+  `K.ne[1] % FATTN_KQ_STRIDE != 0` for most autoregressive step
+  shapes.
+
+**Conclusion: MMA_F16 is already the optimal pickable variant for
+chatterbox on Blackwell.**  The 67 ms / utterance gap to Vulkan
+(`FINDINGS_CUDA.md` § 5.1.d) is intrinsic to the MMA_F16 kernel's
+quality at chatterbox's `(64, 16, 379, 1)` shape — closing it
+needs an `nsys` / `ncu` deep-dive on the kernel itself, not a
+picker change.
+
+#### Why ship anyway?
+
+* **Safety improvement to the existing picker.**  Before this
+  patch, an end-user setting `GGML_CUDA_FATTN_KERNEL=…` (a
+  hypothetical env var that didn't exist) would have to
+  hand-edit `fattn.cu` to test variants — and most of those edits
+  would crash on Blackwell (WMMA) or on CFM/STFT shapes (VEC).
+  The new env var + per-arch / per-shape gates make that A/B
+  testing safe by construction.
+* **Forward-compatibility** with future ggml-cuda kernel
+  updates.  When upstream lands a faster TILE or new WMMA
+  variant, users can validate the win on their workload by
+  flipping an env var instead of patching code.
+* **Diagnostic value** that mirrors `GGML_VK_FATTN_*` env vars in
+  ggml-vulkan (the cross-backend grep / awk one-liners in
+  `FINDINGS.md` benefit from API parity).
+
+#### Caveats
+
+* The override applies ONLY where the default picker selected
+  MMA_F16.  Other shapes use whatever the picker chose (usually
+  VEC for n_q==1 with K aligned, MMA otherwise).  This is
+  deliberate — see "Safety" above.
+* The env var is parsed once on first dispatch and cached in a
+  function-local static.  Changing the value mid-process has no
+  effect (same lifetime model as `GGML_VK_DISABLE_FUSION` and our
+  `GGML_CUDA_FORCE_GRAPHS`).
+* No regression-guarding test for *which* variant wins (varies
+  by GPU and workload).  `scripts/bench-fattn-variants.sh` only
+  checks that all 4 + default complete without crashing.
