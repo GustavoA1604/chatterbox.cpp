@@ -263,9 +263,10 @@ Metal patch's simdgroup-sum reduction introduces.
 
 ### Validation harness
 
-Five test artefacts ship with the patch.  The full suite is ~47
-distinct assertions and runs in ~3 minutes on RTX 5090.  Run all
-five after every rebase / upstream sync; they're CI-friendly (each
+Seven test artefacts ship with the patch.  The full suite is ~54
+distinct assertions and runs in ~5 minutes on RTX 5090 (the 50-run
+soak in #6 is the dominant cost — ~70 s of the total).  Run all
+seven after every rebase / upstream sync; they're CI-friendly (each
 exits non-zero on first failure).
 
 ```bash
@@ -310,10 +311,34 @@ cmake --build build-cuda --target test-cuda-ops -j
 #    just that none of them crash.
 ./scripts/bench-fattn-variants.sh
 # Expected: "Fastest variant by T3: <variant> (… ms, Δ=… ms / …% vs default)"
+
+# 6. Production stability soak (NEW in Part 6).  50 sequential runs
+#    of the same prompt + seed; asserts (a) all 50 wavs are
+#    bit-identical (md5 match), (b) wall-time drift between the
+#    warm-up window (runs 5-9) and steady state (runs 46-50) is
+#    ≤ ±5 % for both T3 and S3Gen, (c) RSS grows by ≤ 10 MB across
+#    runs, (d) ~/.nv/ComputeCache stays bounded (no JIT recompile
+#    storm).  Catches process-level memory leaks, GPU pool
+#    fragmentation, and any non-determinism that didn't show up in
+#    the 18-run stress matrix.  Scales to small N — for N < 20 it
+#    falls back to first-half / second-half windows (smoke mode).
+./scripts/test-stability.sh ./build-cuda12.8/chatterbox 50
+# Expected: "All chatterbox.cpp CUDA stability tests PASSED (50 runs)."
+
+# 7. Diversity sweep (NEW in Part 6).  5 distinct seeds + 5
+#    multilingual prompts (EN, FR, ES, DE, IT) + 3 edge-case
+#    durations (very short, very long, whitespace-padded).  Asserts
+#    exit-zero, non-empty wav (>= 1 KB), and that the seed sweep
+#    produces ≥ 2 distinct outputs (sampler is seed-responsive) and
+#    the multilingual sweep produces all-distinct outputs (the BPE
+#    path actually responds to non-ASCII).  No bit-identity check
+#    across different inputs — they SHOULD differ.
+./scripts/test-diversity.sh
+# Expected: "All chatterbox.cpp CUDA diversity tests PASSED."
 ```
 
 `test-cuda-ops` is a no-op when CUDA isn't enabled (exits 0 with a
-notice).  The three shell scripts require both a CUDA build + Turbo
+notice).  The five shell scripts require both a CUDA build + Turbo
 Q4_0 GGUFs at `models/`; they `exit 1` early with a helpful message
 if either is missing.
 

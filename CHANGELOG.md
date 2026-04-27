@@ -23,8 +23,83 @@ because this is upstream-targeted patch work, not a release).
 ## [Unreleased]
 
 Work-in-progress on top of the round-6 commit (3-op fusion).
+Two parts so far: Part 5 (round 7) shipped the `GGML_CUDA_FATTN_KERNEL`
+override + variant sweep; Part 6 (round 8, this work) closes the
+investigation by validating production stability + diversity and
+documenting the remaining flash-attn gap as a Blackwell config-table
+issue best fixed upstream.
 
-### Added
+### Part 6 — Production stability + diversity validation (round 8)
+
+#### Added
+- **`scripts/test-stability.sh`** — 50-run sequential soak test.
+  Asserts: (1) every run is **bit-identical** (same wav md5, no
+  process-to-process state leaks), (2) median wall-time drift between
+  warm-up window (runs 5-9) and steady-state (runs 46-50) is **≤ ±5 %**
+  for both T3 and S3Gen (catches per-run cache growth, GPU memory
+  fragmentation, pool exhaustion), (3) RSS growth from warm-up to
+  steady-state is **≤ 10 MB** (catches process-level memory leaks,
+  with a slack for libc heap stabilisation), (4) `~/.nv/ComputeCache/`
+  growth is **≤ 50 MB** (catches accidental JIT recompiles that
+  shouldn't happen on a stable native-SASS build).  Scales gracefully
+  to small N for smoke testing — for N < 20 it picks first-half /
+  second-half windows automatically.  Result on the post-round-7 build:
+  **all 50 runs identical (md5 `fab3a8f4…`), 0 % drift on T3 and
+  S3Gen, RSS −152 KB (slight shrink, no leak), 0 KB JIT-cache
+  delta**.  Bench log:
+  `inputFilesForAI/qvac-17872-findings/bench-logs-cuda/stability-soak50.log`.
+
+- **`scripts/test-diversity.sh`** — edge-case sweep (no bit-identity
+  asserted across different inputs, just exit-zero + non-empty-wav +
+  reasonable size).  Phase 1: 5 distinct seeds (0, 1, 7, 42,
+  1000003) — asserts ≥ 2 distinct outputs (sampler is seed-responsive).
+  Phase 2: 5 multilingual prompts (EN, FR, ES, DE, IT) — asserts all 5
+  outputs distinct (multilingual BPE path works).  Phase 3: 3
+  edge-case durations (`"Hi."` ≈ 2 tokens, ~50-word sentence,
+  whitespace-padded `"  word   "`).  Result on post-round-7 build:
+  **all 13 cases produce non-empty distinct wavs, no crashes; T3
+  ranges 66 ms (`"Hi."`) → 613 ms (long prompt)**.  Bench log:
+  `inputFilesForAI/qvac-17872-findings/bench-logs-cuda/diversity-test.log`.
+
+#### Investigation finding (no patch)
+- **Root-cause of the remaining 67 ms / utterance flash-attn gap to
+  Vulkan:** code-inspection of `ggml/src/ggml-cuda/fattn-mma-f16.cuh`
+  shows that the per-architecture MMA configuration table
+  (`ggml_cuda_fattn_mma_get_config_<arch>`) has **no Blackwell entry**.
+  `ggml_cuda_fattn_mma_get_config(cc)` checks
+  `ampere_mma_available(cc)` first, which returns `true` for any
+  `cc >= GGML_CUDA_CC_AMPERE (800)` — so RTX 5090 (sm_120) silently
+  uses the **Ampere config tuned for sm_80**:
+  `nthreads=128, occupancy=2, nbatch_fa=64, nbatch_K2=32,
+  nbatch_V2=32, nstages=2, Q_in_reg=true` for our (DKQ=64, DV=64,
+  ncols=64) shape.  Blackwell SMs have larger register files and
+  more shared memory than sm_80, so this config is almost
+  certainly leaving perf on the table.  Tuning a Blackwell config
+  empirically requires either NVIDIA Nsight Compute hardware
+  counters (blocked on this host without root-level
+  `NVreg_RestrictProfilingToAdminUsers=0`) or 5-10 multi-hour
+  `nthreads × occupancy × nbatch_fa × nbatch_KV` sweeps with full
+  rebuild per point.  Best deferred to upstream maintainers who
+  have access to multiple Blackwell SKUs and can land a config-table
+  entry that benefits everyone.  The `GGML_CUDA_FATTN_KERNEL` env
+  var shipped in Part 5 lets them confirm/refute on their own
+  hardware quickly (it surfaces the picker decision and lets them
+  A/B variants without rebuilding).  See `FINDINGS_CUDA.md` § 5.6
+  for the full code-trace and decision rationale.
+
+#### Test harness update
+- Validation harness expands from **5 → 7** test artefacts and
+  **47 → 47 + 7 = 54** assertions covering kernel correctness,
+  build-system idempotency, end-to-end audio bit-identity, perf-logger
+  output format, FlashAttention variant safety, **50-run production
+  soak**, and **multilingual / multi-seed / edge-duration coverage**.
+  Detailed inventory in `patches/README.md` "Validation harness".
+
+---
+
+### Part 5 — `GGML_CUDA_FATTN_KERNEL` override (round 7)
+
+#### Added
 - **`GGML_CUDA_FATTN_KERNEL=tile|mma|wmma|vec` opt-in env var** that
   overrides the FlashAttention picker on calls where the default
   heuristic chose `MMA_F16` (large-batch / prompt-phase path).
