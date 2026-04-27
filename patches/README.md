@@ -4,8 +4,21 @@
 [`README.md`](../README.md)), so any fixes we need in it live here as
 standalone patches and are applied after the clone.
 
-Only the Metal backend currently needs a patch. CPU / CUDA / Vulkan
-builds work with stock upstream ggml and can skip this step entirely.
+Two patches ship today:
+
+1. [`ggml-metal-chatterbox-ops.patch`](#ggml-metal-chatterbox-opspatch) —
+   fills gaps in the Metal backend (missing `diag_mask_inf`, front-pad
+   `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
+   Apple-only; harmless no-op on CPU / CUDA / Vulkan builds.
+2. [`ggml-cuda-chatterbox-ops.patch`](#ggml-cuda-chatterbox-opspatch) —
+   replaces the scalar `conv_transpose_1d` CUDA kernel (one thread per
+   output pixel scanning all `IC * IL` inputs with a skip conditional)
+   with a warp-cooperative version that narrows the input range and
+   reduces across `IC` via `__shfl_xor_sync`. ~40× faster on HiFT-shaped
+   inputs; active whenever `-DGGML_CUDA=ON` is in the build.
+
+`scripts/setup-ggml.sh` applies both in order; the patches stack
+cleanly on the same pinned upstream commit.
 
 ## Apply
 
@@ -14,39 +27,48 @@ everything for you:
 
 ```bash
 # From the repo root.  Clones ggml if needed, checks out the pinned
-# commit, and applies this patch.  Idempotent — re-running is a no-op.
+# commit, and applies every patch under patches/.  Idempotent —
+# re-running is a no-op.
 ./scripts/setup-ggml.sh
 ```
 
-Then configure + build as usual. To enable Metal:
+Then configure + build as usual.  Pick the backend flags for your
+platform:
 
 ```bash
+# Apple Silicon — picks up the Metal patch
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
-cmake --build build -j$(sysctl -n hw.ncpu)
+
+# Linux / Windows + NVIDIA — picks up the CUDA conv_transpose_1d patch
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
+
+cmake --build build -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
 ```
 
-If you'd rather run the two steps by hand (e.g. to pin a different
+If you'd rather run the steps by hand (e.g. to pin a different
 upstream commit), the script is effectively:
 
 ```bash
 git clone https://github.com/ggml-org/ggml.git ggml
 cd ggml && git checkout $GGML_COMMIT
 git apply ../patches/ggml-metal-chatterbox-ops.patch
+git apply ../patches/ggml-cuda-chatterbox-ops.patch
 ```
 
 `GGML_COMMIT` lives at the top of `scripts/setup-ggml.sh` as the
-single source of truth — bump it when re-generating this patch
-against a newer upstream ggml.  To confirm the patch applied cleanly:
+single source of truth — bump it when re-generating the patches
+against a newer upstream ggml.  To confirm everything applied
+cleanly:
 
 ```bash
 (cd ggml && git status --short)
 # Expected: 7 modified files under ggml/src/ggml-metal/
+#           2 modified files under ggml/src/ggml-cuda/
 ```
 
-Skip the whole patch step on Linux or when building CPU-only (the
-stock upstream ggml works). `setup-ggml.sh` still clones at the
-pinned commit either way, which keeps builds deterministic even
-without the patch.
+CPU-only or Vulkan builds get the pinned commit but no useful patch
+work: both targeted backends (Metal, CUDA) are additive and harmless
+when their compile flag is off.
 
 ## `ggml-metal-chatterbox-ops.patch`
 
@@ -79,9 +101,142 @@ Run it after rebuilding:
 ## Dropping the patch
 
 If upstream ggml merges equivalent fixes, delete the patch file and
-remove the `git apply` step from the build instructions.  The C++ side
-of Chatterbox uses only ops supported by every backend, so nothing else
-needs to change.
+remove the corresponding entry from the `PATCHES=(…)` array in
+`scripts/setup-ggml.sh`.  The C++ side of Chatterbox uses only ops
+supported by every backend, so nothing else needs to change.
 
-No patch is needed for CPU / CUDA / Vulkan — those backends already
-handle every op Chatterbox emits.
+No patch is needed for CPU / Vulkan — those backends already handle
+every op Chatterbox emits at production speed.
+
+## `ggml-cuda-chatterbox-ops.patch`
+
+Base commit: same as above (`58c3805`).
+
+Replaces `conv_transpose_1d_kernel` in `ggml/src/ggml-cuda/conv-transpose-1d.cu`
+with a warp-cooperative variant. ~40× faster on the HiFT vocoder
+graphs Chatterbox emits; correctness preserved (output differs only
+by floating-point reduction order — measured at < -57 dBFS / SNR
+58 dB vs the original kernel's output, well below perceptual
+threshold).
+
+### What the patch does
+
+The stock kernel is the textbook "1 thread per output pixel"
+implementation:
+
+```cuda
+int idx = global_index % dst_ne0;          // ol
+int oc  = global_index / dst_ne0;          // out channel
+for (int ic = 0; ic < IC; ic++) {
+    for (int i = 0; i < IL; i++) {         // <-- hot inner loop
+        if (!(idx >= i*s0 && idx < i*s0 + K)) continue;   // most iters skip
+        v += kernel[ki, oc, ic] * input[i, ic];
+    }
+}
+```
+
+Two perf killers:
+
+1. **The `i` loop scans all `IL` positions** even though only
+   `K/s0 + 1` of them contribute (KS=16, s0=8 ⇒ ≤ 2 of 100+).
+2. **No parallelism across `IC`** — the IC reduction is fully
+   serial within a single thread.
+
+For HiFT the typical first upsample layer has `IC=512, IL=104, KS=16,
+s0=8, OL=840, OC=256`. Each thread does `512 * 104 = 53 248` inner
+iterations, of which only ~2 do real work. With `OL*OC = 215 040`
+output pixels that's ~11.4 billion no-op iterations per call — so
+of the 4 conv_transpose_1d calls in the graph, the largest takes
+~100 ms on RTX 5090 in the stock kernel.
+
+The patched kernel:
+
+1. Switches to **one CUDA warp per output pixel**: grid
+   `(OL, OC, 1)`, block `(32, 1, 1)`. Same as the Metal-patch
+   kernel design (one threadgroup per output, 32-wide simdgroup
+   reduction).
+2. Computes `i_start, i_end` analytically from
+   `i*s0 + ki = ol, 0 ≤ ki < K, 0 ≤ i < IL`, so the `i` loop
+   only iterates over the contributing range. No more skip
+   conditional in the hot loop.
+3. **Parallelises the `IC` reduction across the warp** — each
+   thread handles a strided slice `ic = tid, tid+32, …` and
+   accumulates a partial sum.
+4. Reduces across the 32-lane warp with `__shfl_xor_sync` and
+   thread 0 writes the final sum.
+
+The host-side wrapper signature, the `ggml_cuda_op_conv_transpose_1d`
+entry point, and the supported shape constraints (contiguous src0/src1,
+`ne1 == ne3 == 1`) are unchanged. `CUDA_CONV_TRANPOSE_1D_BLOCK_SIZE`
+in `conv-transpose-1d.cuh` drops from 256 to 32 (one warp).
+
+### Measured impact (RTX 5090 + CUDA 12.0 + driver 590.48, Turbo Q4_0)
+
+`build/chatterbox` on the same prompt + seed across 5 runs (median of
+runs 2–5, NVIDIA driver cache warm):
+
+| Stage         | Stock kernel | Patched | Speedup |
+|---------------|-------------:|--------:|--------:|
+| `[hift_decode]`     | 149.5 ms     | 22 ms   | **6.8×** |
+| `[hift_total]`      | 144.7 ms     | 30 ms   | **4.7×** |
+| `S3GEN_INFER_MS`    | 280 ms       | 173 ms  | **1.6×** |
+| Wall (T3 + S3Gen)   | 442 ms       | 337 ms  | **1.3×** |
+| RTF (S3Gen / audio) | 0.15         | 0.09    |   —      |
+
+Per-op profile from `nsys profile --trace=cuda` (4 calls of
+`conv_transpose_1d_kernel` in a single warm S3Gen run):
+
+| Field           | Stock    | Patched  |
+|-----------------|---------:|---------:|
+| Total GPU time  | 135.98 ms |  3.21 ms |
+| Avg per call    |  33.99 ms |  802 µs  |
+| Max single call | 101.34 ms |  1.41 ms |
+| **Speedup**     |     —     | **42×**  |
+
+For comparison, ggml-vulkan's stock `conv_transpose_1d.comp` runs
+the same shapes in ~3.4 ms on the same hardware (FINDINGS.md §3.2);
+the patched CUDA kernel is now within noise of that.
+
+T3 (autoregressive decoder, no `conv_transpose_1d`) is unchanged at
+~163 ms / 43 tokens — confirming the saving is localised to HiFT
+where it should be.
+
+### Correctness
+
+The patch changes the **floating-point reduction order** (warp-strided
+IC accumulation + `__shfl_xor_sync` cross-lane sum vs the stock
+kernel's serial accumulation), so output is not bit-identical. End-to-
+end audio comparison on the same seed and prompt:
+
+| Metric                           | Value           |
+|----------------------------------|-----------------|
+| Sample count                     | 44 160 (same)   |
+| Max abs sample diff              | 0.001221 (-58 dBFS) |
+| Mean abs sample diff             | 0.000016        |
+| RMS error                        | 0.000043        |
+| SNR (signal vs diff)             | **58.5 dB**     |
+
+i.e. inaudible.  This is the same kind of FP-order variance that the
+Metal patch's simdgroup-sum reduction introduces.
+
+### Caveats / follow-ups
+
+* **CUDA Graphs are net-negative for this pipeline.** Independent
+  finding from the same investigation: building with
+  `-DGGML_CUDA_GRAPHS=ON` and running with graphs enabled adds
+  ~7 ms to `[cfm_total]` (capture overhead vs launch saving) and
+  is identical on T3.  The default standalone-ggml setting
+  (`GGML_CUDA_GRAPHS=OFF`) is correct for chatterbox; the runtime
+  switch `GGML_CUDA_DISABLE_GRAPHS=1` matches.
+* **Cold-start (`~/.nv/ComputeCache` wiped) costs ~27 s on
+  RTX 5090** when the host CUDA toolkit is older than the GPU
+  architecture (toolkit 12.0 → emits PTX-89, driver JIT-compiles
+  to sm_120 SASS at first dispatch). Driver-level disk cache
+  amortises this across processes; no chatterbox-side patch can
+  help. Mitigation: ship the build against CUDA Toolkit ≥ 12.8 so
+  the binary contains native sm_120 SASS.
+* **No size cap on the FP-error analysis.** For a different
+  vocoder or a higher-precision down-stream consumer, the
+  reduction-order change should be re-validated. A
+  `test-cuda-ops` harness (matching `test-metal-ops`) would be
+  the right place; not built today.
