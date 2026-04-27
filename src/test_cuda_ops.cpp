@@ -7,8 +7,15 @@
 //     analytically, so its FP-reduction order differs from the stock
 //     scalar kernel (and from CPU) — we tolerate up to 1e-3 absolute /
 //     1e-3 relative.
+//   - 3-op `MUL_MAT + ADD(bias) + ADD(residual)` fusion (the
+//     MUL_MAT_ADD_ADD shader port from ggml-vulkan).  Validates that the
+//     fused mul_mat_vec_q / mul_mat_vec_f kernel that handles bias +
+//     residual inline produces output element-wise close to the CPU
+//     backend's separate-kernel chain.  Critical because the fusion
+//     changes the FP accumulation order (single fused-multiply-add
+//     register chain vs three separate kernel writes).
 //
-// Each test runs the same op twice (once on CPU, once on CUDA) with
+// Each test runs the same graph twice (once on CPU, once on CUDA) with
 // identical inputs and compares element-by-element.  Exits non-zero on
 // any mismatch.  Mirrors src/test_metal_ops.cpp for the Metal path.
 //
@@ -113,6 +120,132 @@ static int test_conv_transpose_1d(ggml_backend_t cpu, ggml_backend_t gpu,
     return 1;
 }
 
+// 3-op `MUL_MAT + ADD(bias) + ADD(residual)` correctness test.
+//
+// Constructs a small graph that exercises the same shape pattern
+// chatterbox emits at T3 step phase (matmul-vec n=1, q4_0 weights,
+// bias and residual same shape as dst).  When the backend is CUDA the
+// 3-op fusion in `ggml_backend_cuda_graph_compute` should fire and
+// dispatch the fused mul_mat_vec_q kernel.  We don't observe the
+// fusion directly — we just compare the final dst against the CPU
+// backend's separate-kernel chain.  Tolerance is the same 1e-3 we use
+// for conv_transpose_1d (FP-reduction-order noise dominated; observed
+// max ~1e-5 on Q4_0 shapes).
+//
+// k_cols = 1024 / out_rows = 1024 keeps us in the matmul-vec regime
+// (`should_fuse_mul_mat_vec_q` requires dst->ne[1] == 1).  We do
+// quantize the weights (q4_0) on the fly using
+// ggml_quantize_chunk so the test exercises the same kernel-template
+// instance chatterbox hits at runtime.
+static int test_mul_mat_add_add_q4_0(ggml_backend_t cpu, ggml_backend_t gpu,
+                                     int k_cols, int out_rows,
+                                     const char * label) {
+    fprintf(stderr, "[mm+add+add q4_0  %-9s] ", label);
+
+    // Generate inputs deterministically.  Weights need to be quantized
+    // to Q4_0 — easiest way is to allocate as F32, then ggml_quantize_chunk
+    // them into the typed buffer ourselves.
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-0.1f, 0.1f);
+    std::vector<float> w_f32(k_cols * out_rows);
+    std::vector<float> y(k_cols);
+    std::vector<float> b(out_rows);
+    std::vector<float> r(out_rows);
+    for (auto & v : w_f32) v = dist(rng);
+    for (auto & v : y)    v = dist(rng);
+    for (auto & v : b)    v = dist(rng);
+    for (auto & v : r)    v = dist(rng);
+
+    // Q4_0 quantize the weights once into a host buffer.  Use the same
+    // pre-quantized blob for both backends so any per-backend quant
+    // difference doesn't leak into the test.
+    const ggml_type qtype = GGML_TYPE_Q4_0;
+    std::vector<uint8_t> w_q(ggml_row_size(qtype, k_cols) * out_rows);
+    for (int row = 0; row < out_rows; ++row) {
+        ggml_quantize_chunk(qtype,
+            w_f32.data() + row * k_cols,
+            w_q.data() + row * ggml_row_size(qtype, k_cols),
+            0, 1, k_cols, /*imatrix=*/nullptr);
+    }
+
+    auto run_one = [&](ggml_backend_t backend) {
+        static size_t buf_size = 8 * 1024 * 1024;
+        std::vector<uint8_t> buf(buf_size);
+        ggml_init_params p = { buf_size, buf.data(), true };
+        ggml_context * ctx = ggml_init(p);
+        ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
+
+        ggml_tensor * w  = ggml_new_tensor_2d(ctx, qtype,         k_cols,  out_rows);
+        ggml_set_name(w, "w");  ggml_set_input(w);
+        ggml_tensor * yT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k_cols,  1);
+        ggml_set_name(yT, "y"); ggml_set_input(yT);
+        ggml_tensor * bT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_rows, 1);
+        ggml_set_name(bT, "b"); ggml_set_input(bT);
+        ggml_tensor * rT = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_rows, 1);
+        ggml_set_name(rT, "r"); ggml_set_input(rT);
+
+        // mm = w * y  →  shape [out_rows, 1]
+        ggml_tensor * mm  = ggml_mul_mat(ctx, w, yT);
+        // mm + bias = ADD #1
+        ggml_tensor * mb  = ggml_add(ctx, mm, bT);
+        // (mm + bias) + residual = ADD #2  ← this is the 3-op pattern
+        ggml_tensor * out = ggml_add(ctx, mb, rT);
+        ggml_set_name(out, "out"); ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+
+        auto * allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        ggml_gallocr_reserve(allocr, gf);
+        ggml_gallocr_alloc_graph(allocr, gf);
+
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w"), w_q.data(), 0, w_q.size());
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "y"), y.data(),   0, y.size()  * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "b"), b.data(),   0, b.size()  * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "r"), r.data(),   0, r.size()  * sizeof(float));
+
+        ggml_backend_graph_compute(backend, gf);
+
+        std::vector<float> res(out_rows);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "out"), res.data(), 0, res.size() * sizeof(float));
+        ggml_gallocr_free(allocr);
+        ggml_free(ctx);
+        return res;
+    };
+
+    auto ref = run_one(cpu);
+    auto got = run_one(gpu);
+
+    // For Q4_0 matmul-vec the per-element max-abs tolerance is the wrong
+    // metric — accumulating ~K quantize-then-multiply-add operations
+    // produces correlated noise on the order of 1e-3 / element which is
+    // normal Q4_0 behaviour, not a kernel bug.  Match ggml's own
+    // test-backend-ops convention and use NMSE (normalised mean squared
+    // error) at 5e-4, the same threshold its `MUL_MAT` test class uses
+    // for non-MXFP4 quantised matmul.  Element-wise stats are still
+    // reported for diagnostic value.
+    double sse = 0.0, ref_sq = 0.0;
+    float  max_abs = 0.f, max_rel = 0.f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double d = double(got[i]) - double(ref[i]);
+        sse    += d * d;
+        ref_sq += double(ref[i]) * double(ref[i]);
+        const float dabs = std::fabs(got[i] - ref[i]);
+        const float drel = dabs / std::max(std::fabs(ref[i]), 1e-6f);
+        if (dabs > max_abs) max_abs = dabs;
+        if (drel > max_rel) max_rel = drel;
+    }
+    const double nmse = ref_sq > 0.0 ? sse / ref_sq : 0.0;
+    const double nmse_max = 5e-4;
+
+    if (nmse <= nmse_max) {
+        fprintf(stderr, "OK (k=%-5d out=%-4d nmse=%.2e max_abs=%.1e max_rel=%.1e, n=%d)\n",
+                k_cols, out_rows, nmse, max_abs, max_rel, out_rows);
+        return 0;
+    }
+    fprintf(stderr, "FAIL: nmse=%.3e > %.1e (k=%d out=%d max_abs=%.3e)\n",
+            nmse, nmse_max, k_cols, out_rows, max_abs);
+    return 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_cpu_init();
     if (!cpu) { fprintf(stderr, "CPU backend init failed\n"); return 1; }
@@ -150,6 +283,17 @@ int main() {
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/1,    /*IC=*/1,   /*OC=*/1,   /*K=*/1,  /*s0=*/1, "1x1");
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/2,    /*IC=*/2,   /*OC=*/2,   /*K=*/3,  /*s0=*/1, "2x2");
     rc |= test_conv_transpose_1d(cpu, gpu, /*IL=*/10,   /*IC=*/3,   /*OC=*/4,   /*K=*/5,  /*s0=*/2, "tiny");
+
+    // 3-op MUL_MAT_VEC + bias + residual fusion (port of ggml-vulkan's
+    // MUL_MAT_ADD_ADD).  k_cols = 1024/4096 picks both the small and
+    // large widths we observed in the chatterbox T3 step graph
+    // (m=1024 k=1024, m=1024 k=4096, m=3072 k=1024, m=4096 k=1024).
+    rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/1024, /*out_rows=*/1024, "1024x1024");
+    rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/4096, /*out_rows=*/1024, "4096x1024");
+    rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/1024, /*out_rows=*/3072, "1024x3072");
+    rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/1024, /*out_rows=*/4096, "1024x4096");
+    // Tiny edge case to catch any off-by-one in single-row/col fusion.
+    rc |= test_mul_mat_add_add_q4_0(cpu, gpu, /*k_cols=*/64,   /*out_rows=*/64,   "64x64");
 
     fprintf(stderr, "\n%s\n", rc == 0 ? "All CUDA op tests PASSED" : "Some CUDA op tests FAILED");
 

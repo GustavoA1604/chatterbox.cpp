@@ -1,5 +1,5 @@
 diff --git a/src/ggml-cuda/common.cuh b/src/ggml-cuda/common.cuh
-index 65d7a6e2..6b459fb5 100644
+index 65d7a6e2..a085d718 100644
 --- a/src/ggml-cuda/common.cuh
 +++ b/src/ggml-cuda/common.cuh
 @@ -1181,7 +1181,12 @@ struct ggml_cuda_graph {
@@ -15,6 +15,33 @@ index 65d7a6e2..6b459fb5 100644
 +        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env || disable_cuda_graphs_due_to_perf_logger);
      }
  #endif
+ };
+@@ -1438,11 +1443,26 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * x_bias = nullptr;
+     const ggml_tensor * gate = nullptr;
+     const ggml_tensor * gate_bias = nullptr;
++    // Residual tensor added to the matmul output AFTER bias and (if any)
++    // gate.  When both x_bias and x_residual are set the kernel performs
++    //     dst = mat * y + bias + residual
++    // in a single dispatch — matching ggml-vulkan's MUL_MAT_ADD_ADD shader
++    // and avoiding two stand-alone GGML_OP_ADD kernel launches per fused
++    // linear-and-residual layer (saves ~3-4 µs/call dispatch overhead per
++    // residual ADD on RTX-class hardware, plus the inline-add inside the
++    // kernel is faster than a separate kernel).  Used by the 3-op
++    // MUL_MAT + ADD(bias) + ADD(residual) fusion in
++    // ggml_backend_cuda_graph_compute (chatterbox attn / FFN proj
++    // pattern).  Must have ne[0] == dst->ne[0] and same shape as the
++    // bias-add output (no broadcasting).  Set to nullptr for normal
++    // 2-op MUL_MAT + ADD(bias) fusion or unfused dispatch.
++    const ggml_tensor * x_residual = nullptr;
+     ggml_glu_op glu_op;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+     const void * x_bias = nullptr;
+     const void * gate = nullptr;
+     const void * gate_bias = nullptr;
++    const void * x_residual = nullptr;  // see _host counterpart for semantics
+     ggml_glu_op glu_op;
  };
 diff --git a/src/ggml-cuda/conv-transpose-1d.cu b/src/ggml-cuda/conv-transpose-1d.cu
 index 8418ba66..ca71ef74 100644
@@ -179,7 +206,7 @@ index 6c2cf666..618b0900 100644
  
  void ggml_cuda_op_conv_transpose_1d(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index 648124c0..fbf7b73e 100644
+index 648124c0..8fb14883 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
 @@ -85,6 +85,263 @@
@@ -468,7 +495,116 @@ index 648124c0..fbf7b73e 100644
                  // start of fusion operations
                  static bool disable_fusion = (getenv("GGML_CUDA_DISABLE_FUSION") != nullptr);
                  if (!disable_fusion) {
-@@ -4025,12 +4297,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -3835,6 +4107,108 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         continue;
+                     }
+ 
++                    // 3-op fusion: MUL_MAT + ADD(bias) + ADD(residual)
++                    //
++                    // Mirrors ggml-vulkan's MUL_MAT_ADD_ADD shader:
++                    // chatterbox attention-output and FFN-output blocks
++                    // are
++                    //     cur = ggml_add(ctx,
++                    //         ggml_add(ctx, ggml_mul_mat(...), bias),
++                    //         residual);
++                    // i.e. exactly { MUL_MAT, ADD, ADD } where the second
++                    // ADD's input is the first ADD's output.  Without this,
++                    // CUDA runs three separate kernels per layer × 24
++                    // layers × 2 (attn + FFN) = 48 ADDs / token that
++                    // each pay ~3-4 µs of dispatch overhead.  The
++                    // x_residual plumbing in mmvq.cu / mmvf.cu folds the
++                    // residual ADD into the matmul-vec kernel.
++                    //
++                    // Kept above the 2-op {MUL_MAT, ADD} fusion below so
++                    // the greedy match prefers the 3-op pattern when
++                    // available (ggml_can_fuse already enforces that
++                    // intermediate nodes have no other consumers).
++                    //
++                    // Only `MUL_MAT` (not MUL_MAT_ID) is handled — the
++                    // residual add doesn't apply to MoE expert routing
++                    // and the chatterbox graph never produces it.
++                    fused_mul_mat_vec = false;
++                    fused_node_count = 0;
++                    if (ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_ADD })) {
++                        ggml_tensor * mm_node       = cgraph->nodes[i];
++                        ggml_tensor * bias_node     = cgraph->nodes[i + 1];
++                        ggml_tensor * residual_node = cgraph->nodes[i + 2];
++
++                        // bias_node consumes (mm_node, bias_tensor) in
++                        // some order; pick the one that's not mm_node.
++                        ggml_tensor * bias_tensor = nullptr;
++                        if (bias_node->src[0] == mm_node) {
++                            bias_tensor = bias_node->src[1];
++                        } else if (bias_node->src[1] == mm_node) {
++                            bias_tensor = bias_node->src[0];
++                        }
++                        // residual_node must consume (bias_node, residual_tensor).
++                        ggml_tensor * residual_tensor = nullptr;
++                        if (bias_tensor) {
++                            if (residual_node->src[0] == bias_node) {
++                                residual_tensor = residual_node->src[1];
++                            } else if (residual_node->src[1] == bias_node) {
++                                residual_tensor = residual_node->src[0];
++                            }
++                        }
++
++                        // No broadcasting on either ADD — same constraint
++                        // as the 2-op fusion below.  This skips the
++                        // PROMPT-phase pattern (where bias is [N] and
++                        // mm output is [N, T]) and lets it fall through
++                        // to plain dispatch, matching what the 2-op
++                        // fusion does.
++                        const bool no_bias_broadcast =
++                            bias_tensor &&
++                            ggml_are_same_shape(bias_node->src[0], bias_node->src[1]);
++                        const bool no_residual_broadcast =
++                            residual_tensor &&
++                            ggml_are_same_shape(residual_node->src[0], residual_node->src[1]);
++
++                        if (bias_tensor && residual_tensor && no_bias_broadcast && no_residual_broadcast) {
++                            const ggml_tensor * src0 = mm_node->src[0];
++                            const ggml_tensor * src1 = mm_node->src[1];
++                            const ggml_tensor * ids  = mm_node->src[2];
++
++                            // Use the 3-op fused kernel only if the
++                            // 2-op fusion path would have been chosen
++                            // anyway (matmul-vec regime, n=1 dst,
++                            // non-Pascal etc.).  Larger-N matmul falls
++                            // through.
++                            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
++                                ggml_cuda_mm_fusion_args_host fusion_data{};
++                                fusion_data.x_bias     = bias_tensor;
++                                fusion_data.x_residual = residual_tensor;
++
++                                // The residual_node is the final output
++                                // of the 3-op fusion; pass it as `dst`
++                                // so the kernel writes into the right
++                                // tensor.
++                                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, residual_node, &fusion_data);
++                                fused_mul_mat_vec = true;
++                                fused_node_count  = 3;
++                            } else if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
++                                ggml_cuda_mm_fusion_args_host fusion_data{};
++                                fusion_data.x_bias     = bias_tensor;
++                                fusion_data.x_residual = residual_tensor;
++                                ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, residual_node, &fusion_data);
++                                fused_mul_mat_vec = true;
++                                fused_node_count  = 3;
++                            }
++                        }
++                    }
++
++                    if (fused_mul_mat_vec) {
++                        i += fused_node_count - 1;
++                        continue;
++                    }
++
++                    // 2-op fusion: MUL_MAT + ADD(bias) — fallback when
++                    // the 3-op pattern above didn't match.
+                     fused_mul_mat_vec = false;
+                     fused_node_count = 0;
+ 
+@@ -4025,12 +4399,36 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
      ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
  
      ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -506,7 +642,7 @@ index 648124c0..fbf7b73e 100644
                  // Warmup: need at least 2 calls with no property change on the 2nd call
                  if (!properties_changed) {
                      graph->warmup_complete = true;
-@@ -4066,6 +4362,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4066,6 +4464,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
  
@@ -520,4 +656,166 @@ index 648124c0..fbf7b73e 100644
 +
      return GGML_STATUS_SUCCESS;
  }
+ 
+diff --git a/src/ggml-cuda/mmvf.cu b/src/ggml-cuda/mmvf.cu
+index d9147202..97c1623c 100644
+--- a/src/ggml-cuda/mmvf.cu
++++ b/src/ggml-cuda/mmvf.cu
+@@ -50,15 +50,18 @@ static __global__ void mul_mat_vec_f(
+     bool use_gate = false;
+     bool use_bias = false;
+     bool use_gate_bias = false;
++    bool use_residual = false;
+     ggml_glu_op glu_op = ggml_glu_op::GGML_GLU_OP_SWIGLU;
+     const T * gate_x = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
++    const float * x_residual = nullptr;
+ 
+     if constexpr (has_fusion) {
+         use_gate = fusion.gate != nullptr;
+         use_bias = fusion.x_bias != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr;
++        use_residual = fusion.x_residual != nullptr;
+         glu_op = fusion.glu_op;
+ 
+         if (use_gate) {
+@@ -73,6 +76,13 @@ static __global__ void mul_mat_vec_f(
+         } else {
+             use_gate_bias = false;
+         }
++        if (use_residual) {
++            // Residual is added AFTER bias and (if any) GLU — matches the
++            // chatterbox graph shape `((mm * y) + bias) + residual` and
++            // ggml-vulkan's MUL_MAT_ADD_ADD shader.  Same shape rules as
++            // x_bias (must match dst, no broadcasting).
++            x_residual = static_cast<const float *>(fusion.x_residual);
++        }
+     }
+ 
+     if (use_gate) {
+@@ -364,6 +374,10 @@ static __global__ void mul_mat_vec_f(
+                     break;
+             }
+         }
++        // Residual is added last — see x_residual comment near declaration.
++        if (use_residual) {
++            value += x_residual[tid*stride_col_dst + row];
++        }
+     }
+ 
+     dst[tid*stride_col_dst + row] = value;
+@@ -667,6 +681,14 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
++        if (fusion->x_residual) {
++            // Same shape rules as x_bias — host-side fusion-detection
++            // logic enforces no broadcasting.
++            GGML_ASSERT(fusion->x_residual->type == GGML_TYPE_F32);
++            GGML_ASSERT(fusion->x_residual->ne[0] == dst->ne[0]);
++            GGML_ASSERT(!ids || fusion->x_residual->ne[1] == src0->ne[2]);
++            fusion_local.x_residual = fusion->x_residual->data;
++        }
+         fusion_local.glu_op = fusion->glu_op;
+     }
+ 
+diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
+index 07b10167..dad81bc9 100644
+--- a/src/ggml-cuda/mmvq.cu
++++ b/src/ggml-cuda/mmvq.cu
+@@ -427,24 +427,29 @@ static __global__ void mul_mat_vec_q(
+     bool use_gate = false;
+     bool use_bias = false;
+     bool use_gate_bias = false;
++    bool use_residual = false;
+     const void * vgate = nullptr;
+     const float * x_bias = nullptr;
+     const float * gate_bias = nullptr;
++    const float * x_residual = nullptr;
+     ggml_glu_op active_glu;
+ 
+     if constexpr (has_fusion) {
+-        use_gate      = fusion.gate      != nullptr;
+-        use_bias      = fusion.x_bias    != nullptr;
+-        use_gate_bias = fusion.gate_bias != nullptr && use_gate;
++        use_gate      = fusion.gate       != nullptr;
++        use_bias      = fusion.x_bias     != nullptr;
++        use_gate_bias = fusion.gate_bias  != nullptr && use_gate;
++        use_residual  = fusion.x_residual != nullptr;
+         vgate         = fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
++        x_residual    = (const float *) fusion.x_residual;
+         active_glu    = fusion.glu_op;
+     }
+ 
+ 
+-    float x_biases[ncols_dst]    = { 0.0f };
+-    float gate_biases[ncols_dst] = { 0.0f };
++    float x_biases[ncols_dst]     = { 0.0f };
++    float gate_biases[ncols_dst]  = { 0.0f };
++    float x_residuals[ncols_dst]  = { 0.0f };
+     if constexpr (has_fusion) {
+         const uint32_t channel_bias = ids ? channel_x : channel_dst;
+         if (use_bias) {
+@@ -459,6 +464,20 @@ static __global__ void mul_mat_vec_q(
+                 }
+             }
+         }
++        if (use_residual) {
++            // Residual is added AFTER bias and after the gate's GLU application
++            // (matches ggml-vulkan's MUL_MAT_ADD_ADD shader).  Residual must be
++            // F32 with the same shape as dst — broadcasting is rejected in the
++            // host-side fusion-detection logic before we get here.
++            x_residual = x_residual + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
++            if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
++                (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    x_residuals[j] = x_residual[j * stride_col_dst + threadIdx.x];
++                }
++            }
++        }
+         if (use_gate_bias) {
+             gate_bias = gate_bias + sample_dst*stride_sample_dst + channel_bias*stride_channel_dst + row0;
+             if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
+@@ -578,13 +597,20 @@ static __global__ void mul_mat_vec_q(
+                             break;
+                     }
+                 }
++                // Residual is added last — matches the chatterbox graph
++                // shape `((mm * y) + bias) + residual` and Vulkan's
++                // MUL_MAT_ADD_ADD shader execution order.  Skipped when
++                // x_residual was null (use_residual == false).
++                if (use_residual) {
++                    result += x_residuals[j];
++                }
+             }
+             dst[j*stride_col_dst + threadIdx.x] = result;
+         }
+     }
+ 
+     if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, active_glu, gate_bias, x_bias, tmp_gate);
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_residual, active_glu, gate_bias, x_bias, x_residual, tmp_gate);
+     }
+ }
+ 
+@@ -1066,6 +1092,16 @@ void ggml_cuda_mul_mat_vec_q(
+             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
+             fusion_local.gate_bias = fusion->gate_bias->data;
+         }
++        if (fusion->x_residual) {
++            // Residual must be F32 and exactly match the dst tensor in
++            // shape — no broadcasting (the host-side fusion-detection
++            // logic in ggml_backend_cuda_graph_compute already enforces
++            // this).  Mirrors the x_bias asserts above.
++            GGML_ASSERT(fusion->x_residual->type == GGML_TYPE_F32);
++            GGML_ASSERT(fusion->x_residual->ne[0] == dst->ne[0]);
++            GGML_ASSERT(!ids || fusion->x_residual->ne[1] == src0->ne[2]);
++            fusion_local.x_residual = fusion->x_residual->data;
++        }
+         fusion_local.glu_op = fusion->glu_op;
+     }
  

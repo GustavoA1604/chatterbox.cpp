@@ -11,7 +11,7 @@ Two patches ship today:
    `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
    Apple-only; harmless no-op on CPU / CUDA / Vulkan builds.
 2. [`ggml-cuda-chatterbox-ops.patch`](#ggml-cuda-chatterbox-opspatch) —
-   three related ggml-cuda fixes / additions for chatterbox-style
+   four related ggml-cuda fixes / additions for chatterbox-style
    workloads:
    (a) replaces the scalar `conv_transpose_1d` CUDA kernel
    (one thread per output pixel scanning all `IC * IL` inputs with a
@@ -29,10 +29,18 @@ Two patches ship today:
    ggml-vulkan's `GGML_VK_PERF_LOGGER=1` so existing cross-backend
    grep / awk one-liners (FINDINGS.md / FINDINGS_CUDA.md
    reproduction recipes) keep working.  Auto-disables CUDA Graphs
-   when set so per-op events are visible.
-   All three active whenever `-DGGML_CUDA=ON` is in the build;
+   when set so per-op events are visible;
+   (d) extends the existing `MUL_MAT_VEC + ADD(bias)` fusion to
+   `MUL_MAT_VEC + ADD(bias) + ADD(residual)` — the same
+   `MUL_MAT_ADD_ADD` shader port from ggml-vulkan.  Adds an
+   `x_residual` field to `ggml_cuda_mm_fusion_args_*` and patches
+   `mmvq.cu` / `mmvf.cu` to add the residual inline after bias and
+   any GLU.  Saves ~47 ms / utterance on RTX 5090 (residual ADDs
+   folded into the matmul-vec kernel); -12 % total GPU time and
+   closes the CUDA ↔ Vulkan gap from 1.29× → 1.13× on long prompts.
+   All four active whenever `-DGGML_CUDA=ON` is in the build;
    force-graphs and perf-logger are opt-in via env vars,
-   conv_transpose patch is unconditional.
+   conv_transpose patch and 3-op fusion are unconditional.
 
 `scripts/setup-ggml.sh` applies both in order; the patches stack
 cleanly on the same pinned upstream commit.
@@ -80,7 +88,7 @@ cleanly:
 ```bash
 (cd ggml && git status --short)
 # Expected: 7 modified files under ggml/src/ggml-metal/
-#           4 modified files under ggml/src/ggml-cuda/
+#           6 modified files under ggml/src/ggml-cuda/
 ```
 
 CPU-only or Vulkan builds get the pinned commit but no useful patch
@@ -455,6 +463,110 @@ Sample run from `bench-logs-cuda/perf-logger-sample.log`:
 Same shapes / dispatch counts as the per-op tables in
 ggml-vulkan's `bench-logs/vk-perf-q4_0-newsdk.log` — the format
 parity makes cross-backend perf debugging trivial.
+
+### Part 4: 3-op `MUL_MAT_VEC + ADD(bias) + ADD(residual)` fusion
+
+#### Background
+
+The QVAC-17873 comparative perf-logger profile
+(`FINDINGS_CUDA.md` § 5.1.d) showed the largest remaining
+CUDA ↔ Vulkan gap was kernel-fusion-related: ggml-vulkan fuses
+chatterbox's `(mm * y) + bias + residual` chains at the kernel
+level (the `MUL_MAT_ADD` and `MUL_MAT_ADD_ADD` shader bindings),
+saving ~67 ms / utterance vs running three separate kernels.
+ggml-cuda already had the 2-op `MUL_MAT_VEC + ADD(bias)` fusion
+but stopped there — the residual `+ inpL` always ran as a
+stand-alone `GGML_OP_ADD` kernel in chatterbox's attn-output and
+FFN-output blocks (24 layers × 2 patterns × 2 ADDs/pattern = ~96
+unfused adds per token at step time).
+
+#### What the patch does
+
+Three coordinated edits:
+
+1. **`ggml/src/ggml-cuda/common.cuh`**: adds an `x_residual` field
+   to both `ggml_cuda_mm_fusion_args_host` and `_device`.  When
+   set, the matmul-vec kernel will add this tensor to its result
+   AFTER the existing bias and (if any) GLU steps.  Default
+   `nullptr` — backwards-compatible with the existing 2-op fusion
+   (and unfused) callers.
+
+2. **`ggml/src/ggml-cuda/mmvq.cu`** and
+   **`ggml/src/ggml-cuda/mmvf.cu`** (Q-quantised + F-precision
+   matmul-vec kernel templates):
+   - Mirror the existing `x_bias` plumbing: prefetch residual
+     values into a register array on the warp-zero / threadIdx.x
+     guard, identical access pattern (`x_residual + sample_dst*…
+     + channel_bias*… + row0`).
+   - Add `result += x_residuals[j];` AFTER the bias-add and the
+     GLU branch — matches ggml-vulkan's MUL_MAT_ADD_ADD shader
+     execution order and chatterbox's
+     `ggml_add(ctx, ggml_add(ctx, mm, bias), residual)` graph
+     shape.
+   - Host wrapper asserts mirror those for `x_bias`: type F32,
+     `ne[0]` matches dst, no broadcasting (broadcasting is
+     rejected at fusion-detection time before we get here).
+
+3. **`ggml/src/ggml-cuda/ggml-cuda.cu`** dispatch loop:
+   adds a 3-op `{MUL_MAT, ADD, ADD}` fusion case BEFORE the
+   existing 2-op fusion.  Validates that the second ADD's input
+   is the first ADD's output (residual layered on top of bias),
+   rejects broadcasting on either ADD (matches the 2-op fusion's
+   shape constraint), and falls through to the 2-op path when
+   the 3-op pattern doesn't match.  Only fires when
+   `ggml_cuda_should_fuse_mul_mat_vec_q/f(mm_node)` returns true
+   — i.e. step-phase n=1 dst, non-Pascal — same gating as 2-op.
+
+`MUL_MAT_ID` is intentionally not handled (residual-add doesn't
+apply to MoE expert routing and chatterbox doesn't emit it).
+
+#### Measured impact (RTX 5090 + CUDA 12.8 + branch HEAD, Turbo Q4_0, long-prompt warm bench)
+
+| Op bucket                    | CUDA pre | CUDA post | Δ        |
+|------------------------------|---------:|----------:|---------:|
+| `ADD` (stand-alone)          | 95.9 ms  | 48.6 ms   | **-47.3 ms** |
+| `MUL_MAT_VEC q4_0`           | 186.6 ms | 175.4 ms  | -11.2 ms |
+| `FLASH_ATTN_EXT`             | 143.9 ms | 136.8 ms  |  -7.2 ms |
+| (other op-bucket deltas)     |   …      |    …      |   ~-19 ms |
+| **Total GPU time**           | **698.5 ms** | **614.1 ms** | **-84.4 ms (-12 %)** |
+| Vulkan reference             |   —      |  541.3 ms |  —       |
+| **CUDA ↔ Vulkan ratio**      | 1.29×    | **1.13×** | -16 pts  |
+
+The 47 ms `ADD` saving is the residual-ADD kernels being absorbed
+into the matmul-vec kernel.  The 11 ms `MUL_MAT_VEC q4_0` saving is
+slightly counter-intuitive — adding an extra `result +=` inside the
+kernel should make it slower — but launching one fused kernel
+instead of three (mm + bias-add + residual-add) saves enough
+dispatch overhead that the net is negative.  Other buckets shifted
+within run-to-run noise as the autoregressive sampler diverged on
+the new FP-reduction order (different token sequence → slightly
+different per-stage call counts).
+
+T3 wall-clock impact is more modest: ~1-3 ms / utterance on Turbo
+Q4_0, scaling with token count.  Most of the GPU-time saving is
+still being eaten by Vulkan's 2× faster `flash_attn_ext_f16` kernel
+on chatterbox's prompt-phase shape — flagged for a follow-up
+(FINDINGS_CUDA.md § 5.1.d).
+
+#### Correctness
+
+`test-cuda-ops` ships 5 new mm+add+add Q4_0 cases at chatterbox-
+realistic shapes (1024×1024, 4096×1024, 1024×3072, 1024×4096,
+64×64).  Each constructs a 3-node graph
+(`mm = w * y; mb = mm + b; out = mb + r`) and compares the CUDA
+backend's output against the CPU backend's output.
+
+Tolerance is **NMSE ≤ 5e-4**, matching ggml's own
+`test-backend-ops` convention for Q4_0 matmul (per-element
+max-abs is the wrong metric for accumulated Q4_0 noise — observed
+max-abs ~1-4e-3 on K=1024-4096 dot-products is normal warp-
+reduction-vs-CPU-sequential variance).  Observed NMSE on RTX 5090
+is 3e-7 (k=64) to 4e-5 (k=4096) — comfortably within tolerance.
+
+End-to-end audio bit-identity is preserved relative to the same
+build with `GGML_CUDA_FORCE_GRAPHS=1` ↔ default — `cmp -s` passes
+in all 7 env-var-matrix combinations of
+`scripts/test-chatterbox-cuda.sh`.
 * **Cold-start (`~/.nv/ComputeCache` wiped) costs ~27 s on
   RTX 5090** when the host CUDA toolkit is older than the GPU
   architecture (toolkit 12.0 → emits PTX-89, driver JIT-compiles
