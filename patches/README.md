@@ -11,7 +11,8 @@ Two patches ship today:
    `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
    Apple-only; harmless no-op on CPU / CUDA / Vulkan builds.
 2. [`ggml-cuda-chatterbox-ops.patch`](#ggml-cuda-chatterbox-opspatch) —
-   two related ggml-cuda fixes for chatterbox-style workloads:
+   three related ggml-cuda fixes / additions for chatterbox-style
+   workloads:
    (a) replaces the scalar `conv_transpose_1d` CUDA kernel
    (one thread per output pixel scanning all `IC * IL` inputs with a
    skip conditional) with a warp-cooperative version that narrows the
@@ -21,9 +22,17 @@ Two patches ship today:
    the strict warmup check in `ggml_backend_cuda_graph_compute` so
    autoregressive workloads with growing-KV cache (chatterbox T3,
    GPT-style step-decode) actually hit the graph cache —
-   ~7-14 % faster T3 step depending on prompt length.
-   Both active whenever `-DGGML_CUDA=ON` is in the build; force-graphs
-   is opt-in via env var, conv_transpose patch is unconditional.
+   ~7-14 % faster T3 step depending on prompt length;
+   (c) adds an opt-in `GGML_CUDA_PERF_LOGGER=1` env var that prints
+   per-op GPU timing aggregates after every
+   `ggml_backend_cuda_graph_compute` call.  Output format matches
+   ggml-vulkan's `GGML_VK_PERF_LOGGER=1` so existing cross-backend
+   grep / awk one-liners (FINDINGS.md / FINDINGS_CUDA.md
+   reproduction recipes) keep working.  Auto-disables CUDA Graphs
+   when set so per-op events are visible.
+   All three active whenever `-DGGML_CUDA=ON` is in the build;
+   force-graphs and perf-logger are opt-in via env vars,
+   conv_transpose patch is unconditional.
 
 `scripts/setup-ggml.sh` applies both in order; the patches stack
 cleanly on the same pinned upstream commit.
@@ -236,7 +245,7 @@ Metal patch's simdgroup-sum reduction introduces.
 
 ### Validation harness
 
-Two test artefacts ship with the patch:
+Three test artefacts ship with the patch:
 
 ```bash
 # 1. Kernel-level CPU-vs-CUDA correctness for conv_transpose_1d.
@@ -250,11 +259,18 @@ cmake --build build-cuda --target test-cuda-ops -j
 #    18-run stress (3 seeds × 3 prompts × 2 modes), perf sanity.
 ./scripts/test-chatterbox-cuda.sh
 # Expected: "All chatterbox.cpp CUDA smoke tests PASSED"
+
+# 3. Perf-logger smoke test: format / parsing / hot-op presence /
+#    graph-disable interaction / aggregate-time sanity.
+./scripts/test-cuda-perf-logger.sh
+# Expected: "All GGML_CUDA_PERF_LOGGER tests PASSED"
 ```
 
-Re-run after every rebase / upstream sync; both binaries are no-ops
-when CUDA isn't enabled, so they're safe to wire into CI for non-CUDA
-builds too.
+Re-run after every rebase / upstream sync; all three binaries are
+no-ops when CUDA isn't enabled, so they're safe to wire into CI for
+non-CUDA builds too (test-cuda-ops exits 0 with a notice;
+test-chatterbox-cuda.sh and test-cuda-perf-logger.sh require both
+CUDA build + Turbo Q4_0 GGUFs).
 
 ### Part 2: `GGML_CUDA_FORCE_GRAPHS` opt-in
 
@@ -332,6 +348,96 @@ kernels still run the same arguments via `cudaGraphExecUpdate`.
   overhead vs launch saving) and is identical on T3.  Either build
   with graphs OFF, or build with graphs ON and set
   `GGML_CUDA_FORCE_GRAPHS=1` for autoregressive workloads.
+
+### Part 3: `GGML_CUDA_PERF_LOGGER` opt-in
+
+#### Background
+
+ggml-vulkan ships a `GGML_VK_PERF_LOGGER=1` per-op timing logger that
+prints aggregated GPU time per op + dtype + shape after every
+`ggml_backend_vk_graph_compute` call.  The Vulkan investigation
+(`../FINDINGS.md` § 3.2) leans on it heavily — the per-op cost
+table that motivated the conv_transpose_1d patch came from there.
+
+The CUDA backend had no equivalent.  Investigations had to fall back
+to `nsys profile --trace=cuda` + `nsys stats --report
+cuda_gpu_kern_sum`, which works but is heavyweight (full traces,
+needs Nsight Systems installed) and bins by raw CUDA kernel name —
+so two MUL_MAT calls at very different shapes show up as the same
+`mul_mat_vec_q<...>` row, hiding the shape distribution.
+
+#### What the env var does
+
+When `GGML_CUDA_PERF_LOGGER=1` is set, the dispatch loop in
+`ggml_backend_cuda_graph_compute` wraps each per-op section with
+`cudaEventRecord(start) / cudaEventRecord(end)`, then at the end of
+each compute_graph call it `cudaStreamSynchronize`s, reads
+`cudaEventElapsedTime` for every recorded pair, aggregates by
+`(op-kind, dtype, shape)` key, and prints to stderr.  Output format
+mirrors ggml-vulkan's `vk_perf_logger`:
+
+```
+----------------
+CUDA Timings:
+MUL_MAT q4_0 m=3072 n=383 k=1024: 24 x 241.979 us = 5807.507 us
+FLASH_ATTN_EXT (64,16,383,1): 24 x 162.226 us = 3893.423 us
+ADD (1024,383,1,1): 146 x 11.445 us = 1670.983 us
+…
+Total time: 22480.220 us.
+```
+
+Cross-backend grep / awk one-liners (the ones in `../FINDINGS.md`
+§ 7 / `bench-logs/summary.md`) work for both Vulkan and CUDA
+without modification.
+
+#### Behavioural notes
+
+* **Disables CUDA Graphs while active.** Capturing per-op events
+  inside a `cudaStreamCapture` block means the event values are
+  only valid AFTER `cudaGraphLaunch`, not when each kernel was
+  recorded — and the next graph capture would re-record over
+  still-pending events.  Simpler to disable graphs entirely while
+  the logger is on; cost is negligible since (a) the logger is
+  diagnostic-only and (b) graphs are off by default for chatterbox
+  anyway (FINDINGS_CUDA.md § 3.4).
+* **One block per `ggml_backend_cuda_graph_compute` call.** The
+  T3 prompt phase (1 call), each T3 step (N calls), CFM steps,
+  encoder, HiFT — each gets its own self-contained "CUDA Timings:"
+  block.  Cross-call mixing would lump prompt-phase (n=large)
+  and step-phase (n=1) MUL_MAT ops together, which obscures the
+  shape distribution.
+* **~3 µs overhead per dispatched op** from the two
+  `cudaEventRecord` calls.  Acceptable for diagnostics; do not
+  ship the env var on in production.
+
+#### Worked example: chatterbox per-op breakdown
+
+```bash
+GGML_CUDA_PERF_LOGGER=1 ./build-cuda/chatterbox \
+    --model models/chatterbox-t3-turbo-q4_0.gguf \
+    --s3gen-gguf models/chatterbox-s3gen-turbo.gguf \
+    --text "Hello from ggml." --out /tmp/run.wav \
+    --n-gpu-layers 99 --threads 16 --seed 42 \
+    2> /tmp/perf.log >/dev/null
+
+# Top 5 hot ops across all compute_graph calls in this run
+awk '/^[A-Z_]+/ && / us = / {sub(/ us$/,"",$NF); name=$1; for(i=2;i<NF;i++) if(!match($i,"^[0-9]+$")&&!match($i,"=")) name=name" "$i; tot[name]+=$NF} END {for(k in tot) print tot[k], k}' /tmp/perf.log \
+    | sort -rn | head -5
+```
+
+Sample run from `bench-logs-cuda/perf-logger-sample.log`:
+
+| Aggregate              | Total (µs) | Avg (µs) | Calls | Top shape |
+|------------------------|-----------:|---------:|------:|-----------|
+| `MUL_MAT q4_0`         |   5 807    |   242    |    24 | m=3072 n=383 k=1024 |
+| `MUL_MAT_VEC f32`      |   5 212    | 5 212    |     1 | m=1024 n=1 k=256 |
+| `MUL_MAT_VEC q4_0`     |   5 116    |   213    |    24 | m=3072 n=1 k=1024 (decode) |
+| `FLASH_ATTN_EXT`       |   3 893    |   162    |    24 | (64,16,383,1) prompt |
+| `ADD`                  |   1 671    |    11    |   146 | (1024,383,1,1) bias / residual |
+
+Same shapes / dispatch counts as the per-op tables in
+ggml-vulkan's `bench-logs/vk-perf-q4_0-newsdk.log` — the format
+parity makes cross-backend perf debugging trivial.
 * **Cold-start (`~/.nv/ComputeCache` wiped) costs ~27 s on
   RTX 5090** when the host CUDA toolkit is older than the GPU
   architecture (toolkit 12.0 → emits PTX-89, driver JIT-compiles
