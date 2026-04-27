@@ -66,7 +66,7 @@ extract_t3_ms() {
 # ---------------------------------------------------------------------------
 # 1. FORCE_GRAPHS bit-identity (default vs FORCE_GRAPHS, same seed/prompt)
 # ---------------------------------------------------------------------------
-echo "==> 1/3  FORCE_GRAPHS bit-identity check"
+echo "==> 1/4  FORCE_GRAPHS bit-identity check"
 LOG_DEFAULT="$WAV_DIR/default.log"
 run_chatterbox default > "$LOG_DEFAULT"
 WAV_DEFAULT="$WAV_DIR/default.wav"
@@ -90,7 +90,7 @@ fi
 # 2. Stress: 3 seeds × 3 prompt lengths in both modes (regression guard
 #    for the warp-cooperative conv_transpose_1d kernel + crash check)
 # ---------------------------------------------------------------------------
-echo "==> 2/3  stress runs (3 seeds × 3 prompts × 2 modes = 18 runs)"
+echo "==> 2/4  stress runs (3 seeds × 3 prompts × 2 modes = 18 runs)"
 SHORT='Hi.'
 MID='Hello from ggml.'
 LONG='We are testing the GGML CUDA backend on Blackwell with the chatterbox text to speech model.'
@@ -123,7 +123,7 @@ echo "    PASS: 18/18 stress runs completed without crashes / empty output"
 # ---------------------------------------------------------------------------
 # 3. Perf sanity: FORCE_GRAPHS should not regress T3 vs default (>5 %)
 # ---------------------------------------------------------------------------
-echo "==> 3/3  perf sanity"
+echo "==> 3/4  perf sanity"
 if [ "${T3_DEFAULT:-0}" -gt 0 ] && [ "${T3_FORCE:-0}" -gt 0 ]; then
     DELTA=$(( T3_FORCE - T3_DEFAULT ))
     PCT=$(awk "BEGIN { printf \"%d\", ($DELTA * 100 + ($T3_DEFAULT/2)) / $T3_DEFAULT }")
@@ -136,6 +136,62 @@ if [ "${T3_DEFAULT:-0}" -gt 0 ] && [ "${T3_FORCE:-0}" -gt 0 ]; then
 else
     echo "    SKIP: could not parse T3 timings"
 fi
+
+# ---------------------------------------------------------------------------
+# 4. Env-var combination matrix.  All combinations must produce a
+#    valid wav file with no crash; FORCE_GRAPHS-default-disable
+#    semantics interact with DISABLE_GRAPHS / DISABLE_FUSION /
+#    PERF_LOGGER, so cover the cross-product.
+# ---------------------------------------------------------------------------
+echo "==> 4/4  env-var combination matrix"
+# (slug, env-string) pairs.  Slug is used as the wav filename.
+COMBO_SLUGS=( default       force                    nofuse                  force_nofuse                                              disable_then_force                                              perflog                  perflog_force                                  )
+COMBO_ENVS=(  ""            "GGML_CUDA_FORCE_GRAPHS=1" "GGML_CUDA_DISABLE_FUSION=1" "GGML_CUDA_FORCE_GRAPHS=1 GGML_CUDA_DISABLE_FUSION=1" "GGML_CUDA_DISABLE_GRAPHS=1 GGML_CUDA_FORCE_GRAPHS=1"            "GGML_CUDA_PERF_LOGGER=1" "GGML_CUDA_PERF_LOGGER=1 GGML_CUDA_FORCE_GRAPHS=1" )
+n_total=${#COMBO_SLUGS[@]}
+n_passed=0
+for i in "${!COMBO_SLUGS[@]}"; do
+    slug="${COMBO_SLUGS[$i]}"
+    combo="${COMBO_ENVS[$i]}"
+    out_wav="$WAV_DIR/combo-${slug}.wav"
+    if env $combo "$BIN" \
+            --model "$T3_GGUF" --s3gen-gguf "$S3GEN_GGUF" \
+            --text "$PROMPT" --out "$out_wav" \
+            --n-gpu-layers 99 --threads 16 --seed "$SEED" >/dev/null 2>&1; then
+        if [ -s "$out_wav" ]; then
+            n_passed=$((n_passed + 1))
+        else
+            echo "    FAIL: empty wav for combo: '$slug' ('$combo')" >&2
+            exit 1
+        fi
+    else
+        echo "    FAIL: chatterbox crashed for combo: '$slug' ('$combo')" >&2
+        exit 1
+    fi
+done
+echo "    PASS: ${n_passed}/${n_total} env-var combinations completed without crash / empty output"
+
+# Bit-identity invariants on top of the matrix:
+# (a) FORCE_GRAPHS doesn't change math vs default → wav identical
+# (b) FORCE_GRAPHS doesn't change math when fusion is off either
+# (c) DISABLE_GRAPHS overrides FORCE_GRAPHS (the latter is contingent
+#     on graphs being enabled in the first place) → identical to a
+#     run that just doesn't try to use graphs
+check_identical() {
+    local label="$1" a="$2" b="$3"
+    if cmp -s "$a" "$b"; then
+        echo "    PASS: $label — $(basename $a) == $(basename $b)"
+    else
+        echo "    FAIL: $label — wavs differ" >&2
+        md5sum "$a" "$b" >&2
+        exit 1
+    fi
+}
+check_identical "(a) FORCE_GRAPHS bit-identical to default"      \
+    "$WAV_DIR/combo-default.wav" "$WAV_DIR/combo-force.wav"
+check_identical "(b) FORCE_GRAPHS bit-identical with DISABLE_FUSION" \
+    "$WAV_DIR/combo-nofuse.wav" "$WAV_DIR/combo-force_nofuse.wav"
+check_identical "(c) DISABLE_GRAPHS overrides FORCE_GRAPHS"       \
+    "$WAV_DIR/combo-default.wav" "$WAV_DIR/combo-disable_then_force.wav"
 
 echo
 echo "All chatterbox.cpp CUDA smoke tests PASSED."

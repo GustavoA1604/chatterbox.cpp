@@ -80,7 +80,7 @@ cleanly:
 ```bash
 (cd ggml && git status --short)
 # Expected: 7 modified files under ggml/src/ggml-metal/
-#           3 modified files under ggml/src/ggml-cuda/
+#           4 modified files under ggml/src/ggml-cuda/
 ```
 
 CPU-only or Vulkan builds get the pinned commit but no useful patch
@@ -245,7 +245,10 @@ Metal patch's simdgroup-sum reduction introduces.
 
 ### Validation harness
 
-Three test artefacts ship with the patch:
+Four test artefacts ship with the patch.  The full suite is ~35
+distinct assertions and runs in ~2 minutes on RTX 5090.  Run all
+four after every rebase / upstream sync; they're CI-friendly (each
+exits non-zero on first failure).
 
 ```bash
 # 1. Kernel-level CPU-vs-CUDA correctness for conv_transpose_1d.
@@ -255,22 +258,36 @@ cmake --build build-cuda --target test-cuda-ops -j
 ./build-cuda/test-cuda-ops
 # Expected: "All CUDA op tests PASSED" (max_abs ~7e-7 on HiFT shapes)
 
-# 2. End-to-end pipeline smoke test: bit-identity of FORCE_GRAPHS,
-#    18-run stress (3 seeds × 3 prompts × 2 modes), perf sanity.
+# 2. Build-system regression guard.  Verifies setup-ggml.sh
+#    idempotency, recovery from manually-corrupted state, and that
+#    every patch in patches/*.patch applies cleanly to the pinned
+#    GGML_COMMIT.  Most useful when bumping GGML_COMMIT or after an
+#    upstream sync.  Catches "patch silently no-ops because the
+#    target was renamed" / "setup falsely declares already-applied
+#    on a corrupted tree".
+./scripts/test-build-system.sh
+# Expected: "All build-system tests PASSED"
+
+# 3. End-to-end pipeline smoke test: bit-identity of FORCE_GRAPHS,
+#    18-run stress (3 seeds × 3 prompts × 2 modes), perf sanity,
+#    and an env-var combination matrix (FORCE_GRAPHS × DISABLE_FUSION
+#    × DISABLE_GRAPHS × PERF_LOGGER) with the bit-identity invariants:
+#      a) FORCE_GRAPHS bit-identical to default
+#      b) FORCE_GRAPHS bit-identical when DISABLE_FUSION=1 too
+#      c) DISABLE_GRAPHS overrides FORCE_GRAPHS
 ./scripts/test-chatterbox-cuda.sh
 # Expected: "All chatterbox.cpp CUDA smoke tests PASSED"
 
-# 3. Perf-logger smoke test: format / parsing / hot-op presence /
-#    graph-disable interaction / aggregate-time sanity.
+# 4. Perf-logger smoke test: output format / parsing / hot-op
+#    presence / graph-disable interaction / aggregate-time sanity.
 ./scripts/test-cuda-perf-logger.sh
 # Expected: "All GGML_CUDA_PERF_LOGGER tests PASSED"
 ```
 
-Re-run after every rebase / upstream sync; all three binaries are
-no-ops when CUDA isn't enabled, so they're safe to wire into CI for
-non-CUDA builds too (test-cuda-ops exits 0 with a notice;
-test-chatterbox-cuda.sh and test-cuda-perf-logger.sh require both
-CUDA build + Turbo Q4_0 GGUFs).
+`test-cuda-ops` is a no-op when CUDA isn't enabled (exits 0 with a
+notice).  The three shell scripts require both a CUDA build + Turbo
+Q4_0 GGUFs at `models/`; they `exit 1` early with a helpful message
+if either is missing.
 
 ### Part 2: `GGML_CUDA_FORCE_GRAPHS` opt-in
 

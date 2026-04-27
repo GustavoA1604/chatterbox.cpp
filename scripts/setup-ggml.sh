@@ -33,13 +33,24 @@ fi
 cd ggml
 
 # Skip if we're already at the pinned commit with every patch already applied.
+#
+# Use `git apply --reverse --check`: it asks "would the reverse of this
+# patch apply cleanly?", which is true ONLY when the patch's exact
+# expected-output content is currently in the tree.  This is much more
+# discriminating than plain `--check` (which can spuriously fail —
+# and so spuriously declare "already applied" — when the working tree
+# is dirty in unrelated ways, e.g. an aborted previous run or manual
+# debug edits).  See scripts/test-build-system.sh §2 for the recovery
+# case this guards.
 CURRENT="$(git rev-parse --short=8 HEAD 2>/dev/null || echo '')"
 DIRTY_FILES="$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
 if [ "$CURRENT" = "$GGML_COMMIT" ] && [ "$DIRTY_FILES" -ge 1 ]; then
     ALL_APPLIED=1
     for p in "${PATCHES[@]}"; do
-        # If the patch would apply cleanly on top, it isn't in yet.
-        if git apply --check "$REPO_ROOT/patches/$p" 2>/dev/null; then
+        # If the reverse-apply does NOT apply cleanly, this patch's
+        # exact output is not in the tree — fall through and re-apply
+        # everything from scratch.
+        if ! git apply --reverse --check "$REPO_ROOT/patches/$p" 2>/dev/null; then
             ALL_APPLIED=0
             break
         fi
