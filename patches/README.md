@@ -234,6 +234,28 @@ end audio comparison on the same seed and prompt:
 i.e. inaudible.  This is the same kind of FP-order variance that the
 Metal patch's simdgroup-sum reduction introduces.
 
+### Validation harness
+
+Two test artefacts ship with the patch:
+
+```bash
+# 1. Kernel-level CPU-vs-CUDA correctness for conv_transpose_1d.
+#    13 cases: HiFT-realistic shapes, IC<warp / IC=warp / IC>warp,
+#    K==s0, s0==1, 1×1, etc.  Tolerance: 1e-3 abs / 1e-3 rel.
+cmake --build build-cuda --target test-cuda-ops -j
+./build-cuda/test-cuda-ops
+# Expected: "All CUDA op tests PASSED" (max_abs ~7e-7 on HiFT shapes)
+
+# 2. End-to-end pipeline smoke test: bit-identity of FORCE_GRAPHS,
+#    18-run stress (3 seeds × 3 prompts × 2 modes), perf sanity.
+./scripts/test-chatterbox-cuda.sh
+# Expected: "All chatterbox.cpp CUDA smoke tests PASSED"
+```
+
+Re-run after every rebase / upstream sync; both binaries are no-ops
+when CUDA isn't enabled, so they're safe to wire into CI for non-CUDA
+builds too.
+
 ### Part 2: `GGML_CUDA_FORCE_GRAPHS` opt-in
 
 #### Background

@@ -112,6 +112,16 @@ if (GGML_METAL)
     target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
 endif()
 
+# CUDA kernel validation: conv_transpose_1d (counterpart to test-metal-ops
+# for patches/ggml-cuda-chatterbox-ops.patch).  Compiles as a no-op
+# binary when CUDA isn't enabled — main() exits 0 with a notice.
+add_executable(test-cuda-ops src/test_cuda_ops.cpp)
+target_link_libraries(test-cuda-ops PRIVATE ggml)
+target_include_directories(test-cuda-ops PRIVATE ggml/include src)
+if (GGML_CUDA)
+    target_compile_definitions(test-cuda-ops PRIVATE GGML_USE_CUDA)
+endif()
+
 if (GGML_CUDA)
     target_compile_definitions(chatterbox PRIVATE GGML_USE_CUDA)
 endif()
