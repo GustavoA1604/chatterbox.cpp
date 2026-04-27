@@ -11,11 +11,19 @@ Two patches ship today:
    `PAD`, scalar `conv_transpose_1d`, `MUL_MAT + ADD(+ADD)` fusion).
    Apple-only; harmless no-op on CPU / CUDA / Vulkan builds.
 2. [`ggml-cuda-chatterbox-ops.patch`](#ggml-cuda-chatterbox-opspatch) —
-   replaces the scalar `conv_transpose_1d` CUDA kernel (one thread per
-   output pixel scanning all `IC * IL` inputs with a skip conditional)
-   with a warp-cooperative version that narrows the input range and
-   reduces across `IC` via `__shfl_xor_sync`. ~40× faster on HiFT-shaped
-   inputs; active whenever `-DGGML_CUDA=ON` is in the build.
+   two related ggml-cuda fixes for chatterbox-style workloads:
+   (a) replaces the scalar `conv_transpose_1d` CUDA kernel
+   (one thread per output pixel scanning all `IC * IL` inputs with a
+   skip conditional) with a warp-cooperative version that narrows the
+   input range and reduces across `IC` via `__shfl_xor_sync` —
+   ~40× faster on HiFT-shaped inputs;
+   (b) adds an opt-in `GGML_CUDA_FORCE_GRAPHS=1` env var that bypasses
+   the strict warmup check in `ggml_backend_cuda_graph_compute` so
+   autoregressive workloads with growing-KV cache (chatterbox T3,
+   GPT-style step-decode) actually hit the graph cache —
+   ~7-14 % faster T3 step depending on prompt length.
+   Both active whenever `-DGGML_CUDA=ON` is in the build; force-graphs
+   is opt-in via env var, conv_transpose patch is unconditional.
 
 `scripts/setup-ggml.sh` applies both in order; the patches stack
 cleanly on the same pinned upstream commit.
@@ -63,7 +71,7 @@ cleanly:
 ```bash
 (cd ggml && git status --short)
 # Expected: 7 modified files under ggml/src/ggml-metal/
-#           2 modified files under ggml/src/ggml-cuda/
+#           3 modified files under ggml/src/ggml-cuda/
 ```
 
 CPU-only or Vulkan builds get the pinned commit but no useful patch
@@ -112,14 +120,21 @@ every op Chatterbox emits at production speed.
 
 Base commit: same as above (`58c3805`).
 
-Replaces `conv_transpose_1d_kernel` in `ggml/src/ggml-cuda/conv-transpose-1d.cu`
-with a warp-cooperative variant. ~40× faster on the HiFT vocoder
-graphs Chatterbox emits; correctness preserved (output differs only
-by floating-point reduction order — measured at < -57 dBFS / SNR
-58 dB vs the original kernel's output, well below perceptual
-threshold).
+Two ggml-cuda changes targeted at chatterbox's pipeline shapes:
 
-### What the patch does
+1. **`conv_transpose_1d_kernel` rewrite** — ~40× faster on the HiFT
+   vocoder graphs Chatterbox emits.  Always on whenever `GGML_CUDA=ON`.
+2. **`GGML_CUDA_FORCE_GRAPHS=1` env var** — bypass the strict warmup
+   check so autoregressive (T3-step / growing-KV) workloads can use
+   CUDA Graphs.  Opt-in.
+
+Both modify only `ggml/src/ggml-cuda/`; no other backend is touched
+and the changes are no-ops when CUDA isn't built.  Correctness
+preserved end-to-end (audio output identical at -57 dBFS / SNR 58 dB
+vs the stock kernel for the conv_transpose change; bit-identical for
+the force-graphs change since it only changes scheduling not math).
+
+### Part 1: warp-cooperative `conv_transpose_1d_kernel`
 
 The stock kernel is the textbook "1 thread per output pixel"
 implementation:
@@ -219,15 +234,82 @@ end audio comparison on the same seed and prompt:
 i.e. inaudible.  This is the same kind of FP-order variance that the
 Metal patch's simdgroup-sum reduction introduces.
 
+### Part 2: `GGML_CUDA_FORCE_GRAPHS` opt-in
+
+#### Background
+
+Default ggml-cuda graph caching is keyed on the first node of the
+incoming `ggml_cgraph_t` and gated by a 2-call warmup check
+(`ggml_cuda_graph_update_required`) that requires every property of
+every node to be byte-identical between calls.  That's the right
+default for llama.cpp-style workloads where each call sends the same
+graph object with stable data pointers.
+
+Chatterbox's T3 step builds a fresh-but-identical-topology cgraph
+per token *with growing K/V views* (`L = n_past + 1`, see
+`build_step_graph` in `src/main.cpp`).  Each call therefore looks
+"different" to the strict warmup check — `K`'s `ne[1]` grows by 1,
+view offsets shift, etc. — so `warmup_complete` keeps resetting and
+the captured cudaGraph is never actually used.  The cost manifests
+as a multi-ms-per-token gap to e.g. ggml-vulkan, whose dispatcher
+has lower per-launch overhead.
+
+#### What the env var does
+
+When `GGML_CUDA_FORCE_GRAPHS=1` is set, the early-exit branch in
+`ggml_backend_cuda_graph_compute` is replaced with:
+
+```cpp
+use_cuda_graph = true;
+cuda_graph_update_required = properties_changed || graph->instance == nullptr;
+```
+
+i.e. *always* try the captured-graph path; rely on the existing
+`cudaGraphExecUpdate` (and re-instantiate-on-failure) wiring in
+`ggml_cuda_graph_update_executable` to absorb per-call differences.
+Default behaviour is unchanged when the env var is unset.
+
+#### Measured impact (RTX 5090 + CUDA 12.0, Turbo Q4_0, fresh process median)
+
+| Prompt length (tokens) | Default (no graphs) | `FORCE_GRAPHS=1` | Δ T3   | Δ %   |
+|------------------------:|--------------------:|-----------------:|-------:|------:|
+|                  19    |        120 ms       |       113 ms     | -7 ms  | -6 %  |
+|                  43    |        163 ms       |       150 ms     | -13 ms | -8 %  |
+|                 157    |        384 ms       |       332 ms     | -52 ms | -14 % |
+|                 231    |        523 ms       |       453 ms     | -70 ms | -13 % |
+
+Per-token saving is constant at ~0.3 ms/token across prompt lengths
+— consistent with replacing `~30 cudaLaunchKernel` calls per token
+(at ~4 µs each) with a single `cudaGraphLaunch` + `cudaGraphExecUpdate`
+(at ~50 µs total).  Modest but free, and S3Gen / CFM are unchanged.
+
+#### Correctness
+
+Audio output is **bit-identical** with vs without the env var
+(`md5sum` matches across `tokens=43` and `tokens=231` runs).  The
+patch only changes graph orchestration, not kernel math; the inner
+kernels still run the same arguments via `cudaGraphExecUpdate`.
+
+#### When NOT to set it
+
+- Workloads that genuinely change topology between calls (e.g. a
+  model that loads variable-length subgraphs per request).  In that
+  case `cudaGraphExecUpdate` would fail and trigger re-instantiation
+  every call, which is *slower* than the no-graphs fallback. Stick
+  with the default.
+- Models where each call's KV-cache properties are stable
+  (llama.cpp's default decode loop): the regular warmup machinery
+  already kicks in and `FORCE_GRAPHS` is at most a no-op.
+
 ### Caveats / follow-ups
 
-* **CUDA Graphs are net-negative for this pipeline.** Independent
-  finding from the same investigation: building with
-  `-DGGML_CUDA_GRAPHS=ON` and running with graphs enabled adds
-  ~7 ms to `[cfm_total]` (capture overhead vs launch saving) and
-  is identical on T3.  The default standalone-ggml setting
-  (`GGML_CUDA_GRAPHS=OFF`) is correct for chatterbox; the runtime
-  switch `GGML_CUDA_DISABLE_GRAPHS=1` matches.
+* **Standalone CUDA Graphs (without FORCE_GRAPHS) are net-negative
+  for this pipeline.** Independent finding from the same
+  investigation: building with `-DGGML_CUDA_GRAPHS=ON` and running
+  without `FORCE_GRAPHS=1` adds ~7 ms to `[cfm_total]` (capture
+  overhead vs launch saving) and is identical on T3.  Either build
+  with graphs OFF, or build with graphs ON and set
+  `GGML_CUDA_FORCE_GRAPHS=1` for autoregressive workloads.
 * **Cold-start (`~/.nv/ComputeCache` wiped) costs ~27 s on
   RTX 5090** when the host CUDA toolkit is older than the GPU
   architecture (toolkit 12.0 → emits PTX-89, driver JIT-compiles
