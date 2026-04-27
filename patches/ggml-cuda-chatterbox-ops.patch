@@ -902,6 +902,23 @@ index d9147202..97c1623c 100644
      }
  
      if (use_gate) {
+@@ -89,6 +99,16 @@ static __global__ void mul_mat_vec_f(
+         if (use_gate_bias) {
+             gate_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
+         }
++        if (use_residual) {
++            // Residual must be offset into the same (sample, channel) slice
++            // as the bias-add output it gets summed with.  Same shape rules
++            // as x_bias (no broadcasting; host-side fusion-detection in
++            // ggml_backend_cuda_graph_compute enforces this).  Latent bug
++            // here when ne[2]==ne[3]==1 (the chatterbox case) — the offset
++            // is 0 — but exposed by upstream test_mul_mat_vec_fusion's
++            // batch_dims=[4,2] cases.  Fix mirrors x_bias above.
++            x_residual += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
++        }
+     }
+ 
+     const float2 * y2 = (const float2 *) y;
 @@ -364,6 +374,10 @@ static __global__ void mul_mat_vec_f(
                      break;
              }
