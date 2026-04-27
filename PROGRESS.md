@@ -1,11 +1,16 @@
 # Chatterbox → ggml Port: Development Journal
 
-This document tracks the port of **Chatterbox Turbo** (Resemble AI, MIT license)
+This document tracks the port of **Chatterbox** (Resemble AI, MIT license)
 to `ggml`, from the first exploratory scoping all the way to the optimized
-end-to-end CPU binary, in the order things actually happened.
+end-to-end CPU/GPU binary, in the order things actually happened.  §3.1 –
+§3.18 cover the original **Turbo** port (English, GPT-2 Medium T3, meanflow
+CFM); §3.19 / §3.20 add the **Multilingual** variant (23 languages,
+Llama-520M T3 + perceiver, standard CFG-enabled CFM) and the cross-variant
+S3Gen weight-quantisation pass.
 
-- **Model**: `ResembleAI/chatterbox-turbo` (text-to-speech, ~450 M params without
-  the tokenizer / speaker-encoder).
+- **Models**: `ResembleAI/chatterbox-turbo` (~450 M params, English) and
+  `ResembleAI/chatterbox` (~520 M T3 + 23-language tokenizer, the
+  multilingual variant).  Both share the S3Gen + HiFT vocoder back half.
 - **Goal**: end-to-end `text → waveform` in C++/ggml with **bit-exact (or
   float-precision) parity** against the official PyTorch reference.
 - **Verification target**: every intermediate tensor within 1e-6 relative error
@@ -19,7 +24,8 @@ Everything runs in pure C++/ggml on CPU. The main end-to-end tool is one binary:
 
 | Binary | Role |
 |--------|------|
-| `tts-cli` | end-to-end: text → speech tokens (T3) → 24 kHz wav (S3Gen + HiFT); voice cloning, streaming, etc. |
+| `tts-cli` | end-to-end: text → speech tokens (T3) → 24 kHz wav (S3Gen + HiFT); voice cloning, streaming, both Turbo and Multilingual variants (autodetected from GGUF metadata). |
+| `chatterbox` | identical second binary kept for backward compatibility with pre-rename scripts; same code as `tts-cli`. |
 | `mel2wav` | mel spectrogram → wav (HiFT only, demo) |
 
 Plus `scripts/synthesize.sh`, a thin wrapper around `tts-cli`.
@@ -48,7 +54,10 @@ Plus `scripts/synthesize.sh`, a thin wrapper around `tts-cli`.
 
 GPU support and Metal kernel fixes are described in §3.11 / §3.12;
 the layout-friendly KV cache + Flash Attention pass that produced the
-numbers in this table is in §3.13.
+numbers in this table is in §3.13.  The Multilingual port (§3.19) and
+the S3Gen weight-quantisation pass that landed alongside it (§3.20)
+add a second variant on top of the same back half — see those sections
+for the MTL-specific parity / speed numbers.
 
 ---
 
@@ -56,47 +65,74 @@ numbers in this table is in §3.13.
 
 ```
 chatterbox.cpp/
-  ggml/                           vendored ggml checkout (see patches/)
+  ggml/                           vendored ggml checkout (see patches/, scripts/setup-ggml.sh)
   patches/
     ggml-metal-chatterbox-ops.patch   Metal op fixes: diag_mask_inf, pad_ext,
                                       faster conv_transpose_1d (applied to ggml/
                                       during setup; see patches/README.md)
+    ggml-opencl-chatterbox-ops.patch  OpenCL: HiFT ops (CONV_TRANSPOSE_1D, SIN, …)
     README.md                         why each patch exists + how to drop it
+  include/tts-cpp/                installed public headers (Engine API)
+    tts-cpp.h                       library entry; declares tts_cpp_cli_main()
+    chatterbox/engine.h             Engine + EngineOptions (text → wav)
+    chatterbox/s3gen_pipeline.h     low-level S3Gen pipeline entry points
   src/
-    main.cpp                      T3 runtime + shared helpers (libtts-cpp; tts-cli links this)
-    chatterbox_cli.cpp            unified CLI (tts-cli binary)
+    main.cpp                      T3 turbo runtime + shared helpers (libtts-cpp)
+    t3_mtl.{h,cpp}                T3 multilingual (Llama-520M) runtime + stage builders
+    chatterbox_t3_internal.h      internal T3 declarations shared by main.cpp / engine / CLI
+    chatterbox_engine.cpp         public Engine API impl (links into libtts-cpp)
+    chatterbox_cli.cpp            unified CLI (tts-cli + chatterbox binaries)
+    cli_main.cpp                  thin entry: forwards argc/argv to tts_cpp_cli_main()
     chatterbox_tts.cpp            S3Gen encoder + CFM + HiFT (reusable entry)
-    gpt2_bpe.{h,cpp}              self-contained GPT-2 byte-level BPE tokenizer
+    gpt2_bpe.{h,cpp}              self-contained GPT-2 byte-level BPE tokenizer (turbo)
+    mtl_tokenizer.{h,cpp}         multilingual grapheme tokenizer (HF tokenizers.json + NFKD)
+    mtl_unicode_tables.inc        embedded NFKD + Korean Jamo lookup tables
     voice_features.{h,cpp}        wav I/O, resample, mel, fbank, LUFS
+    mel_extract_stft.cpp          STFT-based mel extraction shared by C++ pipelines
     voice_encoder.{h,cpp}         VoiceEncoder 256-d speaker embedding
-    campplus.{h,cpp}              CAMPPlus 192-d speaker embedding
+    campplus.{h,cpp}              CAMPPlus 192-d speaker embedding (BN-fused inc include)
     s3tokenizer.{h,cpp}           S3TokenizerV2 (wav → S3 speech tokens)
-    test_s3gen.cpp                staged verification harness (stages A..H5)
-    test_metal_ops.cpp            parity test for the patched Metal kernels
     mel2wav.cpp                   mel → wav demo binary (HiFT only)
-    npy.h                         minimal .npy loader + compare helpers
+    test_s3gen.cpp                staged verification harness for turbo S3Gen (A..H5)
+    test_t3_mtl.cpp               end-to-end parity test for the MTL T3 forward pass
+    test_t3_mtl_stages.cpp        staged parity harness for MTL (cond/text/inputs/layers/head)
+    test_mtl_tokenizer.cpp        MTL tokenizer parity vs HF reference
+    test_metal_ops.cpp            parity test for the patched Metal kernels
+    test_streaming.cpp / test_voice_*.cpp / test_resample.cpp / test_fbank.cpp / …
+    npy.h, dr_wav.h               minimal .npy loader + WAV decoder (header-only)
   scripts/
-    convert-t3-turbo-to-gguf.py       T3 weights + tokenizer + VE + builtin voice → GGUF
-    convert-s3gen-to-gguf.py          S3Gen encoder + CFM + HiFT + CAMPPlus
-                                      + S3TokenizerV2 + mel filterbanks → GGUF
-    dump-s3gen-reference.py           PyTorch → .npy intermediates for test-s3gen
-    dump-campplus-reference.py        PyTorch → .npy intermediates for test-campplus
-    dump-s3tokenizer-reference.py     PyTorch → .npy intermediates for test-s3tokenizer
+    setup-ggml.sh                     clones the pinned ggml commit + applies patches
+    convert-t3-turbo-to-gguf.py       Turbo T3 weights + tokenizer + VE + builtin voice → GGUF
+    convert-t3-mtl-to-gguf.py         MTL T3 (Llama-520M) + perceiver + emotion-adv
+                                      + tokenizers.json + builtin voice → GGUF
+    convert-s3gen-to-gguf.py          S3Gen encoder + CFM + HiFT + CAMPPlus + S3TokenizerV2
+                                      + mel filterbanks → GGUF (--variant {turbo,mtl},
+                                      --quant {f32,f16,q8_0,q5_0,q4_0})
+    requantize-gguf.py                in-place block-quantise of an existing S3Gen/T3 GGUF
+    gen-nfkd-table.py                 generates src/mtl_unicode_tables.inc from CLDR data
+    extract-voice.py                  one-shot voice-clone prep (silencedetect + EQ + bake)
+    dump-{s3gen,campplus,s3tokenizer,streaming,t3-mtl}-reference.py
+                                      PyTorch → .npy intermediates for the test-* harnesses
     reference-t3-turbo.py             PyTorch T3 + compare against C++
     compare-tokenizer.py              10-case tokenizer comparison against HF
-    synthesize.sh                     text → wav wrapper (tts-cli)
+    synthesize.sh                     text → wav wrapper around tts-cli
   models/
-    chatterbox-t3-turbo.gguf      T3 + tokenizer conditionals
-    chatterbox-s3gen.gguf         flow + mel2wav weights + built-in voice
-    t3-{q8_0,q5_0,q4_0}.gguf      quantized T3 variants (A3)
-  CMakeLists.txt                  top-level: add_subdirectory(ggml) + targets
+    chatterbox-t3-turbo.gguf      Turbo T3 (GPT-2 Medium) + GPT-2 BPE + builtin voice
+    chatterbox-s3gen.gguf         Turbo S3Gen (meanflow CFM) + HiFT + CAMPPlus + S3TokV2
+    chatterbox-t3-mtl.gguf        Multilingual T3 (Llama-520M) + tokenizers.json + builtin voice
+    chatterbox-s3gen-mtl.gguf     Multilingual S3Gen (standard 10-step CFM, CFG inside)
+    *-{q8_0,q5_0,q4_0}.gguf       quantised variants (see §3.20)
+  CMakeLists.txt                  top-level: add_subdirectory(ggml) + tts-cpp lib + binaries
   PROGRESS.md                     this file
+  README.md                       user-facing build / run / benchmark guide
 ```
 
 A separate machine holds PyTorch + the original Chatterbox repo for reference
 runs. On-device (Apple Silicon / Linux x86) the C++ binaries have **no runtime
-dependency on Python** — the tokenizer reads `vocab.json` + `merges.txt`
-directly.
+dependency on Python** — the Turbo BPE tokenizer (`vocab.json` + `merges.txt`)
+and the Multilingual `tokenizers.json` are both embedded directly into their
+T3 GGUFs as `tokenizer.ggml.*` metadata, so the only runtime input is the
+GGUF file itself plus optional reference audio.
 
 ---
 
@@ -1010,14 +1046,14 @@ The ONNX addon is shown as a baseline because it's the current
 in-house reference TTS implementation. Every ggml configuration —
 including CPU F16 on the same host — beats it.
 
-### 3.17  Multilingual (Llama-520M) variant
+### 3.19  Multilingual (Llama-520M) variant
 
 Everything up to this point in the journal was Chatterbox **Turbo**
-(GPT-2 Medium T3, meanflow 2-step CFM, English BPE).  §3.17 is the port
+(GPT-2 Medium T3, meanflow 2-step CFM, English BPE).  §3.19 is the port
 of **ChatterboxMultilingualTTS** (23-language Llama-520M T3 + perceiver
 resampler + CFG-enabled standard 10-step CFM).  Variant is auto-detected
 from `chatterbox.variant` GGUF metadata at load time; Turbo stays byte-
-identical to the pre-§3.17 builds.
+identical to the pre-§3.19 builds.
 
 **What shipped (commit
 [3f0a8dac](https://github.com/gianni-cor/chatterbox.cpp/commit/3f0a8dac)):**
@@ -1075,7 +1111,7 @@ end-to-end with `jfk.wav` in Spanish: VoiceEncoder + S3TokenizerV2 +
 CAMPPlus + native mel extraction all fire and produce a plausibly-JFK
 Spanish wav.
 
-#### Staged parity (§3.17 milestone M1..M5)
+#### Staged parity (§3.19 milestone M1..M5)
 
 Mirroring the Turbo staged-verification pattern (§3.3 S3Gen A..F).  M4
 with Metal, F16 weights, 7-token prompt "Hello there.":
@@ -1225,47 +1261,73 @@ Optimisations still on the table, ordered by expected CPU impact:
    Hindi phonemizer).  Easiest to ship as optional Python pre-processing
    that emits already-tokenised IDs.
 
-### 3.18  CPU/GPU optimisation pass #1 — S3Gen weight quantisation
+### 3.20  CPU/GPU optimisation pass #1 — S3Gen weight quantisation
 
-Items #1 and #2 from the §3.17 backlog shipped together.  The lever is
-entirely in `scripts/convert-s3gen-to-gguf.py`: a new `--quant
-{f32,f16,q8_0,q4_0}` flag routes every big matmul weight through a
-single `add_weight()` helper that picks the storage format per-tensor
-based on shape, with a safe fallback chain.  Zero C++ changes, zero
-runtime API changes — `ggml_mul_mat` dispatches the right quantised
-kernel automatically once the tensor's `ggml_type` is set, so every
-backend (CPU/NEON, CPU/AVX, Metal, Vulkan, CUDA) picks up the win for
-free.
+Items #1 and #2 from the §3.19 backlog shipped together.  The lever
+sits in two converter scripts that share the same per-tensor
+quantisation policy:
 
-**Rules inside `add_weight()`** (documented inline; all defensive so a
-stray caller can't silently degrade quality):
+- `scripts/convert-s3gen-to-gguf.py` — covers item #2 (CFM estimator +
+  encoder Linears, the dominant CPU cost on MTL).  A new `--quant
+  {f32,f16,q8_0,q5_0,q4_0}` flag routes every tensor through a single
+  `add_tensor_maybe_q()` helper, which delegates the per-tensor
+  decision to `should_quantize()` in `scripts/requantize-gguf.py`.
+- `scripts/convert-t3-mtl-to-gguf.py` — covers item #1 (T3 Llama
+  linears + speech/text heads).  Same `--quant` flag, same target
+  block formats; uses the same MTL-specific `_is_quantizable_weight`
+  shape filter the Turbo-side converter has had since §A3.
 
-- Rank < 2 tensor → always F32.  Biases and LayerNorm gammas/betas; the
-  bandwidth savings are negligible and F16 LN params visibly regress rel
-  error at deeper layers.
-- Rank == 3 tensor → always F32.  These are Conv1d kernels (ne=[K, IC,
-  OC] in ggml order).  `src/chatterbox_tts.cpp`'s `conv1d_f32` helper
-  passes the kernel as mul_mat's *second* operand, and ggml-cpu asserts
-  `src1->type == GGML_TYPE_F32` on that path.  Quantising conv kernels
-  would crash the CPU backend on load.  TODO in the code: once
-  `conv1d_f32` is refactored to use the same kernel-as-src0 pattern as
-  `conv1d_f32_b`, drop this branch.
-- Explicit skip list `_FORCE_F32_WEIGHTS` → always F32.  Three tensors
-  the C++ side reads directly via `ggml_backend_tensor_get` with F32
-  byte layout assumed (`flow/input_embedding`, `flow/spk_embed_affine/w`,
-  `hift/m_source/l_linear/weight`).  Auto-detection would need C++
-  cooperation; explicit is simpler for a "compress what's safe" PR.
-- Rank 2, ne[0] % 32 == 0, `--quant` ∈ {q8_0, q4_0} → block quantise.
-  Every transformer Q/K/V/out/FF Linear in the Conformer encoder + CFM
-  + S3TokenizerV2 lands here.  Inner dim 512, 1024, 2048 all align.
-- Rank 2, ne[0] % 32 != 0 (e.g. 9, 192-with-bias-quirks) OR `--quant` ==
-  f16 → F16 fallback.  Halves bandwidth without block alignment.
-- Rank 2, `--quant` == f32 → F32.  Default, reproduces pre-optimisation
-  GGUFs byte-for-byte.
+Zero C++ changes, zero runtime API changes — `ggml_mul_mat` dispatches
+the right quantised kernel automatically once the tensor's `ggml_type`
+is set, so every backend (CPU/NEON, CPU/AVX, Metal, Vulkan, CUDA)
+picks up the win for free.
 
-**Format histogram** printed at the end of every conversion
-(`Weight format breakdown (requested --quant q4_0): f32=808 q4_0=426`)
-so it's immediately visible whether tensors landed where expected.
+**Single source of truth.**  `requantize-gguf.py` already had to make
+the same yes/no quantise decision for the offline "rewrite an existing
+GGUF in place" tool, and we explicitly want both paths (convert-from-
+PyTorch and rewrite-existing) to land tensors in identical layouts.
+`convert-s3gen-to-gguf.py` therefore loads the policy at import time
+via `_load_requantize_policy()` and reuses `should_quantize()` +
+`_QUANT_TYPE` directly — no duplicate deny-list, no drift between the
+two tools.
+
+**Rules in `should_quantize()`** (`scripts/requantize-gguf.py`; all
+defensive so a stray caller can't silently degrade quality):
+
+- Tensors with < 1024 elements → never quantise.  Biases, LayerNorm
+  gammas/betas, tiny conditioning vectors; the bandwidth savings are
+  negligible and block-quant rounding visibly regresses rel error.
+- Deny-list of name substrings (`_DENY_SUBSTRINGS`) → never quantise.
+  Covers `flow/input_embedding` and `/builtin/` (read as raw F32 by the
+  C++ loader), token / position embedding tables (`text_emb`,
+  `speech_emb`, `wte`, `wpe`, `pos_emb`, `pe/pe`), spectral bases
+  (`stft_basis`, `mel_filterbank`, `mel_fb`), all bias / norm / scale
+  patterns (`/b`, `/bias`, `/bn/`, `/norm/`, `/ln_`, `/g`, `/s`,
+  `alpha`, `beta`, `gamma`), and the entire voice-encoder /
+  `campplus/` / `s3tokv2/` subtrees (small specialised encoders whose
+  dynamic range is too tight for Q4/Q8 block quant — speaker_emb
+  collapses to zeros if quantised).
+- Reduction-dim alignment: `shape[-1] % block_size != 0` → never
+  quantise.  GGML block quants need the reduction dim to be a multiple
+  of 32 (Q8_0 / Q4_0) or 32 (Q5_0).  Every transformer Q/K/V/out/FF
+  Linear in the Conformer encoder + CFM + S3TokenizerV2 hits this:
+  inner dim 512, 1024, 2048 all align.
+- Source dtype gate: only F32 / F16 tensors are quantisation candidates
+  (`_QUANTIZABLE_SRC_DTYPES`); already-quantised tensors get copied
+  through as-is.
+- Anything that survives all four gates → quantised to the requested
+  block format.  `--quant f16` skips block-quant entirely and just
+  stores everything as F16; `--quant f32` is the default and reproduces
+  the pre-optimisation GGUF byte-for-byte.
+
+**Quantisation counter.**  When `--quant != f16`, `add_tensor_maybe_q`
+threads a `qstats` dict through every call site and at the end of
+conversion prints
+`--quant q4_0: 426 tensors block-quantized (policy matches
+scripts/requantize-gguf.py; embeddings, voice encoders, norms/biases,
+and filterbanks kept at full precision)`
+so it's immediately visible whether the deny-list bit and how many
+tensors landed in the quantised pool.
 
 **GGUF size** (MTL S3Gen):
 
@@ -1300,7 +1362,7 @@ conv1d-arg-order reason above.  CFM gains the full expected fraction
 because its transformer blocks and `mlp` projections were the bulk of
 the bandwidth.)
 
-**End-to-end multilingual table (M4, same Spanish prompt as §3.17,
+**End-to-end multilingual table (M4, same Spanish prompt as §3.19,
 seed 42, 4 CPU threads, built-in voice on ggml, `jfk.wav` voice on
 ONNX via the `chatterbox-multilingual-bench.js` harness):**
 
@@ -1310,11 +1372,11 @@ ONNX via the `chatterbox-multilingual-bench.js` harness):**
 | ggml Metal, F16  T3 + F16  S3Gen       | 1 825 ms / 57 t  |  2 135 ms   |2.40 s |  3 960 ms  | 1.65  |
 | ggml CPU 4t, Q4_0 T3 + Q4_0 S3Gen      | 1 168 ms / 53 t  |  4 861 ms   |2.24 s |  6 029 ms  | 2.69  |
 | ggml CPU 4t, F16  T3 + F16  S3Gen      | 2 315 ms / 57 t  |  5 453 ms   |2.40 s |  7 768 ms  | 3.24  |
-| ggml CPU 4t, F16  T3 + **F32** S3Gen (§3.17) | 2 423 ms / 57 t | 7 113 ms | 2.40 s | 9 536 ms | 3.97 |
+| ggml CPU 4t, F16  T3 + **F32** S3Gen (§3.19) | 2 423 ms / 57 t | 7 113 ms | 2.40 s | 9 536 ms | 3.97 |
 | ONNX Runtime CPU 4t, q4   (avg of 2)   |      —           |      —      |2.19 s | 31 702 ms  |14.55  |
 | ONNX Runtime CPU 4t, fp16 (avg of 2)   |      —           |      —      |2.27 s | 53 342 ms  |23.50  |
 
-Key deltas vs the §3.17 CPU baseline at the same 4-thread CPU target:
+Key deltas vs the §3.19 CPU baseline at the same 4-thread CPU target:
 
 - `F16 S3Gen`  quant alone: -19% wall (-1.77 s).
 - `Q4_0 S3Gen` quant + Q4_0 T3: -37% wall (-3.51 s).  RTF drops from
@@ -1330,7 +1392,7 @@ ONNX side so it's doing half the compute):
 
 With CFG enabled on ONNX (the apples-to-apples comparison), those
 ratios would roughly double.  ONNX q4 notably improved from our
-§3.17-era measurement (RTF 18.17 → 14.55) after a recent
+§3.19-era measurement (RTF 18.17 → 14.55) after a recent
 `qvac-lib-infer-onnx-tts` prebuilds update; ONNX fp16 stayed within
 noise (20.91 → 23.50).
 
@@ -1352,10 +1414,10 @@ AVX-512 VNNI on Intel/AMD, by Metal/Vulkan/CUDA compute shaders on
 their respective GPUs.  Mobile deployments (Android + iOS) get the
 same win as desktop.
 
-**What's next for MTL (updated §3.17 backlog).**
+**What's next for MTL (updated §3.19 backlog).**
 
-1. ~~Q8_0/Q4_0 T3 for MTL~~ — **shipped** (this §3.18 row).
-2. ~~Quantised CFM estimator weights~~ — **shipped** (this §3.18 row).
+1. ~~Q8_0/Q4_0 T3 for MTL~~ — **shipped** (this §3.20 row).
+2. ~~Quantised CFM estimator weights~~ — **shipped** (this §3.20 row).
 3. **Runtime `--cfm-steps N` for MTL**.  Still on the table; trivial
    plumbing, probably 25–30% more CPU wall time savings at `N=7`.
 4. **Fix `conv1d_f32` arg order** so rank-3 Conv1d kernels can also
@@ -1367,7 +1429,7 @@ same win as desktop.
    hits efficiency cores and regresses ~10% vs `--threads 8`.
    Platform-agnostic detection (`hwloc` or direct sysctl on Apple, a
    mask on Linux perf cores).  Follow-up PR.
-6. **ja/he/ru/zh/hi language support** — unchanged from §3.17.
+6. **ja/he/ru/zh/hi language support** — unchanged from §3.19.
 
 ---
 
@@ -1909,8 +1971,14 @@ Quality, comparing output tokens on a long prompt:
 - **Q4_0**: sampling diverges slightly earlier and more. Audio still
   intelligible, with more drift from the F16 reference voice.
 
-S3Gen / HiFT weights are conv-dominated (F16 on CFM linears actually
-regressed on CPU — see §3.8 Attempt 7), so those stay F32.
+S3Gen / HiFT weights initially stayed F32 because Conv1d kernels are
+F32-only on the ggml CPU backend (F16 on CFM linears regressed on CPU
+— see §3.8 Attempt 7).  The S3Gen-quant pass in §3.20 lifts this for
+the big 2-D matmul weights only (CFM attn/FF Linears, encoder
+projections, HiFT Conv1d weights where the inner-dim alignment allows
+block layout); biases, LayerNorm, conv kernels and embedding tables
+still stay full precision.  See §3.20 for the storage-format table and
+the resulting end-to-end speed / parity numbers.
 
 Remaining: Q4_K / Q5_K path. Drop-in win would come from
 `llama-quantize models/chatterbox-t3-turbo.gguf /out.gguf Q4_K_M`
@@ -1919,7 +1987,7 @@ porting one of the K-quant kernels to the Python `gguf` package.
 
 ### Tier B — serious work, impactful for specific use cases
 
-#### B1. Streaming / chunked generation for first-token latency
+#### B1. Streaming / chunked generation for first-token latency — ✅ **DONE** (Phases 1–3d shipped; live-input mode added in §3.17)
 
 The current pipeline is "wait 2.4 s then hear all 8.6 s at once". For
 interactive apps, **first-audio-out latency** matters more than

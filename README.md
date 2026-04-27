@@ -44,7 +44,7 @@ instead of 2 — no classifier-free guidance, no CFG-combined CFM). If
 the ONNX CFG path were wired up, its RTF would roughly double and the
 gap vs ggml would widen to ~10–14× (CPU) / ~20–28× (Metal). ggml runs
 the full CFG pipeline in every row above. Reproduction + per-stage
-breakdown in [`PROGRESS.md §3.17–3.18`](PROGRESS.md) and
+breakdown in [`PROGRESS.md §3.19–3.20`](PROGRESS.md) and
 [`qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js`][bench].
 
 [bench]: https://github.com/tetherto/qvac2/blob/feat/tts-ggml/packages/qvac-lib-infer-onnx-tts/examples/chatterbox-multilingual-bench.js
@@ -211,12 +211,12 @@ embed the full HuggingFace `tokenizers.json` blob (plus a Korean-Jamo /
 NFKD Unicode table for offline preprocessing), so in both cases you don't
 need to keep the source tokenizer files around on disk.
 
-The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.18 —
+The quantisation flag on `convert-s3gen-to-gguf.py` is new as of §3.20 —
 it's pure data-format work, so the binary needs no changes and every
 backend (CPU, Metal, Vulkan, CUDA) picks up the faster matmul kernels
 transparently.  Safety rules inside the converter force biases, LN
 gammas/betas, and conv kernels (rank-3) to stay F32 regardless of
-`--quant`; see `PROGRESS.md §3.18` for the full storage-format table
+`--quant`; see `PROGRESS.md §3.20` for the full storage-format table
 and fallback chain.
 
 You should now have (either pair is usable on its own):
@@ -617,7 +617,7 @@ decoder forward (`use_b2 = !ggml_backend_is_cpu(...)`), since kernel
 dispatch overhead amortises well across the bigger workload; on ggml-cpu
 the extra permute+cont ops that a batched attention block needs regress
 throughput, so CPU keeps the two-call path.  See
-[`PROGRESS.md §3.17`](PROGRESS.md) for the measurement and a discussion
+[`PROGRESS.md §3.19`](PROGRESS.md) for the measurement and a discussion
 of where the MTL slowdown lives relative to Turbo.
 
 ### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
