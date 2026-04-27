@@ -351,8 +351,15 @@ bool load_model_gguf(const std::string & path, chatterbox_model & model, int req
         gguf_init_params peek_params = { /*.no_alloc=*/ true, /*.ctx=*/ nullptr };
         gguf_context * peek_ctx = gguf_init_from_file(path.c_str(), peek_params);
         if (peek_ctx) {
+            std::string variant = "t3_turbo";
             const int64_t vk = gguf_find_key(peek_ctx, KEY_VARIANT);
-            std::string variant = (vk >= 0) ? std::string(gguf_get_val_str(peek_ctx, vk)) : std::string("t3_turbo");
+            if (vk >= 0 && gguf_get_kv_type(peek_ctx, vk) == GGUF_TYPE_STRING) {
+                const char * v = gguf_get_val_str(peek_ctx, vk);
+                if (v) variant = v;
+            } else if (vk >= 0) {
+                fprintf(stderr, "%s: ignoring %s with unexpected GGUF type %d (defaulting to t3_turbo)\n",
+                        __func__, KEY_VARIANT, (int) gguf_get_kv_type(peek_ctx, vk));
+            }
             gguf_free(peek_ctx);
             if (variant == "t3_mtl") {
                 return load_model_gguf_mtl(path, model, requested_ctx, n_gpu_layers);
@@ -602,7 +609,7 @@ static ggml_tensor * build_transformer_core(
 static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_text_tokens) {
     const int N = 1 + model.hparams.cond_prompt_len + n_text_tokens + 1;
     static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -631,7 +638,7 @@ static ggml_cgraph * build_prompt_graph(const chatterbox_model & model, int n_te
 
 static ggml_cgraph * build_step_graph(const chatterbox_model & model, int n_past) {
     static size_t buf_size = ggml_tensor_overhead()*CHBX_MAX_NODES + ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);

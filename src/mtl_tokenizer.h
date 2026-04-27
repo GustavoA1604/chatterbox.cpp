@@ -5,6 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace tts_cpp::chatterbox::detail {
+
 class mtl_tokenizer {
 public:
     bool load_from_json(const std::string & json_blob);
@@ -53,3 +55,5 @@ private:
     void index_vocab();
     void bpe_word(const std::string & word, std::vector<int32_t> & out) const;
 };
+
+} // namespace tts_cpp::chatterbox::detail

@@ -561,9 +561,27 @@ static bool parse_args(int argc, char ** argv, cli_params & params) {
         else if (arg == "--top-p")          { if (!parse_float("--top-p",          params.top_p))          return false; }
         else if (arg == "--temp")           { if (!parse_float("--temp",           params.temp))           return false; }
         else if (arg == "--repeat-penalty") { if (!parse_float("--repeat-penalty", params.repeat_penalty)) return false; }
-        else if (arg == "--min-p")          { if (!parse_float("--min-p",          params.min_p))          return false; }
-        else if (arg == "--cfg-weight")     { if (!parse_float("--cfg-weight",     params.cfg_weight))     return false; }
-        else if (arg == "--exaggeration")   { if (!parse_float("--exaggeration",   params.exaggeration))   return false; }
+        else if (arg == "--min-p") {
+            if (!parse_float("--min-p", params.min_p)) return false;
+            if (params.min_p < 0.0f || params.min_p > 1.0f) {
+                fprintf(stderr, "error: --min-p must be in [0, 1] (got %g)\n", (double) params.min_p);
+                return false;
+            }
+        }
+        else if (arg == "--cfg-weight") {
+            if (!parse_float("--cfg-weight", params.cfg_weight)) return false;
+            if (params.cfg_weight < 0.0f) {
+                fprintf(stderr, "error: --cfg-weight must be >= 0 (got %g)\n", (double) params.cfg_weight);
+                return false;
+            }
+        }
+        else if (arg == "--exaggeration") {
+            if (!parse_float("--exaggeration", params.exaggeration)) return false;
+            if (params.exaggeration < 0.0f || params.exaggeration > 1.0f) {
+                fprintf(stderr, "error: --exaggeration must be in [0, 1] (got %g)\n", (double) params.exaggeration);
+                return false;
+            }
+        }
         else if (arg == "--language")       { auto v = next("--language");       if (!v) return false; params.language = v; }
         else if (arg == "--max-sentence-chars") { if (!parse_int("--max-sentence-chars", params.max_sentence_chars)) return false; }
         else if (arg == "--no-auto-split")  { params.max_sentence_chars = 0; }
@@ -1702,7 +1720,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                 generated.reserve(params.n_predict + 1);
 
                 int32_t current = is_mtl
-                    ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng)
+                    ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
+                                            model.hparams.stop_speech_token)
                     : sample_next_token(logits, generated, params, rng);
                 generated.push_back(current);
 
@@ -1721,7 +1740,8 @@ int tts_cpp_cli_main(int argc, char ** argv) {
                     if (!step_ok) throw std::runtime_error("step eval failed");
                     ++n_past;
                     current = is_mtl
-                        ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng)
+                        ? sample_next_token_mtl(logits_c, logits_u, generated, sp_mtl, rng,
+                                                model.hparams.stop_speech_token)
                         : sample_next_token(logits, generated, params, rng);
                     generated.push_back(current);
 

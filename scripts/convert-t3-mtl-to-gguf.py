@@ -10,9 +10,11 @@ Parallels scripts/convert-t3-turbo-to-gguf.py, adapted to:
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import re
+import sys
 from pathlib import Path
 
 import gguf
@@ -20,6 +22,24 @@ import numpy as np
 import torch
 from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
+
+
+def _load_requantize_policy():
+    """Load should_quantize + _QUANT_TYPE from requantize-gguf.py (single
+    source of truth shared with convert-s3gen-to-gguf.py and the offline
+    requantize tool).  Keeps the deny-list in one place so adding a new
+    tensor name to T3 doesn't accidentally leak into a quantised slot."""
+    path = Path(__file__).resolve().parent / "requantize-gguf.py"
+    spec = importlib.util.spec_from_file_location("_chatterbox_requantize_policy", path)
+    if spec is None or spec.loader is None:
+        print(f"error: could not load quant policy from {path}", file=sys.stderr)
+        sys.exit(1)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.should_quantize, mod._QUANT_TYPE
+
+
+_SHOULD_QUANTIZE, _RQ_QUANT_TYPE = _load_requantize_policy()
 
 
 REPO_ID = "ResembleAI/chatterbox"
@@ -77,7 +97,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", type=Path, default=Path("models/chatterbox-t3-mtl.gguf"))
     p.add_argument("--hf-token", default=None)
     p.add_argument("--quant", choices=QUANT_CHOICES, default="f16",
-                   help="Weight dtype for Llama linears + speech/text heads.")
+                   help="Weight dtype for the big 2-D matmul weights.  f16 keeps "
+                        "the GGUF byte-identical to the legacy default.  q8_0/q5_0/q4_0 "
+                        "block-quantise eligible tensors per scripts/requantize-gguf.py "
+                        "(same deny-list as the S3Gen converter and the offline "
+                        "requantize tool: keeps embeddings, position embeddings, "
+                        "norms/biases, voice-encoder weights, and built-in voice "
+                        "conditioning at full precision).")
     return p.parse_args()
 
 
@@ -90,36 +116,40 @@ def as_numpy(tensor: torch.Tensor, *, dtype=None, transpose: bool = False) -> np
     return np.ascontiguousarray(arr)
 
 
-_QUANT_TYPE = {
-    "q8_0": gguf.GGMLQuantizationType.Q8_0,
-    "q5_0": gguf.GGMLQuantizationType.Q5_0,
-    "q4_0": gguf.GGMLQuantizationType.Q4_0,
-}
-
-
-def _is_quantizable_weight(name: str) -> bool:
-    if name in ("chatterbox/speech_head", "chatterbox/text_head"):
-        return True
-    if name.startswith("model/h") and (
-        name.endswith("/attn/q/w") or
-        name.endswith("/attn/k/w") or
-        name.endswith("/attn/v/w") or
-        name.endswith("/attn/o/w") or
-        name.endswith("/mlp/gate/w") or
-        name.endswith("/mlp/up/w") or
-        name.endswith("/mlp/down/w")
-    ):
-        return True
-    return False
-
-
 def add_maybe_quantized(writer: "gguf.GGUFWriter", name: str, array: np.ndarray, quant: str) -> str:
-    if quant == "f16" or not _is_quantizable_weight(name):
+    """Write a tensor; quantise eligible big 2-D float weights when
+    quant != f16.  Eligibility is decided by `should_quantize()` in
+    scripts/requantize-gguf.py — single source of truth shared with
+    convert-s3gen-to-gguf.py and the offline requantize tool.
+
+    Concretely, for the T3 MTL tensor set this means q8_0/q5_0/q4_0
+    quantises:
+      - model/h{i}/attn/{q,k,v,o}/w
+      - model/h{i}/mlp/{gate,up,down}/w
+      - chatterbox/{text,speech}_head
+      - chatterbox/cond_spkr/w
+      - chatterbox/perceiver/pre_attention_query
+      - chatterbox/perceiver/attn/{to_q,to_k,to_v,proj_out}/w
+    and keeps full precision on:
+      - all norms / biases (matched by `/g`, `/b`, `/norm/`, `/ln_`)
+      - text/speech token embedding tables (`text_emb`, `speech_emb`)
+      - text/speech positional embedding tables (`pos_emb`)
+      - voice_encoder/* and chatterbox/builtin/* (whole subtrees)
+      - chatterbox/emotion_adv_fc/w (fails the rank/alignment gate; ne[0]=1)
+
+    Returns the storage dtype as a short string for the BENCH log.
+    """
+    if quant == "f16":
         writer.add_tensor(name, array)
         return str(array.dtype)
-
-    qtype = _QUANT_TYPE[quant]
-    qdata = gguf.quants.quantize(array.astype(np.float32), qtype)
+    if array.dtype.kind in ("i", "u") or np.issubdtype(array.dtype, np.integer):
+        writer.add_tensor(name, array)
+        return str(array.dtype)
+    qtype = _RQ_QUANT_TYPE[quant]
+    if not _SHOULD_QUANTIZE(name, array.shape, qtype):
+        writer.add_tensor(name, array)
+        return str(array.dtype)
+    qdata = gguf.quants.quantize(np.ascontiguousarray(array.astype(np.float32)), qtype)
     writer.add_tensor(name, qdata, raw_shape=qdata.shape, raw_dtype=qtype)
     return qtype.name
 
@@ -205,7 +235,10 @@ def write_metadata(writer: gguf.GGUFWriter, quant: str) -> None:
     writer.add_embedding_length(N_EMBD)
     writer.add_block_count(N_LAYER)
     writer.add_head_count(N_HEAD)
-    writer.add_vocab_size(TEXT_VOCAB_SIZE)
+    # Note: vocab size goes through `chatterbox.text_vocab_size` only (read
+    # by the C++ loader as KEY_TEXT_VOCAB_SIZE).  Skipping the GGUF-standard
+    # `general.vocab_size` keeps a single canonical source so a future
+    # converter can't have the two metadata entries drift.
 
     writer.add_string("chatterbox.variant", "t3_mtl")
     writer.add_string("chatterbox.backbone", "llama_520m")

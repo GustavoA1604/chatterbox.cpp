@@ -251,6 +251,20 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
         m.meanflow    = (k_mf >= 0) ? gguf_get_val_bool(g, k_mf) : true;
         m.n_timesteps = (k_ts >= 0) ? (int) gguf_get_val_u32(g, k_ts) : (m.meanflow ? 2 : 10);
         m.cfg_rate    = (k_cf >= 0) ? gguf_get_val_f32(g, k_cf) : (m.meanflow ? 0.0f : 0.7f);
+        if (k_mf < 0 && k_ts < 0 && k_cf < 0) {
+            // Pre-§3.19 GGUFs lack the variant keys.  Defaults match the
+            // historical Turbo behaviour, so legacy chatterbox-s3gen.gguf
+            // files continue to work unchanged.  Print a one-time warning
+            // because the same defaults applied to a *multilingual* S3Gen
+            // GGUF produced by an older converter would silently run the
+            // wrong CFM solver and emit garbage.  Re-converting picks up
+            // the proper keys.
+            fprintf(stderr, "warning: s3gen GGUF lacks variant keys "
+                            "(s3gen.meanflow / n_timesteps / cfg_rate); "
+                            "assuming Turbo (meanflow, 2 steps).  If this is "
+                            "an MTL S3Gen, re-run "
+                            "scripts/convert-s3gen-to-gguf.py --variant mtl.\n");
+        }
         if (verbose) {
             fprintf(stderr, "  s3gen variant: %s (n_timesteps=%d, cfg_rate=%.2f)\n",
                     m.meanflow ? "meanflow" : "standard CFM + CFG",
@@ -894,8 +908,18 @@ static std::vector<float> compute_time_mixed(const model_ctx & m,
 }
 
 // Cached CFM estimator state — graph is built once and reused across steps.
+//
+// Cache key is (T, b2): a graph built for batch=1 (cfm_estimator_forward) cannot
+// be reused for the batch=2 path (cfm_estimator_forward_b2) since the input
+// tensor layouts differ (ne[2] = 1 vs 2).  Today `use_b2` is constant per
+// `s3gen_synthesize_to_wav` invocation and the cache lives on the stack of
+// that one call, so a single key would be safe — but a future change that
+// switches modes mid-utterance (e.g. CFG warm-up where step 0 is single-pass
+// and steps 1+ are batched) would silently reuse a wrong-shape graph and
+// crash inside the allocator.
 struct cfm_estimator_cache {
-    int T = -1;
+    int  T  = -1;
+    bool b2 = false;
     ggml_context * ctx = nullptr;
     ggml_cgraph * gf = nullptr;
     ggml_gallocr_t allocr = nullptr;
@@ -920,15 +944,21 @@ static std::vector<float> cfm_estimator_forward(
     const int MEL = 80, CH = 256, TIME_DIM = 1024;
     const int N_MID = 12, N_BLOCKS = 4;
 
-    const bool build_graph = (cache.T != T);
+    const bool build_graph = (cache.T != T) || cache.b2;
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        cache.buf.resize(256 * 1024 * 1024);
+        // 64 MB is comfortable headroom for ~1500 tensor headers + 65536-node
+        // graph metadata at no_alloc=true (the buffer holds tensor structs
+        // and graph book-keeping only, not weight data).  Was 256 MB before;
+        // dropped after measuring real usage at <8 MB and noticing that the
+        // virtual reservation was inflating RSS on systems without overcommit.
+        cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
         cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.T = T;
+        cache.T  = T;
+        cache.b2 = false;
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;
@@ -1041,15 +1071,20 @@ static void cfm_estimator_forward_b2(
     const int N_MID = 12, N_BLOCKS = 4;
     const int B = 2;
 
-    const bool build_graph = (cache.T != T);
+    const bool build_graph = (cache.T != T) || !cache.b2;
     if (build_graph) {
         if (cache.allocr) { ggml_gallocr_free(cache.allocr); cache.allocr = nullptr; }
         if (cache.ctx) { ggml_free(cache.ctx); cache.ctx = nullptr; }
-        cache.buf.resize(512 * 1024 * 1024);
+        // 64 MB is plenty for 65536 graph nodes + ~3000 tensor headers (the
+        // batch=2 graph roughly doubles tensor count vs the batch=1 path).
+        // Was 512 MB before — see cfm_estimator_forward for the rationale on
+        // why the original number was overspec.
+        cache.buf.resize(64 * 1024 * 1024);
         ggml_init_params gp = { cache.buf.size(), cache.buf.data(), true };
         cache.ctx = ggml_init(gp);
         cache.gf = ggml_new_graph_custom(cache.ctx, 65536, false);
-        cache.T = T;
+        cache.T  = T;
+        cache.b2 = true;
     }
     ggml_context * ctx = cache.ctx;
     ggml_cgraph * gf = cache.gf;

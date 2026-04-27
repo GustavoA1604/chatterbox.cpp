@@ -17,6 +17,8 @@
 #include <string>
 #include <vector>
 
+using namespace tts_cpp::chatterbox::detail;
+
 namespace {
 
 struct tiny_json {

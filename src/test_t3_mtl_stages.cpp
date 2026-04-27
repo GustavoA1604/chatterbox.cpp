@@ -27,6 +27,11 @@
 #include <thread>
 #include <vector>
 
+// Pull the implementation-detail symbols (`chatterbox_model`,
+// `build_stage_*_graph`, etc.) into the global scope so each `int main`
+// stage can stay compact.  Fine for a test executable; tightly couples
+// these tests to detail-namespace renames, which is the right trade-off
+// for a parity harness.
 using namespace tts_cpp::chatterbox::detail;
 
 namespace {

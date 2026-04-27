@@ -77,7 +77,11 @@ bool get_bool(const gguf_context * ctx, const char * key) {
 //   if wavelen < high_wavelen: inv_freq = base
 //   else:                      smooth transition
 //   freq_factor[i]   = base_inv_freq[i] / effective_inv_freq[i]
-//                    (ggml divides each band's base frequency by this).
+//                    (ggml multiplies the position by 1/freq_factor[i] when
+//                    rotating each band, so storing base/effective here is
+//                    equivalent to dividing the base frequency by the
+//                    same ratio Python's `inv_freq_llama / inv_freq_extrapolation`
+//                    produces).  Parity test green against PyTorch.
 std::vector<float> compute_llama3_freq_factors(int head_dim, float theta,
                                                float factor, float low_freq,
                                                float high_freq, int orig_max_pos) {
@@ -335,7 +339,7 @@ ggml_cgraph * build_prompt_graph_mtl(const chatterbox_model & model,
 
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -416,7 +420,7 @@ ggml_cgraph * build_step_graph_mtl(const chatterbox_model & model,
 
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -481,7 +485,10 @@ bool run_prompt_pass(const chatterbox_model & model,
         fprintf(stderr, "run_prompt_pass: gallocr_reserve failed\n");
         return false;
     }
-    ggml_gallocr_alloc_graph(allocr, gf);
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "run_prompt_pass: gallocr_alloc_graph failed (graph topology exceeded reserved budget?)\n");
+        return false;
+    }
 
     // Dynamic inputs.  Any tensor may be pruned by the allocator if it does
     // not feed into the final output (e.g. text_tokens is unused on the
@@ -541,7 +548,10 @@ bool run_step_pass(const chatterbox_model & model,
         fprintf(stderr, "run_step_pass: gallocr_reserve failed\n");
         return false;
     }
-    ggml_gallocr_alloc_graph(allocr, gf);
+    if (!ggml_gallocr_alloc_graph(allocr, gf)) {
+        fprintf(stderr, "run_step_pass: gallocr_alloc_graph failed (n_past=%d)\n", n_past);
+        return false;
+    }
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "speech_token"), &token, 0, sizeof(token));
     int32_t sp = n_past;
@@ -567,7 +577,7 @@ bool run_step_pass(const chatterbox_model & model,
 ggml_cgraph * build_stage_cond_emb_graph(const chatterbox_model & m) {
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -586,7 +596,7 @@ ggml_cgraph * build_stage_cond_emb_graph(const chatterbox_model & m) {
 ggml_cgraph * build_stage_text_emb_graph(const chatterbox_model & m, int T_text) {
     static size_t buf_size = ggml_tensor_overhead() * 256 +
                              ggml_graph_overhead_custom(256, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 256, false);
@@ -614,7 +624,7 @@ ggml_cgraph * build_stage_inputs_graph(const chatterbox_model & m, int T_text,
 
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -661,7 +671,7 @@ ggml_cgraph * build_stage_layers_graph(const chatterbox_model & m, int N,
     const auto & hp = m.hparams;
     static size_t buf_size = ggml_tensor_overhead() * CHBX_MAX_NODES +
                              ggml_graph_overhead_custom(CHBX_MAX_NODES, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, CHBX_MAX_NODES, false);
@@ -698,7 +708,7 @@ ggml_cgraph * build_stage_head_graph(const chatterbox_model & m, int N) {
     const auto & hp = m.hparams;
     static size_t buf_size = ggml_tensor_overhead() * 64 +
                              ggml_graph_overhead_custom(64, false);
-    static std::vector<uint8_t> buf(buf_size);
+    thread_local std::vector<uint8_t> buf(buf_size);
     ggml_init_params p = { buf_size, buf.data(), true };
     ggml_context * ctx = ggml_init(p);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 64, false);
@@ -764,6 +774,20 @@ bool load_model_gguf_mtl(const std::string & path,
         hp.rope_high_freq    = get_f32(gguf_ctx, KEY_ROPE_HIGH_FREQ);
         hp.rope_orig_max_pos = (int32_t) get_u32(gguf_ctx, KEY_ROPE_ORIG_MAX_POS);
 
+        if (hp.rope_high_freq <= hp.rope_low_freq) {
+            throw std::runtime_error("invalid llama3 rope freq config: high_freq_factor (" +
+                                     std::to_string(hp.rope_high_freq) +
+                                     ") must be > low_freq_factor (" +
+                                     std::to_string(hp.rope_low_freq) +
+                                     ") to avoid div-by-zero in compute_llama3_freq_factors");
+        }
+        if (hp.rope_scale_factor == 0.0f) {
+            throw std::runtime_error("invalid llama3 rope_scaling_factor: must be non-zero");
+        }
+        if (hp.rope_orig_max_pos <= 0) {
+            throw std::runtime_error("invalid rope.original_max_position: must be > 0");
+        }
+
         if (requested_ctx > 0) hp.n_ctx = std::min(hp.n_ctx, requested_ctx);
 
         model.backend = init_backend(n_gpu_layers);
@@ -775,6 +799,14 @@ bool load_model_gguf_mtl(const std::string & path,
 
         for (int64_t i = 0; i < num_tensors; ++i) {
             const char * name = gguf_get_tensor_name(gguf_ctx, i);
+            // Reject duplicate names: ggml_dup_tensor would happily allocate
+            // a second tensor under the same name and the second one wins in
+            // model.tensors, leaking the first in ctx_w until model destruction.
+            // Real-world cause is a malformed GGUF or a future merged-shard
+            // format that emits the same name from two shards.
+            if (model.tensors.find(name) != model.tensors.end()) {
+                throw std::runtime_error(std::string("duplicate tensor name in GGUF: ") + name);
+            }
             ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
             ggml_tensor * dst = ggml_dup_tensor(model.ctx_w, src);
             ggml_set_name(dst, name);
@@ -787,6 +819,10 @@ bool load_model_gguf_mtl(const std::string & path,
         model.rope_freq_factors = freq_factors;
 
         model.buffer_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
+        if (!model.buffer_w) {
+            throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
+                                     "weights buffer (backend out of memory?)");
+        }
 
         for (ggml_tensor * cur = ggml_get_first_tensor(model.ctx_w); cur; cur = ggml_get_next_tensor(model.ctx_w, cur)) {
             if (cur == freq_factors) continue;
@@ -850,6 +886,10 @@ bool load_model_gguf_mtl(const std::string & path,
         model.memory_k_uncond = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
         model.memory_v_uncond = ggml_new_tensor_1d(model.ctx_kv, GGML_TYPE_F32, kv_elements);
         model.buffer_kv = ggml_backend_alloc_ctx_tensors(model.ctx_kv, model.backend);
+        if (!model.buffer_kv) {
+            throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
+                                     "KV-cache buffer (backend out of memory?)");
+        }
 
         {
             const int64_t jk = gguf_find_key(gguf_ctx, "tokenizer.ggml.mtl_json");
@@ -861,12 +901,29 @@ bool load_model_gguf_mtl(const std::string & path,
                 ggml_free(tmp_ctx);
                 return false;
             }
-            model.mtl_tokenizer_json = gguf_get_val_str(gguf_ctx, jk);
-            if (lk >= 0) {
+            if (gguf_get_kv_type(gguf_ctx, jk) != GGUF_TYPE_STRING) {
+                fprintf(stderr, "load_model_gguf_mtl: tokenizer.ggml.mtl_json has unexpected GGUF type %d "
+                                "(expected GGUF_TYPE_STRING); re-run scripts/convert-t3-mtl-to-gguf.py.\n",
+                        (int) gguf_get_kv_type(gguf_ctx, jk));
+                gguf_free(gguf_ctx);
+                ggml_free(tmp_ctx);
+                return false;
+            }
+            const char * jv = gguf_get_val_str(gguf_ctx, jk);
+            if (!jv) {
+                fprintf(stderr, "load_model_gguf_mtl: tokenizer.ggml.mtl_json is null\n");
+                gguf_free(gguf_ctx);
+                ggml_free(tmp_ctx);
+                return false;
+            }
+            model.mtl_tokenizer_json = jv;
+            if (lk >= 0 && gguf_get_kv_type(gguf_ctx, lk) == GGUF_TYPE_ARRAY &&
+                gguf_get_arr_type(gguf_ctx, lk) == GGUF_TYPE_STRING) {
                 const size_t n = gguf_get_arr_n(gguf_ctx, lk);
                 model.mtl_languages.reserve(n);
                 for (size_t i = 0; i < n; ++i) {
-                    model.mtl_languages.emplace_back(gguf_get_arr_str(gguf_ctx, lk, i));
+                    const char * s = gguf_get_arr_str(gguf_ctx, lk, i);
+                    if (s) model.mtl_languages.emplace_back(s);
                 }
             }
         }
@@ -908,7 +965,16 @@ bool eval_prompt_mtl(const chatterbox_model & model,
     if (!run_prompt_pass(model, allocr, n_threads, text_tokens, exaggeration,
                          /*is_uncond=*/true, logits_uncond_out, plen_u)) return false;
     prompt_len = plen_c;
-    return plen_c == plen_u;
+    if (plen_c != plen_u) {
+        // Defensive: both passes derive prompt_len from the same hparams
+        // (len_cond + n_text_tokens + 2), so a mismatch should be impossible.
+        // Log loudly so anyone hitting this can root-cause instead of seeing
+        // a silent "prompt eval failed".
+        fprintf(stderr, "eval_prompt_mtl: cond/uncond prompt_len mismatch (%d vs %d); "
+                        "graph builder is inconsistent across is_uncond\n", plen_c, plen_u);
+        return false;
+    }
+    return true;
 }
 
 bool eval_step_mtl(const chatterbox_model & model,
@@ -918,6 +984,19 @@ bool eval_step_mtl(const chatterbox_model & model,
                    int32_t token,
                    std::vector<float> & logits_cond_out,
                    std::vector<float> & logits_uncond_out) {
+    // The step graph indexes `speech_pos_emb` directly with `n_past`.
+    // `speech_pos_emb` only has `max_speech_tokens` rows (see
+    // scripts/convert-t3-mtl-to-gguf.py: MAX_SPEECH_TOKENS=4096), so we have
+    // to refuse the step before `ggml_get_rows` reads past the embedding
+    // table.  In practice n_past starts at len_cond + n_text_tokens + 2
+    // (~2084 with max text), so this only fires on very long generations.
+    if (model.hparams.max_speech_tokens > 0 &&
+        n_past >= model.hparams.max_speech_tokens) {
+        fprintf(stderr, "eval_step_mtl: n_past=%d exceeds max_speech_tokens=%d; "
+                        "stopping generation to avoid out-of-range speech_pos_emb lookup\n",
+                n_past, model.hparams.max_speech_tokens);
+        return false;
+    }
     if (!run_step_pass(model, allocr, n_threads, n_past, token, /*uncond=*/false,
                        logits_cond_out)) return false;
     if (!run_step_pass(model, allocr, n_threads, n_past, token, /*uncond=*/true,
@@ -932,7 +1011,8 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
                               const std::vector<float> & logits_uncond,
                               const std::vector<int32_t> & generated,
                               const chatterbox_sampling_params & p,
-                              std::mt19937 & rng) {
+                              std::mt19937 & rng,
+                              int32_t stop_token) {
     const size_t V = logits_cond.size();
     std::vector<float> l(V);
     for (size_t i = 0; i < V; ++i) {
@@ -992,7 +1072,15 @@ int32_t sample_next_token_mtl(const std::vector<float> & logits_cond,
     double maxl = -INFINITY;
     for (float x : l) if (x > maxl) maxl = x;
     if (!std::isfinite(maxl)) {
-        return 0;
+        // All logits are -inf or NaN — sampling cascade left the distribution
+        // empty (e.g. min_p too aggressive against a flat distribution, or
+        // numerical underflow mid-pipeline).  Returning `stop_token` lets the
+        // outer decode loop break cleanly; the previous behaviour of returning
+        // 0 happened to be a valid in-vocab speech token id and would desync
+        // the sampler.
+        fprintf(stderr, "sample_next_token_mtl: degenerate logits "
+                        "(all -inf/NaN); returning stop_token=%d\n", stop_token);
+        return stop_token;
     }
     double sum = 0.0;
     std::vector<double> probs(V);

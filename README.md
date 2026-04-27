@@ -212,11 +212,14 @@ python scripts/convert-t3-mtl-to-gguf.py            --out models/chatterbox-t3-m
 python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
 
 # --- Multilingual, quantised (recommended for speed) ---
-# Matches the RTF numbers in the benchmark table above.  Both converters
-# accept --quant {f32,f16,q8_0,q5_0,q4_0}; the flag controls the large
-# matmul weights only — biases, LayerNorm gammas/betas, and embedding
-# tables always stay full precision (see the deny-list in
-# scripts/requantize-gguf.py for the exact policy).
+# Matches the RTF numbers in the benchmark table above.  --quant accepts
+# {f32,f16,q8_0,q5_0,q4_0} on convert-s3gen-to-gguf.py (default f32) and
+# {f16,q8_0,q5_0,q4_0} on convert-t3-mtl-to-gguf.py (default f16, since
+# the T3 storage baseline is already F16).  The flag controls the large
+# matmul weights only — biases, LayerNorm gammas/betas, embedding tables,
+# voice encoders, and built-in voice conditioning always stay at full
+# precision (see the deny-list in scripts/requantize-gguf.py for the
+# exact policy; the same policy is used by all three tools).
 python scripts/convert-t3-mtl-to-gguf.py --quant q4_0 \
        --out models/chatterbox-t3-mtl-q4_0.gguf
 python scripts/convert-s3gen-to-gguf.py  --variant mtl --quant q4_0 \
@@ -378,8 +381,9 @@ CFG / perceiver / 10-step-CFM machinery automatically based on the GGUF's
   --out         /tmp/mtl_es.wav
 ```
 
-Extra MTL-only knobs: `--cfg-weight F` (default 0.5), `--min-p F` (0.05),
-`--exaggeration F` (0.5 — emotion intensity).  `--reference-audio` works
+Extra MTL-only knobs: `--cfg-weight F` (default 0.5, must be ≥ 0),
+`--min-p F` (0.05, in [0, 1]), `--exaggeration F` (0.5 — emotion
+intensity, in [0, 1]).  `--reference-audio` works
 the same way on both variants.
 
 Everything is self-contained in the two `.gguf` files:
@@ -904,6 +908,22 @@ converter to produce a fresh GGUF:
 ```bash
 python scripts/convert-t3-turbo-to-gguf.py --out models/chatterbox-t3-turbo.gguf
 ```
+
+**`warning: s3gen GGUF lacks variant keys`** — you're running against a
+legacy S3Gen GGUF produced before the variant metadata was added in
+§3.19/§3.20. The defaults (`meanflow=true, n_timesteps=2, cfg_rate=0`)
+match the historical Turbo behaviour, so legacy Turbo GGUFs continue
+to work.  For a Multilingual S3Gen GGUF, however, those defaults are
+wrong and the output will be garbage — re-run the converter:
+
+```bash
+python scripts/convert-s3gen-to-gguf.py --variant mtl --out models/chatterbox-s3gen-mtl.gguf
+```
+
+**`error: --min-p must be in [0, 1]`** / `--cfg-weight must be >= 0` /
+`--exaggeration must be in [0, 1]` — the MTL sampling knobs reject
+out-of-range values up front instead of producing wrong-but-not-crashing
+output.  Pass values inside the documented ranges (see "Run" above).
 
 **`--debug requires --ref-dir`** — debug mode substitutes Python-dumped
 random bits to make every intermediate tensor bit-exactly comparable.

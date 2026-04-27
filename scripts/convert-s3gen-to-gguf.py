@@ -553,11 +553,23 @@ def main():
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file()
     writer.close()
-    print(f"\nOutput: {args.out}")
+
+    out_size_mb = args.out.stat().st_size / (1024 * 1024)
+    print(f"\nOutput: {args.out} ({out_size_mb:.0f} MB)")
     if args.quant != "f16" and qstats is not None:
         print(f"  --quant {args.quant}: {qstats['n_quant']} tensors block-quantized "
               f"(policy matches scripts/requantize-gguf.py; embeddings, voice encoders, "
               f"norms/biases, and filterbanks kept at full precision)")
+    elif args.quant == "f32":
+        # Note: this default changed during the multilingual merge (the
+        # pre-merge main converter defaulted to --quant f16).  Surface the
+        # change so users running the converter without --quant in CI / build
+        # pipelines notice the size jump and can opt back in to a smaller
+        # GGUF if they want.
+        print(f"  --quant f32 is the default.  Pass --quant q4_0 (or run "
+              f"scripts/requantize-gguf.py {args.out} <out>.gguf q4_0) to get a "
+              f"~3x smaller, ~2x faster GGUF on bandwidth-bound backends.",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":

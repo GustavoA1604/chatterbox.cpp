@@ -20,6 +20,11 @@
 #include <thread>
 #include <vector>
 
+// Pull the implementation-detail symbols (`load_model_gguf`,
+// `chatterbox_model`, `eval_*_mtl`, sampling-params struct, etc.) into the
+// global scope so the test code can stay compact.  Fine for a test
+// executable: any rename inside the detail namespace would only break this
+// test's build, not the public Engine API.
 using namespace tts_cpp::chatterbox::detail;
 
 int main(int argc, char ** argv) {

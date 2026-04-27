@@ -292,11 +292,16 @@ bool eval_step_mtl(
     std::vector<float> &     logits_cond_out,
     std::vector<float> &     logits_uncond_out);
 
+// On a degenerate logits distribution (everything -inf after the sampling
+// cascade), returns `stop_token` so the caller's stop check fires cleanly
+// instead of emitting a pseudo-random in-vocab id.  Pass
+// `model.hparams.stop_speech_token` from the speech-decode loop.
 int32_t sample_next_token_mtl(
     const std::vector<float> &         logits_cond,
     const std::vector<float> &         logits_uncond,
     const std::vector<int32_t> &       generated,
     const chatterbox_sampling_params & params,
-    std::mt19937 &                     rng);
+    std::mt19937 &                     rng,
+    int32_t                            stop_token);
 
 } // namespace tts_cpp::chatterbox::detail

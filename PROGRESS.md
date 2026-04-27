@@ -1264,18 +1264,18 @@ Optimisations still on the table, ordered by expected CPU impact:
 ### 3.20  CPU/GPU optimisation pass #1 — S3Gen weight quantisation
 
 Items #1 and #2 from the §3.19 backlog shipped together.  The lever
-sits in two converter scripts that share the same per-tensor
+sits in two converter scripts that share a single per-tensor
 quantisation policy:
 
 - `scripts/convert-s3gen-to-gguf.py` — covers item #2 (CFM estimator +
-  encoder Linears, the dominant CPU cost on MTL).  A new `--quant
-  {f32,f16,q8_0,q5_0,q4_0}` flag routes every tensor through a single
-  `add_tensor_maybe_q()` helper, which delegates the per-tensor
-  decision to `should_quantize()` in `scripts/requantize-gguf.py`.
+  encoder Linears, the dominant CPU cost on MTL).  A new
+  `--quant {f32,f16,q8_0,q5_0,q4_0}` flag (default `f32` to keep the
+  from-PyTorch GGUF byte-identical to the pre-optimisation builds)
+  routes every tensor through a single `add_tensor_maybe_q()` helper.
 - `scripts/convert-t3-mtl-to-gguf.py` — covers item #1 (T3 Llama
-  linears + speech/text heads).  Same `--quant` flag, same target
-  block formats; uses the same MTL-specific `_is_quantizable_weight`
-  shape filter the Turbo-side converter has had since §A3.
+  linears + speech/text heads + perceiver Linears + cond_spkr).
+  `--quant {f16,q8_0,q5_0,q4_0}` (default `f16`, since the T3 storage
+  baseline is already F16) routes through the same helper.
 
 Zero C++ changes, zero runtime API changes — `ggml_mul_mat` dispatches
 the right quantised kernel automatically once the tensor's `ggml_type`
@@ -1284,12 +1284,14 @@ picks up the win for free.
 
 **Single source of truth.**  `requantize-gguf.py` already had to make
 the same yes/no quantise decision for the offline "rewrite an existing
-GGUF in place" tool, and we explicitly want both paths (convert-from-
-PyTorch and rewrite-existing) to land tensors in identical layouts.
-`convert-s3gen-to-gguf.py` therefore loads the policy at import time
-via `_load_requantize_policy()` and reuses `should_quantize()` +
-`_QUANT_TYPE` directly — no duplicate deny-list, no drift between the
-two tools.
+GGUF in place" tool, and we explicitly want all three paths (T3
+convert-from-PyTorch, S3Gen convert-from-PyTorch, and rewrite-existing)
+to land tensors in identical layouts.  Both converters load the policy
+at import time via `_load_requantize_policy()` and reuse
+`should_quantize()` + `_QUANT_TYPE` directly — no duplicate deny-list,
+no drift between the three tools.  Adding a new tensor name to either
+converter automatically inherits the right keep-as-F32 / quantise
+decision based on the deny-list patterns.
 
 **Rules in `should_quantize()`** (`scripts/requantize-gguf.py`; all
 defensive so a stray caller can't silently degrade quality):
