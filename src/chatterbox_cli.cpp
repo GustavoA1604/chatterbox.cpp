@@ -57,6 +57,7 @@
 #include "tts-cpp/tts-cpp.h"
 #include "tts-cpp/chatterbox/s3gen_pipeline.h"
 #include "chatterbox_t3_internal.h"
+#include "t3_mtl.h"
 #include "npy.h"
 #include "voice_features.h"
 #include "voice_encoder.h"
@@ -1029,19 +1030,27 @@ int tts_cpp_cli_main(int argc, char ** argv) {
             // tears the device down.  (S3Gen's cache registers its own
             // atexit hook; T3 has no such hook, main() is its owner.)
             auto free_t3 = [&]() {
+                if (model.buffer_stack || model.ctx_stack) {
+                    tts_cpp::chatterbox::detail::t3_stack_unregister(
+                        model.buffer_stack, model.ctx_stack);
+                }
                 ggml_backend_buffer_free(model.buffer_w);
                 ggml_backend_buffer_free(model.buffer_kv);
+                if (model.buffer_stack)    ggml_backend_buffer_free(model.buffer_stack);
                 if (model.buffer_override) ggml_backend_buffer_free(model.buffer_override);
                 ggml_backend_free(model.backend);
                 ggml_free(model.ctx_w);
                 ggml_free(model.ctx_kv);
+                if (model.ctx_stack)    ggml_free(model.ctx_stack);
                 if (model.ctx_override) ggml_free(model.ctx_override);
                 model.buffer_w = nullptr;
                 model.buffer_kv = nullptr;
+                model.buffer_stack = nullptr;
                 model.buffer_override = nullptr;
                 model.backend = nullptr;
                 model.ctx_w = nullptr;
                 model.ctx_kv = nullptr;
+                model.ctx_stack = nullptr;
                 model.ctx_override = nullptr;
             };
 

@@ -128,6 +128,25 @@ struct llama_layer {
     ggml_tensor * mlp_gate = nullptr;
     ggml_tensor * mlp_up   = nullptr;
     ggml_tensor * mlp_down = nullptr;
+
+    // Phase 15 fused-matmul stack for the Metal hot path. Allocated in
+    // a dedicated persistent buffer at load time; data is memcpy'd in
+    // from the per-tensor wq / wk / wv GGUF tensors which keep their
+    // own backing storage in the weights buffer.
+    //
+    //   wqkv : shape [n_embd, 3 * n_embd]   (Q rows ‖ K rows ‖ V rows)
+    //
+    // Stacking lets each Llama block run ONE Q4_0 mat-mul where it
+    // previously ran three. On a 30-layer × 84-token T3 step pass
+    // that's 30 * 84 * 2 ≈ 5k fewer kernel launches per call inside
+    // each command-buffer commit; the combined mat-mul is also a
+    // wider M dim (3072 vs 1024) which lets ggml-metal's mul_mm tile
+    // (NR0 = 64 row, NR1 = 32 col) saturate better on the tile loop.
+    //
+    // gate / up are NOT stacked: the multilingual T3 GGUF ships
+    // mlp_gate as F16 and mlp_up as Q4_0, and a single ggml_tensor
+    // can't hold mixed element widths.
+    ggml_tensor * wqkv = nullptr;
 };
 
 struct perceiver_weights {
@@ -207,6 +226,20 @@ struct chatterbox_model {
 
     ggml_backend_buffer_t buffer_w  = nullptr;
     ggml_backend_buffer_t buffer_kv = nullptr;
+
+    // Phase 15 stacked fused-matmul weights (wqkv per layer) live in
+    // their own backend buffer. Empty on the CPU backend; the CPU path
+    // uses the original wq/wk/wv directly.
+    //
+    // The buffer is registered in a process-wide t3_stack_registry
+    // (see src/t3_mtl.cpp) so an atexit hook can free it before
+    // Metal's static device destructors run, which otherwise asserts
+    // on `[rsets->data count] == 0` because residency sets stay
+    // referenced through buffer_stack. main()'s explicit free_t3()
+    // calls t3_stack_unregister() before freeing the backend so
+    // error-path early-returns don't double-free at exit.
+    ggml_context *        ctx_stack    = nullptr;
+    ggml_backend_buffer_t buffer_stack = nullptr;
 
     ggml_context *        ctx_override    = nullptr;
     ggml_backend_buffer_t buffer_override = nullptr;

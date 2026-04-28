@@ -34,12 +34,75 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace tts_cpp::chatterbox::detail {
+
+namespace {
+
+// Process-wide registry of the Phase-15 stacked-weight buffers, with an
+// atexit hook that frees them before Metal's static device destructors
+// run. Without this Metal asserts on `[rsets->data count] == 0` because
+// `buffer_stack` is still live when the ggml-metal dylib tears down.
+// Mirrors `s3gen_model_cache_release` in chatterbox_tts.cpp; the
+// existing buffer_w / buffer_kv get cleaned up by other paths
+// (explicit free_t3() in error returns, dylib finaliser via the
+// model_ctx cache for s3gen, etc.) — only the new buffer_stack needs
+// to be added to the atexit chain.
+struct t3_stack_entry {
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_context *        ctx    = nullptr;
+};
+std::mutex                  t3_stack_mu;
+std::vector<t3_stack_entry> t3_stack_registry;
+bool                        t3_stack_atexit_registered = false;
+
+void t3_stack_release_atexit() {
+    std::lock_guard<std::mutex> lk(t3_stack_mu);
+    for (auto & e : t3_stack_registry) {
+        if (e.buffer) {
+            ggml_backend_buffer_free(e.buffer);
+            e.buffer = nullptr;
+        }
+        if (e.ctx) {
+            ggml_free(e.ctx);
+            e.ctx = nullptr;
+        }
+    }
+    t3_stack_registry.clear();
+}
+
+}  // anonymous namespace
+
+void t3_stack_register(ggml_backend_buffer_t buf, ggml_context * ctx) {
+    std::lock_guard<std::mutex> lk(t3_stack_mu);
+    t3_stack_registry.push_back({buf, ctx});
+    if (!t3_stack_atexit_registered) {
+        std::atexit(t3_stack_release_atexit);
+        t3_stack_atexit_registered = true;
+    }
+}
+
+// Drop a (buffer, ctx) pair from the atexit registry without freeing.
+// Used by free_t3() in main on error-path early-returns: free_t3 itself
+// frees buffer_stack + ctx_stack so the backend can shut down cleanly in
+// the same scope; the atexit hook would otherwise double-free dangling
+// pointers if we didn't pull them out of the registry first.
+void t3_stack_unregister(ggml_backend_buffer_t buf, ggml_context * ctx) {
+    std::lock_guard<std::mutex> lk(t3_stack_mu);
+    for (auto it = t3_stack_registry.begin(); it != t3_stack_registry.end(); ) {
+        if (it->buffer == buf && it->ctx == ctx) {
+            it = t3_stack_registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 namespace {
 
@@ -227,25 +290,69 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
     ggml_tensor * cur = ggml_rms_norm(ctx, inpL, hp.eps);
     cur = ggml_mul(ctx, cur, l.ln_attn_g);
 
-    ggml_tensor * Qlin = ggml_mul_mat(ctx, l.wq, cur);  // (n_embd, N) or (n_embd, N, B)
-    ggml_tensor * Klin = ggml_mul_mat(ctx, l.wk, cur);
-    ggml_tensor * Vlin = ggml_mul_mat(ctx, l.wv, cur);
+    // Q/K/V mat-muls.  When the Phase-15 stacked W_qkv is available
+    // (Metal hot path) we run ONE Q4_0 mat-mul producing
+    // (3 * n_embd, N, B), then slice Q/K/V via strided views straight
+    // into the (HD, NH, N[, B]) shape that RoPE expects — no
+    // ggml_reshape (would require a contiguous source) and no
+    // ggml_cont (would defeat the saving). RoPE's metal kernel walks
+    // src via per-element nb00/nb01/nb02/nb03 strides so it handles
+    // the non-contiguous N stride on the slice transparently.
+    const int n_embd_t = hp.n_embd;
+    ggml_tensor * Qlin;
+    ggml_tensor * Klin;
+    ggml_tensor * Vlin;
+    bool used_stacked_qkv = false;
+    if (l.wqkv) {
+        ggml_tensor * QKV = ggml_mul_mat(ctx, l.wqkv, cur);  // (3*n_embd, N) or (3*n_embd, N, B)
+        used_stacked_qkv = true;
+        const size_t f = sizeof(float);
+        const size_t row_stride   = (size_t) 3 * n_embd_t * f;
+        const size_t batch_stride = row_stride * (size_t) N;
+        const size_t off_q = 0 * (size_t) n_embd_t * f;
+        const size_t off_k = 1 * (size_t) n_embd_t * f;
+        const size_t off_v = 2 * (size_t) n_embd_t * f;
+        if (B == 1) {
+            Qlin = ggml_view_2d(ctx, QKV, n_embd_t, N, row_stride, off_q);
+            Klin = ggml_view_2d(ctx, QKV, n_embd_t, N, row_stride, off_k);
+            Vlin = ggml_view_2d(ctx, QKV, n_embd_t, N, row_stride, off_v);
+        } else {
+            Qlin = ggml_view_3d(ctx, QKV, n_embd_t, N, B, row_stride, batch_stride, off_q);
+            Klin = ggml_view_3d(ctx, QKV, n_embd_t, N, B, row_stride, batch_stride, off_k);
+            Vlin = ggml_view_3d(ctx, QKV, n_embd_t, N, B, row_stride, batch_stride, off_v);
+        }
+    } else {
+        Qlin = ggml_mul_mat(ctx, l.wq, cur);
+        Klin = ggml_mul_mat(ctx, l.wk, cur);
+        Vlin = ggml_mul_mat(ctx, l.wv, cur);
+    }
 
     // Reshape to (HD, n_head, N) [B=1] or (HD, n_head, N, B) [B=2].
     // ggml_rope_ext requires ne[2] == len(pos_ids), so sequence stays on
     // ne[2] at the rope call; the optional batch dim sits at ne[3].
+    //
+    // Use ggml_view_3d/4d (not ggml_reshape) so the same code path
+    // works whether Q/K/V came from contiguous per-head mul_mats
+    // (un-stacked path) or from strided slices of the W_qkv mul_mat
+    // (Phase-15 stacked path). RoPE's metal kernel walks src via
+    // per-element nb01/nb02/nb03 strides so the strided N step is
+    // transparent.
     ggml_tensor * Q;
     ggml_tensor * K;
     ggml_tensor * V;
-    if (B == 1) {
-        Q = ggml_reshape_3d(ctx, Qlin, HD, NH,  N);
-        K = ggml_reshape_3d(ctx, Klin, HD, NKV, N);
-        V = ggml_reshape_3d(ctx, Vlin, HD, NKV, N);
-    } else {
-        Q = ggml_reshape_4d(ctx, Qlin, HD, NH,  N, B);
-        K = ggml_reshape_4d(ctx, Klin, HD, NKV, N, B);
-        V = ggml_reshape_4d(ctx, Vlin, HD, NKV, N, B);
+    {
+        const size_t f = sizeof(float);
+        if (B == 1) {
+            Q = ggml_view_3d(ctx, Qlin, HD, NH,  N, HD * f, Qlin->nb[1], 0);
+            K = ggml_view_3d(ctx, Klin, HD, NKV, N, HD * f, Klin->nb[1], 0);
+            V = ggml_view_3d(ctx, Vlin, HD, NKV, N, HD * f, Vlin->nb[1], 0);
+        } else {
+            Q = ggml_view_4d(ctx, Qlin, HD, NH,  N, B, HD * f, Qlin->nb[1], Qlin->nb[2], 0);
+            K = ggml_view_4d(ctx, Klin, HD, NKV, N, B, HD * f, Klin->nb[1], Klin->nb[2], 0);
+            V = ggml_view_4d(ctx, Vlin, HD, NKV, N, B, HD * f, Vlin->nb[1], Vlin->nb[2], 0);
+        }
     }
+    (void) used_stacked_qkv;
 
     // RoPE on Q and K (NEOX-style half-split convention used by Llama).
     // ggml_rope_ext broadcasts cleanly over an optional batch dim at ne[3].
@@ -330,20 +437,25 @@ ggml_tensor * build_llama_block(ggml_context * ctx, ggml_cgraph * gf,
 
     // MLP (SwiGLU) with pre-norm + residual.
     //
-    // Use ggml_swiglu_split (GGML_GLU_OP_SWIGLU on (gate, up)) so the
-    // separate `silu(gate)` + `gate * up` element-wise ops collapse into
-    // one fused Metal kernel (`kernel_swiglu_f32`).  Saves 30 dispatches
-    // per token (one per layer) on the per-step hot path.  Pre-norm
-    // pattern `mul(rms_norm(x), g)` is already auto-fused by
-    // ggml-metal's `can_fuse(RMS_NORM, MUL)` path
-    // (kernel_rms_norm_mul_f32) — leave it written as the obvious two
-    // ops here so CPU + non-Metal backends get the same shape.
+    // Phase 15 stacks `[W_gate ‖ W_up]` along the M dim so a single
+    // Q4_0 mat-mul produces (2 * n_ff, N, B); ggml_swiglu (the
+    // single-arg variant, GGML_GLU_OP_SWIGLU on the stacked tensor)
+    // splits the result internally and fuses
+    // `silu(first_half) * second_half` into one Metal kernel
+    // (kernel_swiglu_f32). Net effect per layer per step: 2 mat-muls
+    // + 1 swiglu instead of 2 mat-muls + 1 swiglu_split, **plus**
+    // one fewer mul_mat dispatch.
+    //
+    // Pre-norm `mul(rms_norm(x), g)` is already auto-fused upstream
+    // by ggml-metal's `can_fuse(RMS_NORM, MUL)` path
+    // (kernel_rms_norm_mul_f32) — leave it written as the obvious
+    // two ops so CPU + non-Metal backends get the same shape.
     ggml_tensor * inpFF = cur;
     ggml_tensor * norm2 = ggml_mul(ctx, ggml_rms_norm(ctx, cur, hp.eps), l.ln_mlp_g);
-    ggml_tensor * gate  = ggml_mul_mat(ctx, l.mlp_gate, norm2);
-    ggml_tensor * up    = ggml_mul_mat(ctx, l.mlp_up,   norm2);
-    ggml_tensor * mlp   = ggml_swiglu_split(ctx, gate, up);
-    ggml_tensor * down  = ggml_mul_mat(ctx, l.mlp_down, mlp);
+    ggml_tensor * gate = ggml_mul_mat(ctx, l.mlp_gate, norm2);
+    ggml_tensor * up   = ggml_mul_mat(ctx, l.mlp_up,   norm2);
+    ggml_tensor * mlp  = ggml_swiglu_split(ctx, gate, up);
+    ggml_tensor * down = ggml_mul_mat(ctx, l.mlp_down, mlp);
     return ggml_add(ctx, inpFF, down);
 }
 
@@ -1244,6 +1356,85 @@ bool load_model_gguf_mtl(const std::string & path,
         if (!model.buffer_kv) {
             throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
                                      "KV-cache buffer (backend out of memory?)");
+        }
+
+        // Phase 15: per-layer fused-matmul stacks for the Metal hot path.
+        //
+        //   wqkv      : (n_embd, 3 * n_embd)  rows  [Q ‖ K ‖ V]
+        //   w_gate_up : (n_embd, 2 * n_ff)    rows  [gate ‖ up]
+        //
+        // Each Llama block previously dispatched 3 separate Q4_0 mat-muls
+        // for Q/K/V plus 2 for gate/up; stacking them collapses those into
+        // 1 + 1 = 2 dispatches per block, saving (3-1) + (2-1) = 3 kernel
+        // launches per block per step inside the same compute_graph
+        // commit. On a 30-layer × 84-token T3 step pass that's ~7.5k
+        // fewer kernel launches per call. The combined mat-mul also
+        // gives the Metal mul_mm shader a wider M dimension, which is
+        // what its tiling expects (NR0 = 64).
+        //
+        // CPU backend keeps the original wq/wk/wv path because
+        // ggml-cpu's per-kernel overhead is already negligible and the
+        // extra weight memory footprint (~75 MB for the multilingual
+        // T3) trades unfavourably with thread-cache locality there.
+        if (!ggml_backend_is_cpu(model.backend)) {
+            const int n_embd = hp.n_embd;
+            const int n_ff   = hp.intermediate_size;
+
+            const size_t stack_meta = ggml_tensor_overhead() * (size_t) (2 * hp.n_layer + 4);
+            ggml_init_params sp = { stack_meta, nullptr, true };
+            model.ctx_stack = ggml_init(sp);
+            if (!model.ctx_stack) {
+                throw std::runtime_error("load_model_gguf_mtl: ggml_init failed for stacked-weights ctx");
+            }
+
+            // QKV stack: Q4_0 in the multilingual T3 GGUF (q.w / k.w / v.w
+            // all Q4_0 for every layer). gate/up CAN'T be stacked because
+            // the converter ships gate as F16 and up as Q4_0 — different
+            // element widths can't share a single ggml_tensor.
+            for (int i = 0; i < hp.n_layer; ++i) {
+                auto & l = model.layers_mtl[i];
+                if (l.wq->type != l.wk->type || l.wq->type != l.wv->type) {
+                    fprintf(stderr, "load_model_gguf_mtl: skipping QKV stack on layer %d "
+                                    "(mixed types Q=%s K=%s V=%s)\n",
+                            i, ggml_type_name(l.wq->type), ggml_type_name(l.wk->type),
+                            ggml_type_name(l.wv->type));
+                    l.wqkv = nullptr;
+                    continue;
+                }
+                l.wqkv = ggml_new_tensor_2d(model.ctx_stack, l.wq->type, n_embd, 3 * n_embd);
+            }
+            (void) n_ff;
+            model.buffer_stack = ggml_backend_alloc_ctx_tensors(model.ctx_stack, model.backend);
+            if (!model.buffer_stack) {
+                throw std::runtime_error("load_model_gguf_mtl: ggml_backend_alloc_ctx_tensors failed for "
+                                         "stacked-weights buffer (backend out of memory?)");
+            }
+            t3_stack_register(model.buffer_stack, model.ctx_stack);
+
+            // Copy Q/K/V rows into wqkv via host scratch. Q4_0 row
+            // layout is M-major (rows packed contiguously), so we just
+            // append wq's rows, then wk's, then wv's.
+            size_t scratch_bytes = 0;
+            for (int i = 0; i < hp.n_layer; ++i) {
+                auto & l = model.layers_mtl[i];
+                if (!l.wqkv) continue;
+                scratch_bytes = std::max(scratch_bytes, ggml_nbytes(l.wq));
+            }
+            std::vector<char> scratch(scratch_bytes);
+            for (int i = 0; i < hp.n_layer; ++i) {
+                auto & l = model.layers_mtl[i];
+                if (!l.wqkv) continue;
+                size_t off = 0;
+                auto copy_into = [&](ggml_tensor * src, ggml_tensor * dst) {
+                    const size_t nb = ggml_nbytes(src);
+                    ggml_backend_tensor_get(src, scratch.data(), 0, nb);
+                    ggml_backend_tensor_set(dst, scratch.data(), off, nb);
+                    off += nb;
+                };
+                copy_into(l.wq, l.wqkv);
+                copy_into(l.wk, l.wqkv);
+                copy_into(l.wv, l.wqkv);
+            }
         }
 
         {
