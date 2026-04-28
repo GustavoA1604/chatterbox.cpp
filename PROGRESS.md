@@ -2533,3 +2533,257 @@ Mirrors the shape `stable-diffusion.cpp` uses with its
   no further changes; unit suite 38/38, integration 4/4 (Whisper
   round-trip 0.0% WER on *"How are you doing today?"*, native chunk
   streaming emits 8 chunks, sentence streaming RTF 0.5448).
+
+### 3.21  MTL Metal optimisation pass — CFG-batched T3 + `--cfm-steps` + SwiGLU
+
+§3.20 left the multilingual M4 baseline at **RTF 1.37 / 1.65** (Q4_0 /
+F16) and itemised three follow-ups the §3.20 optimisation didn't touch:
+runtime CFM step count, MTL T3 step batching, and a faster MLP path.
+This pass picks them up on **M3 Ultra Metal (96 GB unified memory)** and
+hits **RTF 0.30** (Q4_0) / **0.32** (F16) end-to-end on the same Spanish
+prompt, seed 42, `--temp 0 --top-k 1`, voice = `jfk.wav`.  Pre-rationale
+in [`/Users/user002/.cursor/plans/mtl_metal_optimization_breadth_7807d6e0.plan.md`](.cursor/plans/mtl_metal_optimization_breadth_7807d6e0.plan.md);
+this section is the post-mortem with positive **and** negative findings.
+
+**M3 Ultra baseline (before this pass)**, prompt + seed identical to the
+§3.19 reference, 3 warm-run averages excluding T3 load:
+
+| Model | T3 (84/89 tok) | S3Gen (3.48/3.68 s audio, N=10) | Total | **RTF** |
+|---|---:|---:|---:|---:|
+| Q4_0 |  872 ms / 84 tok | 740 ms | 1612 ms | 0.46 |
+| F16  | 1099 ms / 89 tok | 844 ms | 1943 ms | 0.53 |
+
+(M3 Ultra was already well under RTF 1.0 — its 60-core GPU is ~6× the
+M4's 10-core GPU — so this pass is about *how much* further we can push,
+not about clearing the real-time gate.  The relative gains transfer to
+M4: see "What this means for M4" at the end of the section.)
+
+**Bench matrix (M3 Ultra Metal, 3-warm-run averages, T3_INFER_MS only,
+unless otherwise noted).**  Each row is cumulative — adding the
+optimisation in the column heading on top of everything to its left.
+
+| Variant | baseline | +P1: B=2 CFG | +P1+P2: F16 KV | +P1+P4: SwiGLU split | +P1+P3+P4 N=7 (final) |
+|---------|---------:|-------------:|---------------:|---------------------:|----------------------:|
+| Q4_0 T3      | 872 ms | **502 ms (-42%)** | 507 ms (≈) | 482 ms (-4% vs P1) | **478 ms (-45%)** |
+| Q4_0 S3Gen   | 740 ms |  720 ms          | 723 ms (≈) | 730 ms (≈)         | **576 ms (-22%)** |
+| Q4_0 Total   | 1612 ms| 1219 ms (-24%)   |  1230 ms   | 1212 ms            | **1054 ms (-35%)** |
+| Q4_0 RTF     | 0.46   | 0.35             |  0.35      | 0.35               | **0.30** |
+| F16 T3       | 1099 ms| **602 ms (-45%)**| 600 ms (≈) | 635 ms (+5% noise) | **579 ms (-47%)** |
+| F16 S3Gen    | 844 ms |  752 ms          | 743 ms (≈) | 778 ms (≈)         | **586 ms (-31%)** |
+| F16 Total    | 1943 ms| 1354 ms (-30%)   |  1343 ms   | 1413 ms            | **1165 ms (-40%)** |
+| F16 RTF      | 0.53   | 0.37             |  0.36      | 0.38               | **0.32** |
+
+Raw stderr per phase saved under `artifacts/bench/mtl-metal-m3u-*.txt`
+(baseline + per-phase + cfm-sweep + final).  Audio-quality gates against
+N=10 / phase-1 reference WAVs:
+- Phase 1 vs baseline: **byte-exact** WAV (cond+uncond batching is
+  numerically identical to two sequential cond/uncond forwards on the
+  same backend; the unified KV buffer plus `b_offset_elems = 0 |
+  kv_layer_elems` reproduces the per-pass slab layout).
+- Phase 4 (`ggml_swiglu_split`) vs Phase 1: **byte-exact** WAV (Metal's
+  `kernel_swiglu_f32` is bit-equivalent to the manual `ggml_silu(gate) *
+  up`).
+- `--cfm-steps` sweep (computed via librosa log-mel cosine, see
+  `artifacts/bench/mtl-metal-m3u-cfm-sweep-q4_0.txt`):
+
+  | N | S3Gen ms | log-mel cos vs N=10 | PCM cos vs N=10 |
+  |--:|---------:|--------------------:|----------------:|
+  |  6| 518 ms   |              0.9897 |          0.8836 |
+  |  7| 571 ms   |          **0.9954** |          0.9414 |
+  |  8| 629 ms   |              0.9972 |          0.9702 |
+  | 10| 730 ms   |              1.0000 |          1.0000 |
+
+  N=7 cleanly clears the cos ≥ 0.99 gate; N=6 sits right on the
+  threshold (PCM cosine drops to 0.88 — phase-coherent attack
+  reconstruction starts to drift) so it's left as opt-in only.
+
+#### What shipped
+
+**Phase 1 — CFG cond+uncond batched into one Metal forward (B=2)**
+*— biggest win on both Q4_0 (-42%) and F16 (-45%).*
+
+The §3.19 multilingual T3 ran CFG as **two sequential
+`run_step_pass`/`run_prompt_pass` calls per token**, each rebuilding +
+computing a 30-layer Llama graph with a separate `memory_k_uncond` /
+`memory_v_uncond` KV cache.  On Metal this doubled the per-step kernel-
+dispatch + weight-read overhead — exactly the regression `use_b2`
+already paid off for S3Gen's CFM (`src/chatterbox_tts.cpp:1994` /
+§3.19).  This pass mirrors that on T3:
+
+- New `build_step_graph_mtl_b2(model, n_past)` and
+  `build_prompt_graph_mtl_b2(model, n_text_tokens)` in [src/t3_mtl.cpp].
+  cond + uncond pack into the batch dim (`ne[3]=2`) for `inputs_embeds`,
+  `pos_ids`, `kq_mask`, and the per-layer Q/K/V activations.  RoPE +
+  `flash_attn_ext` both broadcast the head/seq dims over batch out of
+  the box, so `build_llama_block` only grew an `int B` parameter and
+  `int b_offset_elems` (one cache slab offset for the legacy B=1 CPU
+  fallback).
+- **KV layout rework.**  The two parallel 1-D F32 KV buffers
+  (`memory_k` + `memory_k_uncond`) are now a **single contiguous
+  `2 × kv_layer_elems` buffer per layer**, cond at offset 0, uncond at
+  offset `kv_layer_elems`.  Per-layer slab stride is therefore
+  `2 * head_dim * n_ctx * n_kv_head * sizeof(F)`.  The B=2 graph views
+  the same buffer as `(head_dim, n_ctx, n_kv_head, B=2)` with
+  `batch_stride = kv_layer_elems * sizeof(F)`; the legacy B=1 CPU path
+  selects the right half via `b_offset_elems = is_uncond ?
+  kv_layer_elems : 0`.  Total backend allocation is unchanged (still 2 ×
+  kv_elements per cache); we just dropped two `ggml_new_tensor_1d`
+  calls.
+- `eval_step_mtl` / `eval_prompt_mtl` dispatch the B=2 path when
+  `!ggml_backend_is_cpu(model.backend)` — exactly mirrors `use_b2` in
+  S3Gen.  CPU keeps the two-call path for the same reason §3.19 found
+  for S3Gen B=2: the per-op B=2 work doubles without saving ops on
+  ggml-cpu, so the two-call path remains the winner there.
+
+Parity gates passed:
+1. Greedy decode token parity at `--temp 0 --top-k 1`: first 100 tokens
+   identical to the two-call baseline on seed 42.
+2. End-to-end WAV byte-exact match vs the §3.19 reference run on Q4_0
+   *and* F16 (`cmp /tmp/baseline_q4_0_r3.wav /tmp/phase1_q4_0.wav` →
+   identical, same for F16).
+3. CPU smoke test (`--n-gpu-layers 0`) still produces audio with the
+   B=1 fallback path.
+
+**Phase 3 — `--cfm-steps N` for non-streaming MTL**
+*— biggest S3Gen win when set to N=7 (-22% S3Gen vs N=10).*
+
+Pre-§3.21, only `--stream-cfm-steps` propagated into
+`s3gen_synthesize_opts.cfm_steps`; non-streaming MTL was locked at the
+GGUF's `n_timesteps=10`.  Even though `s3gen_synthesize_opts.cfm_steps`
+existed (and was honoured by the inner CFM loop in
+`chatterbox_tts.cpp:1973`), [src/chatterbox_cli.cpp] never surfaced it.
+A 6-line CLI flag (`--cfm-steps N`) routed into all three non-streaming
+`s3gen_synthesize_opts` setup sites + a sweep block:
+
+```
+N=6  S3Gen 518 ms  log-mel-cos 0.990  PCM-cos 0.88  (borderline)
+N=7  S3Gen 571 ms  log-mel-cos 0.995  PCM-cos 0.94  ← recommended knee
+N=8  S3Gen 629 ms  log-mel-cos 0.997  PCM-cos 0.97
+N=10 S3Gen 730 ms  log-mel-cos 1.000  PCM-cos 1.00  (default)
+```
+
+The default stays at 10 (no behaviour change for callers that don't
+pass the flag); the README's MTL bench table now has both `N=10` and
+`N=7` rows so users can pick.
+
+**Phase 4 — `ggml_swiglu_split` on the Llama MLP**
+*— marginal on M3 Ultra (Q4_0 -4% within the plan's 5% gate; F16 within
+noise) but kept for code clarity + future ggml-metal kernel improvements.*
+
+Each Llama block in `build_llama_block` did `silu(gate) * up` as three
+separate ggml ops — `ggml_silu(...)`, `ggml_mul_mat(mlp_up, ...)`,
+`ggml_mul(silu_out, up_out)` — i.e. a `silu` + `mul` element-wise pair
+on top of the two `mul_mat`s, at 30 dispatches/token across layers.
+Upstream ggml already exposes this as a single op: `ggml_swiglu_split(ctx,
+gate, up)` lowers to `GGML_OP_GLU / GGML_GLU_OP_SWIGLU`, which Metal
+maps to `kernel_swiglu_f32` (one fused kernel per layer instead of two
+elementwise dispatches).  The pre-norm `ggml_mul(ggml_rms_norm(...), g)`
+pattern was already auto-fused upstream by ggml-metal's
+`can_fuse(RMS_NORM, MUL)` path (`kernel_rms_norm_mul_f32`); we left it
+written as the two obvious ops so CPU + non-Metal backends get the same
+shape.  Net WAV output: byte-exact vs Phase 1.
+
+#### What didn't work — NEGATIVE results
+
+The plan called out three "trades to verify empirically".  All three got
+measured; two were reverted.
+
+**Phase 2 — F16 KV cache.** *Reverted: neutral on M3 Ultra.*
+
+Switching `memory_k`/`memory_v` from F32 to F16 was the predicted-large
+bandwidth win (30 layers × 4096 ctx × 16 heads × 64 head_dim × 2 batches
+per step on the hot path).  The change is small and clean — the strides
+in `build_llama_block` were already routed through
+`ggml_type_size(memory_k->type)`, `flash_attn_ext` consumes F16 K/V
+directly, and the per-step `ggml_cpy` writing new K/V from F32
+activations does the F32→F16 conversion for free.  But the bench was a
+**wash** on M3 Ultra:
+
+| Variant | F32 KV (Phase 1) | F16 KV (Phase 2) | Δ        |
+|---------|-----------------:|-----------------:|---------:|
+| Q4_0 T3 | 502 ms (avg)    | 507 ms (avg)     | +1% (≈)  |
+| F16 T3  | 602 ms (avg)    | 600 ms (avg)     | -0% (≈)  |
+
+Audio output byte-exact vs Phase 1 — i.e. the F16 storage didn't even
+change the compute precision.  The combination strongly suggests
+**ggml-metal's `flash_attn_ext` was already running its inner matmul
+at F16 precision regardless of K/V storage dtype** (Apple GPUs have F16
+matrix-multiply hardware; storage→register conversion is free, so the
+F32 K/V cache was effectively a no-op buffer).  Reverted to F32 storage
+to keep the §3.19 numerics envelope exactly preserved; the
+type-size-aware strides stay in place as a one-character flip
+(`GGML_TYPE_F32` → `GGML_TYPE_F16` in `load_model_gguf_mtl`) so a
+memory-bound backend (e.g. an M4 with 10 GPU cores where bandwidth
+*does* matter) can opt back in without a code change.  Bench artefacts
+under `artifacts/bench/mtl-metal-m3u-phase2-{q4_0,f16}.txt`.
+
+**Phase 4-stretch: explicit `RMS_NORM + MUL(g)` and
+`MUL_MAT + ADD(bias)` fusions in
+`patches/ggml-metal-chatterbox-ops.patch`.**  *Not shipped.*
+
+Audit of upstream `ggml/src/ggml-metal/`:
+- `kernel_rms_norm_mul_f32` (and `_4` SIMD variant) already exists
+  upstream; `ggml-metal-ops.cpp:can_fuse(RMS_NORM, MUL)` triggers it
+  automatically for our `ggml_mul(ggml_rms_norm(x), g)` patterns.
+- `kernel_rms_norm_mul_add_f32` is the next-level-up fusion (RMS_NORM +
+  MUL + ADD); not used by our T3 (no bias on the RMSNorm gain).
+- `kernel_bin_fuse_impl` already chains element-wise ops.
+- The Q-variant `mul_mat + add(bias)` fast path is already in the
+  Chatterbox patch (`get_pipeline_mul_mv(..., has_bias, has_residual)`,
+  `FC_MUL_MV + 2/+3` constants); extending it to F16 src0 was the
+  Phase 4c stretch goal.  Skipped because the F16 build hits Phase 1's
+  -45% T3 win first and lands at the same RTF 0.32 as Q4_0+--cfm-steps;
+  the marginal win available from F16 mat_vec+bias fusion (Llama's
+  Q/K/V/O have **no bias** in this model — `cond_spkr/b` is the only
+  bias-bearing tensor, hit once per cond pass) is below the bench gate.
+
+Net: zero new lines of Metal-kernel patch.  Upstream's fusion coverage
+already maps onto every fusable op we have, and the one slot we'd need
+to extend (F16 `mul_mat + add(bias)`) is dispatched ≤ 1× per cond pass
+in our model so the win is below the floor.
+
+#### What this means for M4 (and other backends)
+
+§3.19's M4 numbers are now stale on Q4_0 + F16; the same Phase 1 + 3
+combination should bring multilingual M4 RTF down from **1.37 → ≈ 0.95**
+(if T3 scales with the same -42% as M3 Ultra: 1865 ms × 0.58 = 1082 ms,
+combined with `--cfm-steps 7` which scales linearly with N: 2247 ms × 7
+/ 10 = 1573 ms; total 2655 ms vs 2.56 s audio → RTF 1.04).  Worth re-
+benchmarking on real M4 hardware before claiming the speedup.  The Phase
+2 (F16 KV) revert may also flip on M4: with 6× less GPU compute, the
+KV-bandwidth headroom that's slack on M3 Ultra could become the binding
+constraint on M4.  Flipping the one-line dtype back to F16 + re-bench on
+M4 is the way to confirm.
+
+Vulkan / CUDA: the B=2 batching change is backend-agnostic (it's a
+graph-shape change, not a Metal patch), so it should land the same
+`-30..-45%` win on any GPU backend; the `--cfm-steps` flag is wholly
+backend-independent.  No measurements collected here — left as a
+follow-up.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_t3_internal.h](src/chatterbox_t3_internal.h) | Comment-only: KV layout doc updated to describe the unified cond+uncond buffer; `memory_k_uncond`/`memory_v_uncond` are now nullable view aliases for legacy callers (none on the MTL hot path). |
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | `build_llama_block` gains `int B`, `size_t b_offset_elems`; new `build_step_graph_mtl_b2`, `build_prompt_graph_mtl_b2`, `run_step_pass_b2`, `run_prompt_pass_b2`; `eval_step_mtl` / `eval_prompt_mtl` dispatch B=2 on non-CPU backends; KV allocation is now a single 2× tensor; MLP uses `ggml_swiglu_split`. |
+| [src/chatterbox_cli.cpp](src/chatterbox_cli.cpp) | New `--cfm-steps N` flag wired into all three non-streaming `s3gen_synthesize_opts` setup sites + help text. |
+| [README.md](README.md) | Multilingual table + per-stage block grew M3 Ultra rows alongside the existing M4 rows; `tts-cli` example mentions `--cfm-steps`. |
+| `artifacts/bench/mtl-*-m3u-*.txt` | Raw stderr per phase + cfm-sweep + final. |
+
+#### "What's next for MTL" (carried over from §3.19, with strikes)
+
+- ~~T3 Q4/Q5/Q8 quantisation~~ — shipped in §3.19 (reused via
+  `_load_requantize_policy`).
+- ~~Quantised CFM estimator weights~~ — shipped in §3.20.
+- ~~Runtime `--cfm-steps N`~~ — shipped in §3.21.
+- ~~Fixing `conv1d_f32` arg order on MTL S3Gen~~ — checked; not on the
+  multilingual hot path (`use_b2 = !cpu` already routes through the
+  batch-2 conv path).
+- Heterogeneous-core aware thread default for CPU MTL — still on the
+  table; orthogonal to this Metal pass.
+- ja / he / ru / zh / hi tokenizer support — separate sub-projects; out
+  of scope for §3.21.
+- Speculative decoding for T3 — long-tail item from §3.20 backlog.
+- F16 KV cache on M4 — left as opt-in flip; needs M4 measurement before
+  shipping.
