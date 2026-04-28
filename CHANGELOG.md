@@ -13,39 +13,126 @@ this file is the brief surface that ships with the repo.
 
 ---
 
-## [Unreleased] — round-5: drop a wasted `ggml_cont` in `zero_pad_dim0`
+## [Unreleased]
 
-**Status:** uncommitted (working tree only) at `src/chatterbox_tts.cpp`.
+**Status:** uncommitted (working tree only) at `src/chatterbox_tts.cpp`
++ `CHANGELOG.md`.  Three round-N changes stacked here: round-5 (small
+zero_pad cleanup), round-6 (encoder-side QKV fusion analog of round-4),
+and round-7-experiment (V1 eager-compile **negative result, reverted —
+no source-tree change shipped**).  Both 5+6 bit-exact-preserving and
+perf-neutral on RTX 5090 (within noise), both ship-on-merit as
+code-quality / mobile-target improvements.
 
-### Performance / cleanup
+### Round-7 experiments — both negative results (no source-tree change shipped)
+
+#### Round-7-A4: multi-step CFM single-graph fusion
+
+- Tested `OPTIMIZATION_ROADMAP.md` Tier A4: a new
+  `cfm_estimator_run_all_steps` function that fuses all CFM steps into a
+  single `ggml_backend_graph_compute` call to save N→1 GPU syncs.
+- **Bit-exact preserved** across all 3 round-1/2/3 invariants in BOTH
+  default-on and opt-out paths.  Math correctness was fine.
+- **But +47 ms cfm_total / +29 ms S3GEN_INFER on RTX 5090** (5-run avg
+  for single-shot CLI; +62 ms cfm_total on 45-chunk multi-synth).
+  GPU compute identical at ~40 ms either way, regression is entirely in
+  CPU-side graph plumbing — `ggml_gallocr_alloc_graph` + Vulkan command
+  buffer recording for one 6000-node graph cost more per-call than two
+  3000-node graphs cost combined.
+- **Reverted.**  Source tree returned to round-6 + round-5/6 working
+  tree.  Full investigation in
+  [`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND7_A4.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND7_A4.md).
+- The "save N-1 syncs" intuition is wrong on Vulkan + RTX 5090: each
+  saved sync trades for super-linear CPU command-buffer overhead.
+
+#### Round-7-V1: eager pipeline compile in `ggml-vulkan`
+
+- Tested `OPTIMIZATION_ROADMAP.md` Tier V1: gate the existing async-compile
+  machinery with a `GGML_VK_EAGER_COMPILE=1` env var that pre-marks every
+  pipeline as `needed` so the first `ggml_vk_load_shaders` call from
+  `ggml_vk_get_device` fans them out across CPU threads via the existing
+  `std::async` pool.
+- **Measured 7.3× SLOWER cold-start** on RTX 5090 + NVIDIA 590.48
+  (3.56 s → 25.96 s WALL, T3_LOAD 240 ms → 24538 ms).  Reason:
+  **NVIDIA's Vulkan driver serialises pipeline compilation internally**
+  — measured per-pipeline cost was ~24.5 ms regardless of how many
+  `std::async` threads were active.  16-core machine, 1000 pipelines:
+  theoretical parallel wall = 1.5 s; measured wall = 24.5 s.  Effective
+  parallelism on this driver: **~6 %, not the projected ~100 %**.
+- Compounded by eager mode compiling ~1000 pipelines vs lazy mode's ~60
+  (chatterbox uses ~17× fewer pipelines than ggml-vulkan can produce).
+- The `// TODO: We're no longer benefitting from the async compiles ...`
+  comment in `ggml-vulkan.cpp:3473` is now confirmed **structural and
+  not fixable from the application or upstream ggml-vulkan**.  The
+  bottleneck is inside the driver.
+- Bit-exact preserved both with and without the flag.
+- **Reverted.** No file in the source tree carries the experiment.
+- Full investigation in
+  [`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND7.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND7.md).
+- `OPTIMIZATION_ROADMAP.md` Tier V1+V2 should be downgraded from
+  "recommended round 7" to "investigated, doesn't help on NVIDIA".
+
+### Round-6 — encoder `conformer_block` Q/K/V matmul fusion
+
+- `conformer_block` previously issued 3 separate `ggml_mul_mat` calls
+  for Q / K / V on the same `xn` input — directly analogous to the
+  CFM `basic_tfm` pattern that round-4 fused.  10 conformer blocks
+  per encoder (6 lower at T=326 + 4 upper at T=652) → **30 mul_mat
+  dispatches saved per encoder run** with the fusion enabled.
+- Same fusion technique as round-4 (concat W along dim=2 + repeat
+  input via `ggml_repeat_4d` to match `ggml_can_mul_mat`'s broadcast
+  asymmetry constraint), with one twist: `conformer_block` Q / K / V
+  each have a per-projection bias (unlike `basic_tfm`), so the bias
+  adds stay outside the fused matmul as 3 separate
+  `ggml_add(view, bias)` ops on the post-split contiguous Q / K / V
+  views.  Bias broadcast over T is bit-identical to the original
+  `add(mul_mat, bias)`.
+- Reuses the existing `CHATTERBOX_FUSE_QKV=0` opt-out env var from
+  round-4; setting it disables BOTH CFM and encoder fusion.
+- **Measured −0.03 ms encoder / +0.15 ms S3GEN_INFER** (n=6
+  alternating pairs, both within noise floor; 3/6 encoder wins,
+  2/6 S3GEN wins).  Encoder runs once per synthesize so the
+  saved-dispatch budget is small (~30 dispatches × ~5 µs ≈ 150 µs)
+  vs CFM (round-4) which fires on 56 transformers × 2 steps = 112
+  fusions per inference.
+- Ships on its merits: bit-exact, code-consistency with round-4
+  (both transformer types in chatterbox now share the same fusion
+  pattern + opt-out flag), and the same mobile / CPU beneficiaries
+  as the previous "perf-neutral on RTX 5090" rounds (3, 5).
+
+### Round-5 — drop wasted `ggml_cont` in `zero_pad_dim0`
 
 - `zero_pad_dim0()` previously wrapped the slice view in `ggml_cont`
-  before passing to `ggml_scale(_, 0.0f)`.  That's wasted work — `cont`
-  reads the source data into a fresh contiguous buffer and `scale`
-  immediately overwrites it with zeros.  Vulkan's `ggml_scale`
-  implementation handles strided sources via `nb[]` indexing, so we
-  drop the `cont` and let `scale` read+zero in one pass.
-- Removes ~30 `CONT` dispatches per CFM step on chatterbox-multilingual
-  (one per padded `cfm_causal_block` / `cfm_causal_k3` / `zero_pad_dim0`
-  call site).  Measured wall-clock delta on RTX 5090 / NVIDIA 590.48
-  is **+0.10 ms (within the run-to-run noise floor, 2/6 pairwise wins)** —
-  the optimization removes wasted GPU work but the per-cont cost
-  was already trivial at these tensor sizes on this hardware.
-- Real beneficiaries are the same cohort as round-2/3: bandwidth-starved
-  Adreno / Mali / RADV / CPU-backend targets where the spurious read
-  costs more than a per-stride increment in the scale shader.
+  before passing to `ggml_scale(_, 0.0f)`.  That's wasted work —
+  `cont` reads the source data into a fresh contiguous buffer and
+  `scale` immediately overwrites it with zeros.  Vulkan's
+  `ggml_scale` implementation handles strided sources via `nb[]`
+  indexing, so we drop the `cont` and let `scale` read+zero in one
+  pass.
+- Removes ~30 `CONT` dispatches per CFM step on
+  chatterbox-multilingual (one per padded `cfm_causal_block` /
+  `cfm_causal_k3` / `zero_pad_dim0` call site).  Measured wall-clock
+  delta on RTX 5090 / NVIDIA 590.48 is **+0.10 ms (within the
+  run-to-run noise floor, 2/6 pairwise wins)** — the optimization
+  removes wasted GPU work but the per-cont cost was already trivial
+  at these tensor sizes on this hardware.
+- Real beneficiaries are the same cohort as rounds 2/3: bandwidth-
+  starved Adreno / Mali / RADV / CPU-backend targets where the
+  spurious read costs more than a per-stride increment in the scale
+  shader.
 
-### Correctness
+### Correctness (both rounds)
 
-- Bit-exact preserved across all three locked invariants:
+- Bit-exact preserved across all three locked invariants in both
+  default-on and `CHATTERBOX_FUSE_QKV=0` opt-out paths:
   - Single-shot WAV `454b4cc14538e8ef917930b110d1e504`
   - Multi-synth identical-chunks PCM `4c83f367e6ca2b02fefbd480519ea3f6`
   - Multi-synth varied-length PCM `9252253ee532cb7928639a0f644a25da`
 
 ### Files changed
 
-- `src/chatterbox_tts.cpp` — single function, ~6 line diff inside
-  `zero_pad_dim0`.
+- `src/chatterbox_tts.cpp` (+40 / −3 cumulative for rounds 5+6) —
+  one function each (`zero_pad_dim0` and `conformer_block`).
+- `CHANGELOG.md` — new file, this round and back-fills rounds 1–4.
 
 ---
 

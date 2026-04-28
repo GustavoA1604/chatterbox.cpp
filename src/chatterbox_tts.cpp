@@ -500,9 +500,46 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     ggml_tensor * xn = ggml_norm(ctx, x, eps);
     xn = ggml_add(ctx, ggml_mul(ctx, xn, w.norm_mha_w), w.norm_mha_b);
 
-    ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, xn), w.q_b);
-    ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, xn), w.k_b);
-    ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, xn), w.v_b);
+    // QVAC-17872 round-6: encoder-side analog of the round-4 CFM
+    // basic_tfm fusion.  conformer_block also issues 3 separate
+    // ggml_mul_mat for Q / K / V on the same `xn` input — but unlike
+    // basic_tfm it adds a bias to each output, so we keep the three
+    // adds outside the fused path.  10 conformer blocks per encoder
+    // (6 lower at T=326 + 4 upper at T=652) → 30 mul_mat dispatches
+    // saved per encoder run with the fusion enabled.
+    //
+    // The same env-var (CHATTERBOX_FUSE_QKV) gates both round-4 (CFM
+    // basic_tfm) and this round-6 (encoder conformer_block) fusion;
+    // setting it to 0 reverts both to the round-3 baseline.
+    static const bool fuse_qkv = []() {
+        const char * e = getenv("CHATTERBOX_FUSE_QKV");
+        if (!e) return true;
+        const std::string s = e;
+        return !(s == "0" || s == "false" || s == "FALSE" || s.empty());
+    }();
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (fuse_qkv) {
+        const int INNER = (int) w.q_w->ne[1];
+        ggml_tensor * w_q3  = ggml_reshape_3d(ctx, w.q_w, w.q_w->ne[0], w.q_w->ne[1], 1);
+        ggml_tensor * w_k3  = ggml_reshape_3d(ctx, w.k_w, w.k_w->ne[0], w.k_w->ne[1], 1);
+        ggml_tensor * w_v3  = ggml_reshape_3d(ctx, w.v_w, w.v_w->ne[0], w.v_w->ne[1], 1);
+        ggml_tensor * w_qk  = ggml_concat(ctx, w_q3, w_k3, /*dim=*/2);
+        ggml_tensor * w_qkv = ggml_concat(ctx, w_qk, w_v3, /*dim=*/2);  // ne=(D, INNER, 3)
+        ggml_tensor * xn_b3 = ggml_repeat_4d(ctx, xn, xn->ne[0], xn->ne[1], 3, 1);
+        ggml_tensor * qkv   = ggml_mul_mat(ctx, w_qkv, xn_b3);          // ne=(INNER, T, 3)
+        const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+        // Each Q/K/V is a contiguous view; the post-split bias add is
+        // bit-exact equivalent to the original `add(mul_mat, bias)`.
+        q = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 0),                  w.q_b);
+        k = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), batch_stride),      w.k_b);
+        v = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 2 * batch_stride),  w.v_b);
+    } else {
+        q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, xn), w.q_b);
+        k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, xn), w.k_b);
+        v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, xn), w.v_b);
+    }
     ggml_tensor * p = ggml_mul_mat(ctx, w.pos_w, pos_emb);
 
     q = ggml_reshape_3d(ctx, q, HD, H, T);
