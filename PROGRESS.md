@@ -2787,3 +2787,88 @@ follow-up.
 - Speculative decoding for T3 — long-tail item from §3.20 backlog.
 - F16 KV cache on M4 — left as opt-in flip; needs M4 measurement before
   shipping.
+
+### 3.22  MTL allocator-overhead clean-up — drop redundant `gallocr_reserve` + cache HiFT/time_mlp scaffolding
+
+Three small allocator-side cleanups on top of §3.21.  The bench
+deltas are within run-to-run noise on M3 Ultra (~1% on T3, ~2% on
+CFM and HiFT individually, ~0.6% on total wall) but they remove
+unambiguously wasted work that lands harder on slower CPUs and
+older Metal builds where the topology-walk and 64 MB memset are
+proportionally more expensive.  All three pass the byte-exact WAV
+gate against §3.21 HEAD (md5 `79002f09bc48dda95ec0c2cfc2b895bd`).
+
+Three changes, listed in order of attack-surface:
+
+1. **Drop `ggml_gallocr_reserve` before `ggml_gallocr_alloc_graph`.**
+   `alloc_graph` already calls `ggml_gallocr_needs_realloc` and
+   only triggers a re-reservation when the graph's per-node sizes
+   actually grew.  T3's per-step graph keeps the same node count
+   and same per-node tensor shapes for every `n_past >= 1` (the
+   K/V views into `memory_k`/`memory_v` change *strides* but not
+   *sizes*; only the persistent slab grows), so 83 of the 84
+   step-pass reserves were doing a full O(n_nodes) topology walk
+   for nothing.  Affects all four `run_*_pass[_b2]` paths in
+   `t3_mtl.cpp`.
+
+2. **`run_hift_decode` 64 MB scratch buffer → `thread_local`.**
+   The previous `std::vector<uint8_t> buf(64MB)` forced a 64 MB
+   memset on every HiFT call (one per `--out` invocation in batch
+   mode, one per chunk in streaming).  `ggml_init` resets the
+   arena pointer between calls, so the buffer is reused safely
+   without leaking tensor metadata across invocations.
+
+3. **`compute_time_mlp` graph + gallocr → `thread_local time_mlp_cache`.**
+   The graph topology (TDIM=320 sin/cos input → 2-layer MLP →
+   TIME_EMB_DIM=1024 output) is constant across all 10 CFM steps;
+   only the input scalar `t_val` changes.  The cache key is
+   `(backend)` so a backend swap rebuilds.  Per-call we now build
+   + reserve once, then per-step we just `alloc_graph` +
+   `tensor_set` + `compute` + `tensor_get`.  Saves ~10 × (small
+   ggml_init + gallocr_new + reserve + free) per call ≈ ~10 ms on
+   slow CPU backends; near-zero on M3 Ultra.
+
+#### Bench (M3 Ultra, Q4_0, ES prompt, seed 42, `--temp 0 --top-k 1`, jfk.wav voice, 3 invocations averaged)
+
+| Stage      | §3.21 base | §3.22 (this) | Δ      |
+|------------|-----------:|-------------:|-------:|
+| T3 ms      |       479  |         470  |  -1.9% |
+| cfm_total  |       561  |         550  |  -2.0% |
+| hift_decode|       128  |         125  |  -2.3% |
+| S3Gen ms   |       730  |         722  |  -1.1% |
+| Total ms   |      1209  |        1192  |  -1.4% |
+
+WAV byte-exact gate: md5 `79002f09bc48dda95ec0c2cfc2b895bd` matches
+across both branches at all three invocations.  Within-noise on M3
+Ultra but unambiguous direction across runs.
+
+#### Why §3.22 didn't go further on M3 Ultra
+
+The per-CFM-step empirical breakdown (from `--verbose`) is:
+`step 0 = 73 ms`, `step 1..9 ≈ 53 ms each`.  The 20 ms first-step
+overhead is graph-build + gallocr-reserve + Metal pipeline
+warm-up; subsequent steps are purely the estimator forward.  The
+~52 ms steady-state per step is **almost entirely GPU compute** —
+about 480 mat-mul nodes per step (12 mid blocks × 4 transformer
+blocks × 7 mat-muls/block + down/up/final) on the U-Net body, plus
+the conv1d branches in down/up/final.  Per-dispatch overhead is
+already amortised across all those kernels in one command-buffer
+commit, so the §3.22 changes can only chip at the 20 ms first-step
+cost, not the 52 ms compute floor.
+
+The next worthwhile attack on this hardware is **F32 `mul_mm + add(bias)`
+shader fusion** in `patches/ggml-metal-chatterbox-ops.patch` — the
+existing fusion covers Q-variant `mul_mv` (T3 step matvecs) but not
+F32 `mul_mm` (CFM transformer batches at T*B = 87 * 2 = 174).
+Estimate: ~280 fuse opportunities per CFM step × 10 steps =
+~2800/call.  Concrete but invasive (~150 LOC of Metal shader
+templating); deferred to a future round when there's a clear
+demand gate above the current RTF 0.30 / 0.32 multilingual numbers.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [src/t3_mtl.cpp](src/t3_mtl.cpp) | Drop `ggml_gallocr_reserve` from `run_step_pass`, `run_prompt_pass`, `run_step_pass_b2`, `run_prompt_pass_b2`; `alloc_graph` covers the lazy-reserve case. |
+| [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | `run_hift_decode` scratch buf → `thread_local`; new `time_mlp_cache` keyed on backend, hoisting per-step build/reserve. |
+
