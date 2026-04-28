@@ -391,6 +391,17 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
 // front/back zero padding on dim 0 via concat(scale(view, 0), x) /
 // concat(x, scale(view, 0)).  The scale(..., 0) trick produces a defined
 // zero tensor (as opposed to allocating an uninitialised one and hoping).
+//
+// QVAC-17872 round-5 (post-round-4): the original code did
+// ggml_scale(ggml_cont(view), 0.0f) — but that's wasted work: cont reads
+// data into a fresh buffer and scale immediately overwrites with zeros.
+// On Vulkan, ggml_scale's compute_forward handles strided sources via
+// nb[] indexing, so we can drop the cont and let scale read+zero in one
+// pass.  Verified bit-exact against the round-1/2/3 invariants and the
+// concat consumer is happy with the contiguous output ggml_scale
+// produces (scale always materialises a fresh contiguous tensor; only
+// the SOURCE may be strided).  Saves one CONT dispatch per zero_pad
+// call — about 30 calls per CFM step on chatterbox-multilingual.
 static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
     ggml_tensor * y = x;
@@ -398,7 +409,7 @@ static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_fr
         GGML_ASSERT(p_front <= (int)x->ne[0]);
         ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
                                            x->nb[1], x->nb[2], x->nb[3], 0);
-        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
+        ggml_tensor * z = ggml_scale(ctx, head, 0.0f);
         y = ggml_concat(ctx, z, y, 0);
     }
     if (p_back > 0) {
@@ -406,7 +417,7 @@ static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_fr
         ggml_tensor * tail = ggml_view_4d(ctx, x, p_back, x->ne[1], x->ne[2], x->ne[3],
                                            x->nb[1], x->nb[2], x->nb[3],
                                            (size_t)(x->ne[0] - p_back) * x->nb[0]);
-        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
+        ggml_tensor * z = ggml_scale(ctx, tail, 0.0f);
         y = ggml_concat(ctx, y, z, 0);
     }
     return y;
