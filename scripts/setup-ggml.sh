@@ -23,6 +23,7 @@ PATCHES=(
     "ggml-metal-chatterbox-ops.patch"
     "ggml-opencl-chatterbox-ops.patch"
     "ggml-vulkan-pipeline-cache.patch"
+    "ggml-vulkan-eager-cache-save.patch"
 )
 
 echo "chatterbox.cpp: setting up ggml at pinned commit ${GGML_COMMIT}"

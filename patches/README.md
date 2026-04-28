@@ -19,6 +19,11 @@ Three patches ship today:
    shader compile (seconds on fresh machines / containers / driver
    upgrades) drops to tens of ms.  Active whenever `-DGGML_VULKAN=ON`
    is in the build.
+3. [`ggml-vulkan-eager-cache-save.patch`](#ggml-vulkan-eager-cache-savepatch)
+   *(QVAC-17872 round-2)* — extends patch 2 with size-tracked eager
+   flushes from `ggml_vk_load_shaders`, so a process crash mid-cold-
+   compile no longer discards the lazy-compile work.  Stacks on top of
+   patch 2 (depends on the `pipeline_cache` field it adds).
 
 `scripts/setup-ggml.sh` applies all three in order; the patches stack
 cleanly on the same pinned upstream commit.
@@ -220,10 +225,9 @@ always write the superset.
 
 ### Caveats / follow-ups
 
-* No opportunistic flush during long-running processes.  Shipping a
-  second dispatcher that snapshots the cache every N minutes would
-  make server-mode deployments resilient to crashes, but it's not
-  needed for the CLI use cases today.
+* ~~No opportunistic flush during long-running processes.~~ Addressed
+  in [`ggml-vulkan-eager-cache-save.patch`](#ggml-vulkan-eager-cache-savepatch)
+  (QVAC-17872 round-2).
 * We key the filename on `vendorID / deviceID / driverVersion`.  Two
   GPUs of the same model with different driver versions would reuse
   the same filename only when the driver matches, which is the
@@ -231,3 +235,75 @@ always write the superset.
 * No attempt to cap the on-disk size.  NVIDIA blobs land at ~1 MB for
   Turbo, ~2 MB for Turbo + MTL shared pipelines.  If this ever becomes
   a concern on mobile, wrap the write with a size check.
+
+## `ggml-vulkan-eager-cache-save.patch`
+
+Base commit: same `58c3805` (stacks on top of `ggml-vulkan-pipeline-cache.patch`).
+
+Closes the crash-safety gap left open by patch 2: it persists the
+on-disk pipeline cache **at the end of every `ggml_vk_load_shaders`
+invocation that grew the cache**, instead of only at backend-free time
+in `ggml_vk_cleanup`.
+
+### Why
+
+`ggml_vk_load_shaders` is the single sync point for both eager
+(initial) and lazy (`ggml_pipeline_request_descriptor_sets`) compile
+batches.  In chatterbox today **every** pipeline is lazy — the eager
+init pass marks nothing `needed`, so `compiles.empty()` returns true on
+that call; the actual SPIR-V → driver compile wave happens during the
+first graph compute.  Patch 2 catches all of it on the
+`ggml_vk_cleanup` save, but **only if the process actually reaches
+cleanup**.  A SIGKILL / OOM / crash in the middle of the first
+inference throws away seconds of work, and the next run pays the same
+cost again.
+
+### What it does
+
+1. Adds `size_t pipeline_cache_last_size` to `vk_device_struct`,
+   initialised to the seed-blob size loaded at init.
+2. After the `for (auto &c : compiles) c.wait();` loop in
+   `ggml_vk_load_shaders`, queries `getPipelineCacheData` and writes it
+   to `<path>.tmp` + `rename` **iff `blob.size() > pipeline_cache_last_size`**.
+3. Same size-tracked guard is added to `ggml_vk_save_pipeline_cache`
+   (the cleanup-time path), so cooperating writers don't fight each
+   other and a no-op cleanup costs nothing.
+
+### Why size-only (no hash)
+
+We measured that a naive "flush whenever `compiles.empty() == false`"
+path is unsafe on warm runs: `compiles` is non-empty on every lazy
+`createComputePipeline` call (even a pure cache hit goes through the
+async dispatch path), so the unconditional flush re-writes the same
+1 MB blob ~60 times per inference and adds **+90 ms WALL** of disk
+churn we measured.  The size compare is the cheapest robust way to
+detect "did this call actually grow the on-disk-equivalent blob".  A
+SHA256 over the blob would be more robust but costs ~2 ms per check
+on the 1 MB blob — disk-write-equivalent overhead — for no extra
+correctness on the failure modes we care about (driver bumps invalidate
+the seed via Vulkan's own header validation, regardless of size).
+
+### Measured impact (RTX 5090 + NVIDIA driver 590.48)
+
+| Scenario              | Before round-2 | After round-2 | Delta   |
+|-----------------------|---------------:|--------------:|--------:|
+| Cold first process    |    3.32 s WALL |   3.34 s WALL |  +20 ms (noise) |
+| Warm (cache hit)      |    0.89 s WALL |   0.90 s WALL |  +10 ms (noise) |
+| Cold + crash recovery |   *3.32 s pay* |  *0.89 s pay* | -2.4 s ≈ 73 % |
+
+The crash-recovery row is qualitative (we kill the process at a known
+point during the cold compile wave): without round-2, restart pays the
+full cold cost again; with round-2, the partial cache from the crashed
+run survives.
+
+### Caveats
+
+* Slightly increased steady-state cold-process disk I/O: each lazy
+  compile batch that grows the cache now does an atomic 1 MB write.
+  In practice this is ~10-30 writes per cold first-process run,
+  totalling a few MB.  Negligible on any storage faster than spinning
+  rust.
+* `pipeline_cache_last_size` resets per process — if two processes
+  race-update the same cache file, last-writer-wins (atomic via
+  `rename`).  This is the same property as patch 2 and is the desired
+  behaviour for shared per-machine caches.
