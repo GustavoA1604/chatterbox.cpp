@@ -2956,4 +2956,126 @@ across §3.22 base and post-§3.23 at five separate invocations
 | [src/t3_mtl.h](src/t3_mtl.h) | Export `t3_stack_unregister()`. |
 | [src/chatterbox_cli.cpp](src/chatterbox_cli.cpp) | `free_t3()` calls `t3_stack_unregister()` then frees `buffer_stack` / `ctx_stack`. |
 
+### 3.24  HiFT conv-kernel F16 quantisation (multilingual S3Gen)
+
+The §3.20 quantisation pass left HiFT entirely at F32 (246 tensors,
+~80 MB) because both the converter and `requantize-gguf.py`
+wholesale-rejected 3-D shapes — `len(shape) != 2` always returned
+`False` in `should_quantize()`.  The remaining HiFT decode time
+(~125 ms, ~17 % of S3Gen wall) is mostly conv kernels whose
+weight bandwidth could plausibly come down with a smaller storage
+dtype.
+
+#### Q4_0 attempt: structurally blocked by K-dim alignment
+
+The plan's first prediction was that
+`should_quantize()` could allow 3-D when `K * IC % 32 == 0`
+(numpy `shape[-1] * shape[-2]` divisible by the Q4_0 block).  Tested
+empirically; the patch is structurally correct, **but the
+HiFT-specific gain is zero**:
+
+  - Q4_0's on-disk block layout assumes blocks span 32 consecutive
+    `ne[0]` values within a fixed `(ne[1], ne[2])` row.  For ggml
+    conv kernel shape `(K, IC, OC)` that means K must be 32-aligned.
+  - HiFT conv kernels have K ∈ {3, 7, 11, 16}.  None of these are
+    32-aligned, so Q4_0 along K is structurally impossible.
+  - Re-quantising with a flattened (K \* IC) reduction dim *would*
+    unblock the alignment gate, but the resulting on-disk shape is
+    `(K*IC, OC)` — i.e. 2-D — which then breaks
+    `ggml_im2col(kernel, ...)` on the C++ side (it derives the
+    kernel size from `kernel->ne[0]`).  That's a structural change
+    to `conv1d_f32` and gated on a future commit.
+
+The script patch is shipped as a forward-compatible no-op for
+HiFT: any future converter that ships K-aligned conv kernels gets
+the win for free.  Tested by re-quantising
+`chatterbox-s3gen-mtl-f16.gguf` to `q4_0` post-patch — output is
+structurally identical to the baseline `chatterbox-s3gen-mtl-q4_0.gguf`
+GGUF for HiFT (still 246 F32, no Q4_0).
+
+#### F16 alternate path: ships, modest win, audio quality preserved
+
+F16 has `block_size = 1` in `GGML_QUANT_SIZES`, so the alignment
+gate is a no-op for any shape.  Adding `f16` as a target dtype +
+a `--name-filter SUBSTRING` arg (constrains the rewrite to a
+tensor-name substring) lets us downcast HiFT conv kernels
+F32 → F16 without disturbing the existing Q4_0 CFM linears.
+
+Two-pass recipe:
+
+```bash
+python scripts/requantize-gguf.py \
+    models/chatterbox-s3gen-mtl-f16.gguf \
+    /tmp/intermediate.gguf f16 --name-filter hift/
+python scripts/requantize-gguf.py \
+    /tmp/intermediate.gguf \
+    models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf q4_0
+```
+
+Of the 246 HiFT tensors:
+  - 159 are 1-D biases / scalars — kept F32 by the `n_elements >= 1024`
+    + `len(shape) == {2,3}` shape gates.
+  - 64 are 2-D / 3-D conv weights — converted to F16.
+  - 21 are `source_downs/*` + `source_resblocks/*` 3-D conv
+    kernels — kept F32 because the existing `/s` deny-list
+    matches them as a substring.  Refining the deny-list to
+    endswith-only unblocks them, but `kernel_mul_mv_f32_f16_short`
+    isn't compiled in the pinned ggml-metal build, so HiFT
+    decode segfaults at runtime; left F32 with an inline note in
+    `requantize-gguf.py` for the next round.
+  - 2 small 2-D weights — kept F32 by `n_elements < 1024`.
+
+Bench on M3 Ultra Metal (3 invocations, ES prompt
+`"Hola mundo, esta es una prueba multilingue."`, `--seed 42
+--temp 0 --top-k 1`, jfk.wav voice):
+
+| Metric             | baseline q4_0 GGUF | q4_0 + HiFT F16 GGUF | Δ        |
+|--------------------|-------------------:|---------------------:|---------:|
+| GGUF size          |          788.4 MB  |             754.6 MB |  −4.3 %  |
+| `[hift_decode]` ms |          **124.9** |             **121.3** | **−2.9 %** |
+| `[s3gen_total]` ms |              727   |               726    | within noise |
+| `[cfm_total]` ms   |              549   |               550    | within noise |
+| T3 ms              |              434   |               434    | unchanged |
+
+Audio quality:
+  - WAV md5 differs (expected: F16 conversion is lossy):
+    baseline `79002f09bc48dda95ec0c2cfc2b895bd`
+    new      `ec58d3e65ab8e9c6f4edefb15b169ea5`
+  - PCM cosine = **0.999851** across all 3 invocations
+    (deterministic on `--seed 42`).
+  - max abs i16 diff = 616 / 32768 ≈ 1.9 %, mean abs diff = 3.65.
+  - Subjectively indistinguishable from baseline.  Cleanly above
+    the §3.20 PCM-cos ≥ 0.99 quality gate.
+
+#### Why this isn't the 80–100 ms drop the plan estimated
+
+The plan estimated a 25–45 ms HiFT win on the assumption that
+HiFT's bandwidth bottleneck would scale with weight storage.  Two
+reasons the realised win is smaller:
+
+1. Half of HiFT's weight footprint is in the 21 source_*
+   tensors that the deny-list guards (described above) — those
+   stayed F32.
+2. Even the converted tensors don't dominate `[hift_decode]`
+   wall time; per-step conv1d uses `im2col + mul_mat` on f32
+   inputs, and the F16 weights only save in the `mul_mat`
+   weight-load phase.  Activation traffic + im2col work stay F32.
+
+#### What's next
+
+  - **Patch the missing `kernel_mul_mv_f32_f16_short` variant**
+    (or reshape `source_downs/*` to a non-mat_mv shape) to
+    unblock the remaining 21 conv kernels.  Predicted
+    additional ~2–4 ms HiFT speedup + ~16 MB GGUF size drop.
+  - **Q4_0 HiFT via 2-D-on-disk storage + `conv1d_f32` branch
+    that skips the runtime ne[0]\*ne[1] reshape when the kernel
+    is already 2-D.**  Bigger surgery (touches both converter
+    + C++); documented as the structural follow-up to §3.24.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [scripts/requantize-gguf.py](scripts/requantize-gguf.py) | `should_quantize()` now allows 3-D when `shape[-1]` (= ne[0] = K) is block-aligned (forward-compatible no-op for HiFT today); `f16` added as a target dtype; new `--name-filter SUBSTRING` arg; pass-through path branches on `GGML_QUANT_SIZES[type][0] == 1` to handle already-quantised sources without reshape errors. |
+| `models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf` | New GGUF artifact (gitignored, 754 MB).  Recipe documented in the script's docstring + this section. |
 
