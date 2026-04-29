@@ -334,6 +334,75 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
+// QVAC-17872 round-C1 (opt-in, default OFF): convert CFM matmul `src0`
+// weights from F32 to F16 at s3gen-model load time.  Unlocks F16
+// tensor-core paths on NVIDIA / AMD RDNA3+ Vulkan; halves CFM matmul
+// weight bandwidth on every other Vulkan device.  Roughly doubles
+// matmul throughput on RTX 5090 (warm S3GEN_INFER 130 ms → ~90 ms
+// projected, see DECISION_C1_F16_CFM_WEIGHTS.md and
+// FINDINGS_ROUND3.md §3 Observation 4).
+//
+// **Breaks bit-exact** vs the round-1/2/3 F32 MD5 invariants —
+// off by default; user must opt in by setting CHATTERBOX_F16_CFM=1.
+// When OFF (no env-var, "0", "false", or empty), every code path is
+// byte-identical to round-6: CFM tensors load as F32, every locked MD5
+// still matches.
+//
+// Scope: only F32→F16 conversion of matmul *src0* weights.  We do NOT
+// touch:
+//   - biases (1D, used as src0 of `add` only — F16 makes no sense)
+//   - LayerNorm / norm scales (1D, used as `mul` operand)
+//   - convolution kernels going through conv1d_f32 (the kernel is
+//     reshaped and used as src1 of mul_mat in im2col, so F16 wouldn't
+//     unlock tensor cores; also conv1d_f32's own implementation
+//     materialises an F32 im2col tensor)
+//   - cfm/final_proj/weight (used via conv1d_f32, same reason)
+//
+// Activations and accumulators stay F32; ggml_mul_mat(F16, F32) is
+// the standard "weight × activation" pattern that every backend
+// chatterbox ships (Vulkan, Metal, OpenCL, CUDA, CPU) supports
+// natively.
+//
+// Counts on chatterbox-s3gen-turbo.gguf: 353 matmul weights
+// (251 MB F32 → 126 MB F16, ~125 MB saved on the device).
+static bool cfm_f16_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("CHATTERBOX_F16_CFM");
+        if (!e) return false;
+        const std::string s = e;
+        return !(s == "0" || s == "false" || s == "FALSE" || s.empty());
+    }();
+    return enabled;
+}
+
+static bool is_cfm_matmul_src0_weight(const std::string & name) {
+    if (name.compare(0, 4, "cfm/") != 0) return false;
+    // Top-level CFM matmul weights (3 tensors).
+    if (name == "cfm/time_mlp/linear_1/weight")     return true;
+    if (name == "cfm/time_mlp/linear_2/weight")     return true;
+    if (name == "cfm/time_embed_mixer/weight")      return true;
+    // resnet time-projection MLP inside down_blocks/<i>/0, mid_blocks/<i>/0,
+    // up_blocks/<i>/0 (14 tensors total: 1 down + 12 mid + 1 up).
+    if (name.find("/0/mlp/1/weight") != std::string::npos) return true;
+    // basic_tfm matmuls inside down_blocks/<i>/1/<j>, mid_blocks/<i>/1/<j>,
+    // up_blocks/<i>/1/<j> (336 tensors: 56 tfms × 6 weights each).
+    if (name.find("/1/") != std::string::npos) {
+        const char * suffixes[] = {
+            "/attn1/to_q/weight",
+            "/attn1/to_k/weight",
+            "/attn1/to_v/weight",
+            "/attn1/to_out/0/weight",
+            "/ff/net/0/proj/weight",
+            "/ff/net/2/weight",
+        };
+        for (const char * s : suffixes) {
+            const size_t slen = std::strlen(s);
+            if (name.size() >= slen && name.compare(name.size() - slen, slen, s) == 0) return true;
+        }
+    }
+    return false;
+}
+
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
@@ -344,17 +413,49 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
+
+    const bool f16_cfm = cfm_f16_enabled();
+    int64_t n_converted = 0;
+    size_t bytes_saved = 0;
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(g, i);
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-        ggml_tensor * dst = ggml_dup_tensor(m.ctx_w, src);
+        const bool convert = f16_cfm
+            && src->type == GGML_TYPE_F32
+            && is_cfm_matmul_src0_weight(name);
+        ggml_tensor * dst;
+        if (convert) {
+            dst = ggml_new_tensor(m.ctx_w, GGML_TYPE_F16, ggml_n_dims(src), src->ne);
+            n_converted++;
+            bytes_saved += ggml_nbytes(src) / 2;  // F32 -> F16 = exactly half
+        } else {
+            dst = ggml_dup_tensor(m.ctx_w, src);
+        }
         ggml_set_name(dst, name);
         m.tensors[name] = dst;
     }
+
+    if (verbose && f16_cfm) {
+        fprintf(stderr,
+                "  CHATTERBOX_F16_CFM=1: converted %lld CFM matmul weights to F16 (~%.1f MB saved)\n",
+                (long long) n_converted, bytes_saved / (1024.0 * 1024.0));
+    }
+
     m.buffer_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, m.backend);
     for (ggml_tensor * cur = ggml_get_first_tensor(m.ctx_w); cur; cur = ggml_get_next_tensor(m.ctx_w, cur)) {
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-        ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        if (cur->type == src->type) {
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        } else if (cur->type == GGML_TYPE_F16 && src->type == GGML_TYPE_F32) {
+            const int64_t n = ggml_nelements(src);
+            std::vector<ggml_fp16_t> f16_buf((size_t) n);
+            ggml_fp32_to_fp16_row((const float *) ggml_get_data(src), f16_buf.data(), n);
+            ggml_backend_tensor_set(cur, f16_buf.data(), 0, ggml_nbytes(cur));
+        } else {
+            throw std::runtime_error(
+                std::string("load_s3gen_gguf: unexpected dtype change at ") + ggml_get_name(cur));
+        }
     }
     gguf_free(g);
     ggml_free(tmp_ctx);

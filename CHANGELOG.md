@@ -16,12 +16,86 @@ this file is the brief surface that ships with the repo.
 ## [Unreleased]
 
 **Status:** uncommitted (working tree only) at `src/chatterbox_tts.cpp`
-+ `CHANGELOG.md`.  Three round-N changes stacked here: round-5 (small
-zero_pad cleanup), round-6 (encoder-side QKV fusion analog of round-4),
-and round-7-experiment (V1 eager-compile **negative result, reverted —
-no source-tree change shipped**).  Both 5+6 bit-exact-preserving and
-perf-neutral on RTX 5090 (within noise), both ship-on-merit as
-code-quality / mobile-target improvements.
++ `CHANGELOG.md`.  Round-C1 (F16 CFM matmul weights, opt-in env var)
+ships on top of the round-6 commit; round-5/6/7-negatives are already
+committed in `9561fd0`.
+
+### Round-C1: F16 CFM matmul weights (opt-in, default OFF)
+
+`src/chatterbox_tts.cpp` (`+101 / −1`).
+
+#### What this is
+
+- Implementation of the `OPTIMIZATION_ROADMAP.md` Tier C1 candidate as
+  an **opt-in** env var (`CHATTERBOX_F16_CFM`, default OFF).
+- At s3gen-model load time, walks the GGUF tensor list and converts the
+  353 CFM matmul `src0` weights (~251 MB F32) to F16 (~126 MB) in a
+  single backend buffer.  Saves ~125 MB device memory.
+- Activations and accumulators stay F32.  `ggml_mul_mat(F16, F32)` is
+  the standard "weight × activation" pattern that every backend
+  chatterbox ships supports natively (Vulkan, Metal, OpenCL, CUDA, CPU).
+
+#### Correctness
+
+- **Opt-out path (default, env unset / =0 / =false / =empty) is
+  byte-identical to round-6.**  All three locked F32 invariants verified:
+  - Single-shot WAV `454b4cc14538e8ef917930b110d1e504` ✓
+  - Multi-synth identical PCM `4c83f367e6ca2b02fefbd480519ea3f6` ✓
+  - Multi-synth varied PCM `9252253ee532cb7928639a0f644a25da` ✓
+- **F16 path is deterministic.**  Newly locked baselines:
+  - Single-shot WAV `6fb0bb5785c2b428a7af05c36cafd6a4` (verified 2 runs)
+  - Multi-synth identical PCM `931590a56193d12c905c7e805ef5cafb` (2 runs)
+  - Multi-synth varied PCM `e2c643be8b6a5a159c616e912d6377b9` (2 runs)
+- **Audio quality A/B (round-1 prompt):** time-domain SNR 35.4 dB,
+  spectral SNR 55.1 dB, max sample diff -43 dBFS.  Verdict:
+  perceptually transparent (single-prompt, single-voice — diverse-voice
+  / long-form / high-temperature panel A/B not done locally).
+
+#### Performance — RTX 5090 + NVIDIA 590.48 (HONEST RESULT)
+
+Projected: -40 ms / -30 % warm S3GEN.  **Measured: -1.2 ms / -1.6 %
+cfm_total** (74.0 → 72.8 ms, n=30 vs n=60, ranges fully overlap).
+
+The projection was wrong because the CFM matmul shapes are
+**bandwidth-bound, not compute-bound**: per the `GGML_VK_PERF_LOGGER`
+diagnostic, F16 storage delivers ~1.4-1.5× per-matmul speedup
+(consistent with halved weight bandwidth) instead of the 2-8×× tensor
+cores would deliver.  **Tensor cores are not engaged for these shapes**
+under the existing ggml-vulkan dispatch; the shapes are too narrow
+on M / N for the current coopmat / coopmat2 selectors.
+
+CFM matmul time on RTX 5090 is only ~1.3 ms / step of ~37 ms / step
+total, so even a 2× matmul speedup would only save ~0.65 ms / step.
+The remaining wall time lives in conv1d_f32, flash_attn_ext,
+layer_norm, concat — all unaffected.
+
+This **invalidates the C2 (encoder F16) projection too**: encoder
+matmul shapes are even narrower and will hit the same regime.
+
+#### Why ship a perf-neutral, bit-exact-breaking change?
+
+1. **~125 MB device-memory saving** is real and meaningful for mobile
+   deployments where 1 GB process budgets matter (Adreno / Mali, Snapdragon
+   mid-range, smaller iPhones).
+2. **Mobile / Mesa-RADV / Adreno / Mali likely deliver the projected
+   -10 to -20 % win** via halved weight bandwidth on slower memory
+   subsystems — same audience as round-1's pipeline-cache and rounds
+   2/3/5/6's mobile-targeted code-quality wins.  Unverified locally
+   (no mobile hardware); QVAC-17872-mobile follow-up.
+3. **Opt-in, zero risk to F32 consumers.**  Default OFF preserves all
+   locked invariants.  Same ship pattern as
+   `CHATTERBOX_FUSE_QKV` (rounds 4 + 6).
+
+Full investigation:
+[`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_C1.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_C1.md).
+
+---
+
+## [Round-5 / 6] — 2026-04-28 — `9561fd0` "round-6 (optimization) is the same shape as rounds 2/3/5: ship-on-merit as code quality + targeted at non-RTX hardware"
+
+**Source:** `src/chatterbox_tts.cpp` (`+40 / -3`) + `CHANGELOG.md`
+(new file in this commit, back-fills rounds 1-4 + this section + the
+two negative-result subsections below).
 
 ### Round-7 experiments — both negative results (no source-tree change shipped)
 
