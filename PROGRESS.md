@@ -3071,6 +3071,19 @@ reasons the realised win is smaller:
     that skips the runtime ne[0]\*ne[1] reshape when the kernel
     is already 2-D.**  Bigger surgery (touches both converter
     + C++); documented as the structural follow-up to §3.24.
+  - **F32 `mul_mm + add(bias)` shader fusion** in
+    [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch).
+    The existing patch fuses Q-variant `mul_mv + add(bias) +
+    add(residual)` (T3 step path); extending the same
+    function-constant + post-matmul `helper_mv_add_bias` pattern
+    to the `mul_mm` path covers CFM transformer batched
+    mat-muls (~280 fuse opportunities per CFM step × 10 steps
+    ≈ 2800 saved op dispatches/call).  Estimated +10–25 ms on
+    chatterbox S3Gen.  ~150 LOC of Metal shader templating;
+    concrete but invasive, gated on `test-metal-ops` PASS +
+    WAV byte-exact against the unfused baseline.  Deferred from
+    §3.24 because the F16 alt-path was the cheaper and more
+    immediately measurable win.
 
 #### Files touched
 
