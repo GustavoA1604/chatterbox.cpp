@@ -89,16 +89,22 @@ _DENY_SUBSTRINGS = (
     "/norm/",                   # layernorms
     "/ln_",                     # GPT-2 style layernorms (ln_1, ln_2, ln_f)
     "/g",                       # GPT-2 style norm scale (matches /g, /ga[mma], /gate — accept the occasional false deny)
-    "/s",                       # legacy scale weights
-                                # (incidental match on HiFT `source_*`
-                                # is intentional for now: F16-quantising
-                                # source_downs/source_resblocks/* tickles
-                                # `kernel_mul_mv_f32_f16_short`, which
-                                # isn't compiled in the pinned ggml-metal
-                                # build — segfaults at HiFT decode.
-                                # Keep them F32 until the missing kernel
-                                # variant is patched in or those tensors
-                                # get reshaped to a non-mat_mv shape.)
+    "/scale",                   # legacy scale weights (narrowed from the
+                                # old "/s" glob so HiFT source_* conv
+                                # weights are no longer incidentally
+                                # excluded.  The `kernel_mul_mv_f32_f16`
+                                # / `_4` / `_short` Metal kernel variants
+                                # that HiFT source_* conv1d needs are
+                                # shipped in patches/ggml-metal-
+                                # chatterbox-ops.patch as of PROGRESS
+                                # §3.26, so this deny is no longer
+                                # necessary for correctness.  With the
+                                # kernel in place, the 21 source_*
+                                # conv-kernel weights go through the
+                                # --name-filter hift/ recipe at f16 and
+                                # the GGUF shrinks by ~7.7 MB with WAV
+                                # parity (cos 1.000000, rms-diff 0.035 %,
+                                # max abs 4/32767).  See §3.26.)
     "alpha",                    # Snake activation alphas
     "beta",
     "gamma",
@@ -280,14 +286,22 @@ def main() -> int:
             # element-shape would fail with a size-mismatch.  Float-type
             # sources have block_size=1 in GGML_QUANT_SIZES so the
             # reshape works as before.
-            if gguf.GGML_QUANT_SIZES[t.tensor_type][0] == 1:
+            block_size, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
+            if block_size == 1:
                 arr = data.reshape(shape)
                 writer.add_tensor(t.name, arr, raw_shape=arr.shape, raw_dtype=t.tensor_type)
             else:
-                # Pass the raw byte buffer through.  raw_shape carries
-                # the logical element-shape; raw_dtype keeps the quant
-                # tag so the reader knows how to interpret bytes.
-                writer.add_tensor(t.name, data, raw_shape=shape, raw_dtype=t.tensor_type)
+                # Q-type passthrough.  gguf-0.18+ `add_tensor_info` treats
+                # `raw_shape` as **byte shape** for uint8 tensors (the
+                # innermost dim is bytes per row, not elements per row).
+                # Convert: byte_inner = elements_inner / block * type_size.
+                # Earlier versions of this script hit
+                # `ValueError: Quantized tensor bytes per row (N) is not a
+                # multiple of Q4_0 type size (18)` when re-quantising a
+                # GGUF that already had Q-type tensors — see §3.26.
+                byte_inner = shape[-1] // block_size * type_size
+                byte_shape = tuple(list(shape[:-1]) + [byte_inner])
+                writer.add_tensor(t.name, data, raw_shape=byte_shape, raw_dtype=t.tensor_type)
             kept_count += 1
             dst_bytes += data.nbytes
 

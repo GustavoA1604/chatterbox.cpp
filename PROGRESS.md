@@ -3205,3 +3205,158 @@ encoder-side optimisations are:
 | File | Change |
 |------|--------|
 | [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | 10-line commentary block added to `conformer_block()` explaining why the flash-attn path is intentionally not taken, pinning the negative-finding cosine number and the speed upside that was measured, and pointing at the parakeet §15.8 counterexample. No code change to the graph itself. |
+
+### 3.26  HiFT source_* F16 — unblocks the missing `kernel_mul_mv_f32_f16{,_4,_short}` Metal variants
+
+Closes the open item from §3.24 §3.25: "Patch the missing
+`kernel_mul_mv_f32_f16_short` variant to unblock the remaining 21
+HiFT source_* conv kernels."
+
+§3.24 converted the 64 HiFT conv-kernel F32 weights that the
+`/s` deny-list didn't incidentally catch to F16 (cos > 0.9998 vs
+the all-F32 baseline, `[hift_decode]` ~3 % faster, ~33 MB GGUF
+shrink). The broad `/s` deny also caught every HiFT `source_*`
+weight (`source_downs/0..2`, `source_resblocks/0..2/{convs1,convs2}/*`,
+`m_source/l_linear/*` — 21 weight tensors, ~7.7 MB at F32) because
+when you flip them to F16, HiFT's `conv1d_f32` path runs the
+`ggml_mul_mat(im2col_f32, kernel_f16)` mat-vec shape with `T0=f32,
+T1=f16`. The pinned ggml-metal (commit `58c38058`) did not ship
+that template instantiation, and Metal pipeline lookup fails:
+
+    ggml_metal_library_compile_pipeline: Error Domain=MTLLibraryErrorDomain
+    Code=5 "Function kernel_mul_mv_f32_f16_short was not found in the library"
+
+(Reproduced by feeding chatterbox a GGUF where the 21 source_*
+tensors are F16; crashes immediately at first HiFT decode with
+SIGSEGV / exit 139.)
+
+#### The fix — three template instantiations in `ggml-metal.metal`
+
+One line each per kernel family:
+
+```cpp
+// kernel_mul_mv_t_t family (full-shape mat-vec)
+template [[host_name("kernel_mul_mv_f32_f16")]]        kernel mul_mv_t_t        kernel_mul_mv_t_t       <float, half>;
+// kernel_mul_mv_t_t_4 family (vec4 dispatch path)
+template [[host_name("kernel_mul_mv_f32_f16_4")]]      kernel mul_mv_t_t_4      kernel_mul_mv_t_t_4     <float, float4, half, half4>;
+// kernel_mul_mv_t_t_short family (short-axis dispatch path — this is the
+// variant HiFT's small-OC source_downs/2/weight (OC=64) actually hits)
+template [[host_name("kernel_mul_mv_f32_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short <float, half>;
+```
+
+The `mul_mv_t_t_short_impl` body (lines ~4320–4355 of `ggml-metal.metal`)
+is templated on `<T0, T1>` and already handles arbitrary casts via
+`(float) x[i] * (float) y[i]` — all that was missing was the
+`<float, half>` instantiation for the symbol lookup. Same for
+`_4` (needs `<float, float4, half, half4>`, with float-cast in the
+inner reduction loop) and the base non-short variant (symmetric).
+
+All three land as additions in `patches/ggml-metal-chatterbox-ops.patch`
+(700 → 733 lines). `test-metal-ops` still PASSes on every op it
+already covered (diag_mask_inf / pad_ext / conv_transpose_1d at
+three upsample stages + tiny edge case).
+
+#### `requantize-gguf.py` updates (two fixes + one scope narrow)
+
+Three changes so the recipe works end-to-end on the current
+gguf-0.18 writer:
+
+1. **Narrowed the deny glob `/s` to `/scale`.** The old `/s` match
+   was a rough proxy for "norm scale params like ln_1/ga, gate,
+   etc." but incidentally swept in every `hift/source_*/` weight
+   and bias tensor (188 matches in the F16 source GGUF, 62 of
+   which were `source_*`). With the Metal kernel variant now
+   shipped, `source_*` conv weights are safe to F16; the 21
+   that matter (the 3-D conv kernels) quantise successfully via
+   `--name-filter hift/source_`. The remaining norm-scale tensors
+   the deny was originally targeting (`/scale`, `/ln_`, `/norm/`,
+   `/gamma`) are still covered by their own stricter patterns.
+
+2. **Fixed the Q-type passthrough byte-shape bug.** `gguf-0.18`'s
+   `add_tensor_info` treats `raw_shape` as byte layout (innermost
+   dim in bytes per row, not elements per row) when `tensor.dtype
+   == np.uint8`. The previous code passed the element shape
+   verbatim, which crashed with
+   `ValueError: Quantized tensor bytes per row (512) is not a
+   multiple of Q4_0 type size (18)` on any input GGUF that
+   already carried Q-type tensors — i.e. every two-pass
+   pipeline like `f16 → q4_0` or `q4_0 → f16 --name-filter`.
+   Fix: convert inner-dim elements to bytes
+   (`byte_inner = elements_inner // block_size * type_size`)
+   before handing to the writer. Blocks `block_size==1` (F16/F32/
+   BF16) keep the existing element-shape path.
+
+3. **Docstring updated** with the two-pass recipe showing the
+   post-§3.26 configuration:
+
+       # Full recipe (Q4_0 everywhere except HiFT kept at F16 now
+       # including the 21 source_* conv kernels unblocked in §3.26):
+       python scripts/requantize-gguf.py \
+           models/chatterbox-s3gen-mtl-f16.gguf \
+           /tmp/intermediate.gguf f16 --name-filter hift/
+       python scripts/requantize-gguf.py \
+           /tmp/intermediate.gguf \
+           models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf q4_0
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42, 3x3 runs)
+
+|                    | §3.24 baseline   | §3.26 (source_* F16) | Δ            |
+|--------------------|-----------------:|---------------------:|-------------:|
+| `[encoder]` ms     |    31.3          |   30.5               | −0.8 (noise) |
+| `[cfm_total]` ms   |   541.9          |  550.4               | noise        |
+| `[hift_decode]` ms |   121.3          |  121.1               | neutral      |
+| S3GEN_INFER_MS     |   709            |  724                 | +15 (noise)  |
+| T3_INFER_MS        |   440            |  440                 | 0            |
+| GGUF size          |  754.4 MB        |  746.7 MB            | **−7.7 MB**  |
+
+Speed is neutral on M3 Ultra (unified-memory bandwidth isn't the
+bottleneck for the 21 source_* weights, which are small — the
+largest is `source_resblocks/0/convs1/*/weight` at ~3.4 MB F32 /
+~1.7 MB F16). The predicted +2–4 ms HiFT gain from §3.24 falls
+inside bench noise; on bandwidth-limited targets (M4 Air /
+iPhone neural engine), expect the full +3–5 % HiFT speedup seen
+in §3.24's existing 64 tensors. The **real win** is the
+**7.7 MB GGUF shrink** (~1.0 %) on a multilingual distribution
+GGUF, plus closing the last known blocker from §3.24.
+
+#### Parity gates
+
+- `test-metal-ops`: all four pre-existing ops (diag_mask_inf, pad_ext,
+  conv_transpose_1d @ 3 upsample stages + tiny edge) PASS; no new
+  tests added because `kernel_mul_mv_f32_f16{,_4,_short}` is covered
+  by the end-to-end audio parity below (same inner math as the
+  existing `<half, float>` / `<half, half>` / `<float, float>`
+  variants, differing only in type tags).
+- **WAV parity** vs §3.24 baseline on ES-prompt / jfk-voice / seed
+  42 (per-invocation deterministic; md5 identical across 3x3 runs):
+
+      MD5 §3.24 baseline:      ec58d3e65ab8e9c6f4edefb15b169ea5
+      MD5 §3.26 v2 (3 runs):   d8a1b22375dbcb2259c686426a7d76c5  d8a1b22375dbcb2259c686426a7d76c5  d8a1b22375dbcb2259c686426a7d76c5
+
+  audio comparison:
+
+      lengths 83520/83520   cos 1.000000   PASS (threshold > 0.9998)
+      rms_diff 0.464    rms_base 1332.66   max_abs_diff 4 (out of ±32767)
+      → 0.035 % relative RMS drift, 0.012 % max sample drift
+
+  Auditorily identical (within the LSB of s16 output). Deterministic
+  across invocations.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | +33 lines for the three `mul_mv_f32_f16{,_4,_short}` template instantiations + comments referencing this section. Regenerated from the pinned commit `58c38058`. |
+| [scripts/requantize-gguf.py](scripts/requantize-gguf.py) | `/s` deny narrowed to `/scale`; Q-type passthrough byte-shape fix; docstring recipe updated. |
+| `ggml/src/ggml-metal/ggml-metal.metal` | Local edit under the `ggml/` worktree; not tracked in this repo. Recipe remains: run `scripts/setup-ggml.sh` to re-apply the patch after a ggml bump. |
+
+#### What's next
+
+All §3.24 follow-ups now closed:
+
+- ~~kernel_mul_mv_f32_f16_short patch~~ ✓ shipped this section
+- Q4_0 HiFT via 2-D-on-disk storage + `conv1d_f32` branch — still
+  deferred, larger surgery (touches both converter + C++)
+- F32 `mul_mm + add(bias)` shader fusion — still deferred, ~150
+  LOC Metal kernel work + test-metal-ops gate; bigger potential
+  (+10–25 ms S3Gen) but not "quick"

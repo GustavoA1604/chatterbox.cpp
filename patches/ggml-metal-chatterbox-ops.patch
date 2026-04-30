@@ -1,5 +1,5 @@
 diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
-index e8548b0..5d93363 100644
+index e8548b05..5d933631 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
 @@ -699,7 +699,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
@@ -51,7 +51,7 @@ index e8548b0..5d93363 100644
      assert(op->op == GGML_OP_ARANGE);
  
 diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
-index de43f81..b6d6b3d 100644
+index de43f819..b6d6b3d5 100644
 --- a/src/ggml-metal/ggml-metal-device.h
 +++ b/src/ggml-metal/ggml-metal-device.h
 @@ -129,7 +129,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_del
@@ -72,7 +72,7 @@ index de43f81..b6d6b3d 100644
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_timestep_embedding(ggml_metal_library_t lib, const struct ggml_tensor * op);
  struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_opt_step_adamw    (ggml_metal_library_t lib, const struct ggml_tensor * op);
 diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
-index 40cacb4..089854e 100644
+index 40cacb46..089854e8 100644
 --- a/src/ggml-metal/ggml-metal-device.m
 +++ b/src/ggml-metal/ggml-metal-device.m
 @@ -1128,12 +1128,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
@@ -95,7 +95,7 @@ index 40cacb4..089854e 100644
          case GGML_OP_TOP_K:
          case GGML_OP_ARANGE:
 diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
-index 62b028f..384db80 100644
+index 62b028f4..384db806 100644
 --- a/src/ggml-metal/ggml-metal-impl.h
 +++ b/src/ggml-metal/ggml-metal-impl.h
 @@ -993,8 +993,19 @@ typedef struct {
@@ -119,7 +119,7 @@ index 62b028f..384db80 100644
      int64_t  ne00;
      int64_t  ne01;
 diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
-index 846225d..3555ce8 100644
+index 846225d9..3555ce8c 100644
 --- a/src/ggml-metal/ggml-metal-ops.cpp
 +++ b/src/ggml-metal/ggml-metal-ops.cpp
 @@ -410,6 +410,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
@@ -331,7 +331,7 @@ index 846225d..3555ce8 100644
      ggml_tensor * op = ctx->node(idx);
  
 diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
-index 50e3c5c..a3aa05c 100644
+index 50e3c5c7..a3aa05c1 100644
 --- a/src/ggml-metal/ggml-metal-ops.h
 +++ b/src/ggml-metal/ggml-metal-ops.h
 @@ -81,6 +81,7 @@ int ggml_metal_op_conv_transpose_2d (ggml_metal_op_t ctx, int idx);
@@ -343,7 +343,7 @@ index 50e3c5c..a3aa05c 100644
  int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index f67c5cd..006e1b9 100644
+index f67c5cd8..c67626e3 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
 @@ -3300,6 +3300,63 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
@@ -526,7 +526,40 @@ index f67c5cd..006e1b9 100644
  }
  
  // mat-vec kernel processing in chunks of float4
-@@ -4830,33 +4932,63 @@ typedef void (conv_transpose_1d_t)(
+@@ -4085,6 +4187,12 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
+ template [[host_name("kernel_mul_mv_f32_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
+ template [[host_name("kernel_mul_mv_f16_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
+ template [[host_name("kernel_mul_mv_f16_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  half>;
++// chatterbox PROGRESS §3.26: add f32_f16 variants so HiFT source_* conv
++// kernels (f16 after requantize-gguf.py --name-filter hift/source_) can
++// run on the f32-input / f16-weight mat-mv dispatch path. Without this
++// the Metal library lookup fails with "Function kernel_mul_mv_f32_f16
++// was not found in the library" at first HiFT decode.
++template [[host_name("kernel_mul_mv_f32_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, half>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, float>;
+ template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, bfloat>;
+@@ -4209,6 +4317,8 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
+ template [[host_name("kernel_mul_mv_f32_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
+ template [[host_name("kernel_mul_mv_f16_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
+ template [[host_name("kernel_mul_mv_f16_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  half,  half4>;
++// chatterbox PROGRESS §3.26: f32_f16 variant for the vec4 dispatch path.
++template [[host_name("kernel_mul_mv_f32_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, half,  half4>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float,  float4>;
+ template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
+@@ -4274,6 +4384,10 @@ typedef decltype(kernel_mul_mv_t_t_short<half, half>) mul_mv_t_t_short_t;
+ template [[host_name("kernel_mul_mv_f32_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, float>;
+ template [[host_name("kernel_mul_mv_f16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  float>;
+ template [[host_name("kernel_mul_mv_f16_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  half>;
++// chatterbox PROGRESS §3.26: f32_f16 variant for the short-axis dispatch
++// path. This is the one that was missing and crashing HiFT when the 21
++// hift/source_* weights were converted to f16 — see §3.26 writeup.
++template [[host_name("kernel_mul_mv_f32_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, half>;
+ #if defined(GGML_METAL_HAS_BF16)
+ template [[host_name("kernel_mul_mv_bf16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, float>;
+ template [[host_name("kernel_mul_mv_bf16_bf16_short")]] kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, bfloat>;
+@@ -4830,33 +4944,63 @@ typedef void (conv_transpose_1d_t)(
          device const float * src1,
          device        char * dst,
          uint3   tgpig[[threadgroup_position_in_grid]],
@@ -607,7 +640,7 @@ index f67c5cd..006e1b9 100644
  }
  
  template [[host_name("kernel_conv_transpose_1d_f32_f32")]]
-@@ -4866,7 +4998,9 @@ kernel void kernel_conv_transpose_1d<float>(
+@@ -4866,7 +5010,9 @@ kernel void kernel_conv_transpose_1d<float>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
@@ -618,7 +651,7 @@ index f67c5cd..006e1b9 100644
  
  template [[host_name("kernel_conv_transpose_1d_f16_f32")]]
  kernel void kernel_conv_transpose_1d<half>(
-@@ -4875,7 +5009,9 @@ kernel void kernel_conv_transpose_1d<half>(
+@@ -4875,7 +5021,9 @@ kernel void kernel_conv_transpose_1d<half>(
      device const float * src1,
      device        char * dst,
      uint3   tgpig[[threadgroup_position_in_grid]],
@@ -629,7 +662,7 @@ index f67c5cd..006e1b9 100644
  
  
  typedef void (conv_transpose_2d_t)(
-@@ -5250,17 +5386,23 @@ kernel void kernel_pad_f32(
+@@ -5250,17 +5398,23 @@ kernel void kernel_pad_f32(
      const int64_t i2 = tgpig.y;
      const int64_t i1 = tgpig.x;
  
@@ -660,7 +693,7 @@ index f67c5cd..006e1b9 100644
              } else {
                  dst_ptr[i0] = 0.0f;
              }
-@@ -5274,6 +5416,37 @@ kernel void kernel_pad_f32(
+@@ -5274,6 +5428,37 @@ kernel void kernel_pad_f32(
      }
  }
  
