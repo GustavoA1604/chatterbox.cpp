@@ -488,40 +488,35 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
     return ggml_cont(ctx, v);
 }
 
-// Metal backend currently has no PAD / PAD_EXT dispatcher entry, so emulate
-// front/back zero padding on dim 0 via concat(scale(view, 0), x) /
-// concat(x, scale(view, 0)).  The scale(..., 0) trick produces a defined
-// zero tensor (as opposed to allocating an uninitialised one and hoping).
+// QVAC-17872 round-V5 (2026-04-30): replaced the previous
+// concat(scale(view, 0), x) emulation with a single ggml_pad_ext call.
+// All four backends chatterbox.cpp ships against support per-dim
+// front/back padding natively today:
+//   * Vulkan    — pad.comp shader takes lp0..lp3 + rp0..rp3 (always has)
+//   * Metal     — round-1's ggml-metal-chatterbox-ops.patch added lp0..lp3
+//   * CUDA      — pad.cu takes (lp0,rp0,lp1,rp1,...,lp3,rp3) per-dim
+//   * OpenCL    — kernel_pad with lp/rp params
+// CPU has the reference impl that always handled it.
 //
-// QVAC-17872 round-5 (post-round-4): the original code did
-// ggml_scale(ggml_cont(view), 0.0f) — but that's wasted work: cont reads
-// data into a fresh buffer and scale immediately overwrites with zeros.
-// On Vulkan, ggml_scale's compute_forward handles strided sources via
-// nb[] indexing, so we can drop the cont and let scale read+zero in one
-// pass.  Verified bit-exact against the round-1/2/3 invariants and the
-// concat consumer is happy with the contiguous output ggml_scale
-// produces (scale always materialises a fresh contiguous tensor; only
-// the SOURCE may be strided).  Saves one CONT dispatch per zero_pad
-// call — about 30 calls per CFM step on chatterbox-multilingual.
+// The previous workaround built a 3-dispatch chain per padded edge
+// (ggml_view_4d → ggml_scale(_, 0.0f) → ggml_concat) for both front and
+// back padding when p_front>0 OR p_back>0; ~30 such calls per CFM step
+// on chatterbox-multilingual gave us ~60 redundant scale + concat
+// dispatches per CFM step on top of the single intended pad.
+//
+// ggml_pad_ext produces a single dispatch that reads src directly into
+// the (front_pad + src + back_pad)-sized destination, writing zeros for
+// the padded regions.  Output is byte-identical to the previous
+// emulation for F32 inputs (0.0 == 0.0; the src region is a literal
+// element copy either way; only the floating-point operation count
+// differs).
+//
+// Round-5's "drop wasted ggml_cont" cleanup is now subsumed by this
+// change — ggml_pad_ext doesn't need a contiguous source view at all.
 static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
-    ggml_tensor * y = x;
-    if (p_front > 0) {
-        GGML_ASSERT(p_front <= (int)x->ne[0]);
-        ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
-                                           x->nb[1], x->nb[2], x->nb[3], 0);
-        ggml_tensor * z = ggml_scale(ctx, head, 0.0f);
-        y = ggml_concat(ctx, z, y, 0);
-    }
-    if (p_back > 0) {
-        GGML_ASSERT(p_back <= (int)x->ne[0]);
-        ggml_tensor * tail = ggml_view_4d(ctx, x, p_back, x->ne[1], x->ne[2], x->ne[3],
-                                           x->nb[1], x->nb[2], x->nb[3],
-                                           (size_t)(x->ne[0] - p_back) * x->nb[0]);
-        ggml_tensor * z = ggml_scale(ctx, tail, 0.0f);
-        y = ggml_concat(ctx, y, z, 0);
-    }
-    return y;
+    GGML_ASSERT(p_front >= 0 && p_back >= 0);
+    return ggml_pad_ext(ctx, x, p_front, p_back, 0, 0, 0, 0, 0, 0);
 }
 
 static ggml_tensor * ggml_mish_fn(ggml_context * ctx, ggml_tensor * x) {
@@ -538,6 +533,11 @@ static ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x,
 }
 
 // LayerNorm on channel axis where x ne=[T, C].
+//
+// QVAC-17872 round-AUDIT: tried dropping the trailing ggml_cont; binary
+// crashed in some downstream op (likely conv1d_f32's im2col or ggml_concat
+// — both common consumers in cfm_causal_block).  Reverted.  The trailing
+// cont is genuinely necessary for the chatterbox CFM graph topology.
 static ggml_tensor * layer_norm_on_channel(ggml_context * ctx, ggml_tensor * x,
                                            ggml_tensor * w, ggml_tensor * b, float eps = 1e-5f) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -648,9 +648,19 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     v = ggml_reshape_3d(ctx, v, HD, H, T);
     p = ggml_reshape_3d(ctx, p, HD, H, pos_emb->ne[1]);
 
-    ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    // QVAC-17872 round-AUDIT:
+    //   q_perm — consumed only by ggml_add (lines 658-659 producing
+    //            q_plus_u / q_plus_v); add accepts strided src0.  Cont
+    //            is redundant.
+    //   v_perm — consumed only by ggml_permute → ggml_cont on line 678
+    //            (v_for_mm).  The trailing cont materialises contig output
+    //            regardless of v_perm's stride state, so the cont here is
+    //            redundant.
+    //   k_perm and p_perm KEEP their conts — they're src0 of ggml_mul_mat
+    //            (lines 661-662) which requires contiguous src0.
+    ggml_tensor * q_perm = ggml_permute(ctx, q, 0, 2, 1, 3);
     ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+    ggml_tensor * v_perm = ggml_permute(ctx, v, 0, 2, 1, 3);
     ggml_tensor * p_perm = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
 
     ggml_tensor * u_bias = ggml_reshape_3d(ctx, w.pos_bias_u, HD, 1, H);
@@ -667,8 +677,10 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     ggml_tensor * bd_reshaped = ggml_reshape_3d(ctx, ggml_cont(ctx, bd_sliced), 2*T - 1, T, H);
     ggml_tensor * bd_final = ggml_view_3d(ctx, bd_reshaped, T, T, H,
                                           bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
-    bd_final = ggml_cont(ctx, bd_final);
-
+    // QVAC-17872 round-AUDIT: drop the trailing ggml_cont — bd_final is
+    // consumed only as src1 of ggml_add(ac, bd_final) below, which handles
+    // strided src1.  Saves 1 dispatch per conformer_block call (10 calls
+    // per encoder run).
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
     ggml_tensor * attn = ggml_soft_max(ctx, scores);
@@ -771,7 +783,10 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     xt = zero_pad_dim0(ctx, xt, 2, 0);
     xt = conv1d_f32(ctx, pw2, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb2, 1, D));
-    xt = ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
+    // QVAC-17872 round-AUDIT: drop the trailing ggml_cont — xt is consumed
+    // only as src0 of ggml_add(xt, residual) below, which handles strided
+    // sources via nb[] indexing.  Saves 1 dispatch per encoder run.
+    xt = ggml_permute(ctx, xt, 1, 0, 2, 3);
     x = ggml_add(ctx, xt, residual);
 
     // 6 conformer blocks at length T
@@ -786,7 +801,10 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * xu = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * xu_3d = ggml_reshape_3d(ctx, xu, 1, xu->ne[0], xu->ne[1]);
     ggml_tensor * xu_2x = ggml_concat(ctx, xu_3d, xu_3d, 0);
-    xu = ggml_cont(ctx, ggml_reshape_2d(ctx, xu_2x, xu_3d->ne[1]*2, xu_3d->ne[2]));
+    // QVAC-17872 round-AUDIT: drop outer cont; ggml_concat output is
+    // contiguous and ggml_reshape_2d on contig source returns a contig
+    // view, so the wrapping ggml_cont was a redundant no-op copy.
+    xu = ggml_reshape_2d(ctx, xu_2x, xu_3d->ne[1]*2, xu_3d->ne[2]);
     xu = zero_pad_dim0(ctx, xu, 4, 0);
     xu = conv1d_f32(ctx, up_w, xu, 1, 0, 1);
     xu = ggml_add(ctx, xu, ggml_reshape_2d(ctx, up_b, 1, D));
@@ -1622,6 +1640,12 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
     // ISTFT
+    // QVAC-17872 round-AUDIT (negative result): tried dropping the leading
+    // conts on mag_log and ph_in.  Single-shot passed bit-exact but
+    // multi-synth multi-chunk produced a different PCM MD5 (the F-stride
+    // view at non-zero offset apparently interacts with the cache-rebuild
+    // path in a way that diverges from the F32 reference for some T_stft
+    // values).  Conts are required.
     size_t col_stride = x->nb[1];
     ggml_tensor * mag_log = ggml_cont(ctx, ggml_view_2d(ctx, x, T_stft, F, col_stride, 0));
     mag_log = ggml_clamp(ctx, mag_log, -1e6f, 1e2f);

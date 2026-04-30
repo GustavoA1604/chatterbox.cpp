@@ -16,9 +16,196 @@ this file is the brief surface that ships with the repo.
 ## [Unreleased]
 
 **Status:** uncommitted (working tree only) at `src/chatterbox_tts.cpp`
-+ `CHANGELOG.md`.  Round-C1 (F16 CFM matmul weights, opt-in env var)
-ships on top of the round-6 commit; round-5/6/7-negatives are already
-committed in `9561fd0`.
++ `CHANGELOG.md`.  Round-V5 (replace `zero_pad_dim0` emulation with
+native `ggml_pad_ext`) and Round-AUDIT (5 redundant `ggml_cont`
+removals identified by code audit) ship together on top of the C1
+commit `883cd21`.  Both are bit-exact-preserving and perf-neutral on
+RTX 5090; AMD/RADV F32 multi-synth still matches its locked baseline.
+Cumulative source diff: `-37 / +61` lines in `src/chatterbox_tts.cpp`.
+
+### Round-V5: Replace `zero_pad_dim0` emulation with native `ggml_pad_ext`
+
+`src/chatterbox_tts.cpp` (`-31 / +28`).
+
+#### What this is
+
+- Replaces a 14-line `concat(scale(view, 0), x)` workaround in
+  `zero_pad_dim0` with a single `ggml_pad_ext` call.  The workaround
+  was added when Metal lacked front-pad support, but round-1's
+  `ggml-metal-chatterbox-ops.patch` fixed Metal's `kernel_pad_f32`
+  to honour `lp0..lp3` per-dim, and Vulkan / CUDA / OpenCL all had
+  per-dim front-pad already.  The emulation has been redundant since
+  round-1 was merged.
+- New code: `return ggml_pad_ext(ctx, x, p_front, p_back, 0,0,0,0,0,0)`.
+  Single dispatch, byte-identical output for the zero-pad-on-dim-0
+  case.
+
+#### Correctness
+
+- **Bit-exact preserving** on RTX 5090 across all six locked
+  invariants (3× F32 + 3× F16 from round-1/2/3/C1).
+- **Bit-exact preserving** on AMD iGPU / Mesa-RADV — locked AMD F32
+  multi-synth identical-chunks PCM still matches
+  `a84623b784b5e47dc95f62229773e81b` (the most stress-sensitive test).
+
+#### Performance
+
+- **RTX 5090: perf-neutral.**  cfm_total 74.0 → 75.7 ms
+  (+1.7 ms / +2.3 %, within run-to-run noise floor; ranges
+  `[72.4, 77.0]` vs `[74.2, 78.4]` overlap).  S3GEN_INFER 122.1 →
+  124.3 ms (within noise).  Slight local cost increase reflects the
+  trade-off between fewer dispatches (3 → 1 per padded edge) and
+  more per-element work in `pad` (4D boundary checks vs simple
+  scale + concat).
+- **AMD iGPU / Mesa-RADV: no measurable regression** (numbers within
+  natural variance of the iGPU's slow compute path).
+
+#### Why ship a perf-neutral change?
+
+Same rationale as rounds 5 / 6 / C1:
+
+1. **Code quality.**  Removes a 14-line stale-comment workaround.
+   Replaces 12-line emulation with 3 lines.
+2. **Graph simplification.**  Single PAD node where there used to be
+   3 nodes per padded edge; cleaner perf-logger output for future
+   analysis.
+3. **Future-proofing.**  New backends (CANN / WebGPU / SYCL) all
+   support PAD natively; no need to re-derive the workaround.
+4. **Closes the OPTIMIZATION_PLAN_NEXT V5 roadmap entry** with a
+   smaller scope than originally projected (no shader port needed).
+
+Full investigation:
+[`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_V5.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_V5.md).
+
+---
+
+### Round-AUDIT: Deep code audit + 5 redundant `ggml_cont` removals
+
+`src/chatterbox_tts.cpp` (`-6 / +33` net on top of V5; cumulative
+`-37 / +61` for the combined V5 + AUDIT diff).
+
+#### What this is
+
+Two-pass code audit of every `ggml_cont(...)` call site in
+`chatterbox_tts.cpp` (28 sites total).  For each, traced the
+downstream consumer and removed conts whose consumers demonstrably
+accept strided sources.  **Net: 5 sites removed, ~32
+dispatches/inference eliminated.**
+
+| Site | Calls/inf | Consumer | Verdict |
+|------|----------:|----------|:-------:|
+| `pre_lookahead` exit cont                     | 1   | `ggml_add(xt, residual)` accepts strided | ✓ removed |
+| `conformer_block` `bd_final` cont             | 10  | `ggml_add(ac, bd_final)` accepts strided | ✓ removed |
+| `up_layer` post-concat reshape cont           | 1   | redundant — concat output + reshape on contig is already contig | ✓ removed |
+| `conformer_block` `q_perm` cont (pass 2)       | 10  | `ggml_add(q_perm, u_bias / v_bias)` accepts strided src0 | ✓ removed |
+| `conformer_block` `v_perm` cont (pass 2)       | 10  | re-permuted + cont'd into `v_for_mm` regardless | ✓ removed |
+| **Total dispatches eliminated**                | **32** |                                       |          |
+
+#### Negative results (reverted with note)
+
+Three sites looked redundant but failed regression — kept for posterity
+so the next investigator doesn't re-tread them:
+
+| Site | Failure mode |
+|------|--------------|
+| `layer_norm_on_channel` exit cont (58/inf) | runtime SIGABRT — downstream `im2col` / `concat` doesn't accept its strided permute output |
+| STFT `mag_log` exit cont (1/inf)            | single-shot PASS but multi-synth identical-chunks PCM diverges from locked baseline |
+| STFT `ph_in` exit cont (1/inf)              | same multi-synth divergence as `mag_log` |
+
+Lesson: single-shot bit-exact is necessary but **not sufficient** —
+always run multi-synth identical AND varied; the cache-rebuild path
+is sensitive to non-zero-offset strided views.
+
+#### Correctness
+
+Same 7-invariant test set as V5, all PASS:
+
+| Invariant                                  | Locked F32 / F16 MD5                           | Match |
+|--------------------------------------------|------------------------------------------------|:-----:|
+| Single-shot WAV (round-1)                  | `454b4cc14538e8ef917930b110d1e504`             |   ✓   |
+| Multi-synth identical-chunks PCM (round-2) | `4c83f367e6ca2b02fefbd480519ea3f6`             |   ✓   |
+| Multi-synth varied-length PCM (round-3)    | `9252253ee532cb7928639a0f644a25da`             |   ✓   |
+| F16 single-shot WAV (C1)                    | `6fb0bb5785c2b428a7af05c36cafd6a4`             |   ✓   |
+| F16 multi-synth identical-chunks PCM (C1)   | `931590a56193d12c905c7e805ef5cafb`             |   ✓   |
+| F16 multi-synth varied-length PCM (C1)      | `e2c643be8b6a5a159c616e912d6377b9`             |   ✓   |
+| F32 single-shot, `CHATTERBOX_F16_CFM=0`     | `454b4cc14538e8ef917930b110d1e504`             |   ✓   |
+
+AMD/RADV F32 multi-synth identical PCM still matches its locked
+baseline `a84623b784b5e47dc95f62229773e81b`.
+
+#### Performance
+
+- **RTX 5090: perf-neutral.**  ~32 dispatches × ~5 µs = ~160 µs
+  theoretical savings, well below the run-to-run noise floor (2-5 ms
+  thermal variance).  Aggregate cfm_total moved within noise (74.0 ↔
+  76.2 ms across measurement sessions).
+- **AMD/RADV: bit-exact preserved**, no measurable perf change.
+
+Same character as rounds 5 / 6 / V5 / C1 on RTX 5090: code-quality
+and graph-simplification wins, not runtime perf wins on this hardware.
+Per-cont overhead is too small to register here; mobile / Mesa
+targets may benefit more.
+
+#### Why ship?
+
+1. **Code quality.**  Removes 5 explicit redundant ops + 3
+   stale-comment workarounds from the graph builder.
+2. **Graph simplification.**  Cleaner `cgraph` topology in
+   `pre_lookahead`, `up_layer`, and the 10× `conformer_block` calls.
+3. **Documented negative results.**  The 3 reverted sites get
+   inline comments documenting WHY they can't be removed — saves
+   the next investigator a runtime crash + a hidden multi-synth
+   divergence.
+4. **What's NOT removable** is also documented (after exhausting the
+   conservative-redundancy candidates): `layer_norm_on_channel`,
+   `apply_tfm_stack`, flash-attn QKV chain, mul_mat src0 conts.
+   Future cont reduction requires backend-side work (Tier 4 V4 —
+   custom `LAYER_NORM_ON_DIM` shader).
+
+Full investigation:
+[`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_AUDIT.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_AUDIT.md).
+
+---
+
+## [Round-AMD] — 2026-04-30 — Tier-1 validation on AMD iGPU + Mesa-RADV (no source change)
+
+Measurement-only round.  No source change.  Lands as
+`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_AMD.md` +
+`bench-logs-vk-amd/` directory.
+
+### What was measured
+
+* All 6 locked baselines re-locked on AMD iGPU + Mesa-RADV
+  (different MD5s than NVIDIA, all deterministic).
+* **C1 perf delta on AMD/RADV:** mean +0.3 % (within noise) over n=4
+  alternating pairs.  **Refutes the projected -10 to -20 %
+  bandwidth-driven mobile win** on this proxy.
+* **Round-1 pipeline cache cold→warm on Mesa-RADV:** 4.54 s cold →
+  4.57 s warm — essentially zero gap.  Mesa-RADV doesn't have
+  NVIDIA's slow-compile-wave problem, so there's nothing for the
+  cache to recover.  **Refutes the round-1 generalised-mobile
+  framing.**
+
+### Implications
+
+* Rounds 2/3/5/6/V5 stay shipped on **code-quality** merit; the
+  "mobile bandwidth wins" half of their framing is empirically
+  unsupported on this proxy.
+* C1's ship rationale narrows to **memory saving (~125 MB)** —
+  perf-neutral on every measured Vulkan target, mobile bandwidth
+  win remains an unverified hypothesis.
+* Round 4 stands alone as the only measured-positive perf round
+  on RTX 5090 (-3.3 % cfm_total).
+* The "next investigations" priorities shift to upstream
+  ggml-vulkan work (V3 / V4 / V5 / coopmat2 enablement) and away
+  from chatterbox-side weight-format tweaks.
+
+Full investigation:
+[`inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_AMD.md`](../inputFilesForAI/qvac-17872-findings/FINDINGS_ROUND_AMD.md).
+
+---
+
+## [C1] — 2026-04-29 — `883cd21` "C1: F16 CFM matmul weights"
 
 ### Round-C1: F16 CFM matmul weights (opt-in, default OFF)
 
