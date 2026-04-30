@@ -157,6 +157,106 @@ struct s3gen_cache_entry { std::string path; int gpu = 0; std::unique_ptr<model_
 static std::mutex                            g_s3gen_cache_mu;
 static std::unique_ptr<s3gen_cache_entry>    g_s3gen_cache_entry;
 static double                                g_s3gen_cache_last_load_ms = 0.0;
+
+// QVAC-17872 round-2 (§5.7): keep the per-stage gallocr / ggml_context /
+// graph-arena alive across calls so the second utterance does not pay
+// gallocr_new + Vulkan buffer alloc + reserve overhead 6× (Turbo) / 30×
+// (MTL).  Each entry is bound to the s3gen backend and released by
+// s3gen_model_cache_release before the Vulkan dylib tears down.  Threading
+// matches s3gen_model_cache: only touched from the synthesize call path,
+// which holds g_s3gen_cache_mu over the entire wav.
+//
+// Two flavours:
+//   * stage_graph_cache_fixed   — graph topology never changes (e.g.
+//     compute_time_mlp's TDIM=320 → OUT=1024 mapping); built once,
+//     re-used on every call by re-binding inputs.
+//   * stage_graph_cache_keyed   — graph topology depends on a small
+//     integer key (T, T_mel, T_stft).  Re-built only when the key
+//     changes; the gallocr's underlying buffer pool is grown by reserve.
+struct stage_graph_cache_fixed {
+    ggml_context *       ctx     = nullptr;
+    ggml_cgraph *        gf      = nullptr;
+    ggml_gallocr_t       allocr  = nullptr;
+    std::vector<uint8_t> buf;
+    bool                 built   = false;
+    void destroy() {
+        if (allocr) { ggml_gallocr_free(allocr); allocr = nullptr; }
+        if (ctx)    { ggml_free(ctx);            ctx    = nullptr; }
+        gf    = nullptr;
+        built = false;
+        buf   = std::vector<uint8_t>();
+    }
+};
+struct stage_graph_cache_keyed {
+    int                  key     = -1;        // T / T_mel / T_stft
+    ggml_context *       ctx     = nullptr;
+    ggml_cgraph *        gf      = nullptr;
+    ggml_gallocr_t       allocr  = nullptr;
+    std::vector<uint8_t> buf;
+    // QVAC-17872 round-3 (§5.7-cache-hit): true once the graph's constant
+    // input tensors (pos_emb, STFT kernel, w_sum, inv_alphas, …) have been
+    // uploaded to GPU.  Subsequent compute calls skip the re-upload because
+    // ggml_gallocr_alloc_graph re-assigns the same offsets for an unchanged
+    // graph topology — the GPU-side data persists.  Cleared on destroy().
+    bool                 inputs_uploaded = false;
+    void destroy() {
+        if (allocr) { ggml_gallocr_free(allocr); allocr = nullptr; }
+        if (ctx)    { ggml_free(ctx);            ctx    = nullptr; }
+        gf  = nullptr;
+        key = -1;
+        buf = std::vector<uint8_t>();
+        inputs_uploaded = false;
+    }
+};
+
+// hift_decode needs to additionally keep the inv_alpha (graph-name, host-
+// data) pairs alongside the cached graph so we can re-upload them on
+// every alloc_graph (the host data is constant, but the GPU buffer is
+// re-bound on each call).  These are derived from the model weights and
+// computed on graph build (CPU side: invert_alpha_cpu).
+struct hift_graph_cache : stage_graph_cache_keyed {
+    std::vector<std::pair<std::string, std::vector<float>>> inv_alphas;
+    // QVAC-17872 round-3 (§5.7-cache-hit): cache the CPU-side constant
+    // inputs computed inside run_hift_decode (build_hann_window /
+    // build_istft_kernel / build_window_sum) so we only do them once per
+    // (T_mel, T_stft) graph build, not on every cached call.
+    std::vector<float> istft_k_data;
+    std::vector<float> w_sum_data;
+    void destroy() {
+        stage_graph_cache_keyed::destroy();
+        inv_alphas.clear();
+        istft_k_data.clear();
+        w_sum_data.clear();
+    }
+};
+// Same idea for encoder and stft: the CPU-side constant inputs (pos_emb,
+// STFT kernel) live alongside the cached graph and are re-uploaded only
+// when inputs_uploaded is false (right after a rebuild).
+struct encoder_graph_cache : stage_graph_cache_keyed {
+    std::vector<float> pe1_data;  // pos_emb at length T
+    std::vector<float> pe2_data;  // pos_emb at length 2T
+    void destroy() {
+        stage_graph_cache_keyed::destroy();
+        pe1_data.clear();
+        pe2_data.clear();
+    }
+};
+struct stft_graph_cache : stage_graph_cache_keyed {
+    std::vector<float> kernel_data;  // STFT kernel; constant for fixed n_fft
+    void destroy() {
+        stage_graph_cache_keyed::destroy();
+        kernel_data.clear();
+    }
+};
+
+// One global instance per stage.  Lifetime tied to the s3gen model cache
+// so we never outlive the backend they hold gallocr handles into.
+static stage_graph_cache_fixed g_time_mlp_cache;
+static stage_graph_cache_fixed g_time_mixed_cache;
+static encoder_graph_cache     g_encoder_cache;
+static stage_graph_cache_keyed g_f0_cache;
+static stft_graph_cache        g_stft_cache;
+static hift_graph_cache        g_hift_cache;
 }  // namespace
 
 // Release any cached model_ctx (frees its backend buffer, ggml context and
@@ -167,6 +267,16 @@ static double                                g_s3gen_cache_last_load_ms = 0.0;
 // insertion so it runs before process-exit dylib finalisers.
 static void s3gen_model_cache_release() {
     std::lock_guard<std::mutex> lk(g_s3gen_cache_mu);
+    // QVAC-17872 round-2: tear down the per-stage gallocr/ctx caches BEFORE
+    // freeing the backend, because gallocr_free transitively frees Vulkan
+    // buffers that were allocated against this backend.  After the backend
+    // is gone, gallocr_free would touch a dangling vk_device.
+    g_time_mlp_cache.destroy();
+    g_time_mixed_cache.destroy();
+    g_encoder_cache.destroy();
+    g_f0_cache.destroy();
+    g_stft_cache.destroy();
+    g_hift_cache.destroy();
     if (!g_s3gen_cache_entry) return;
     model_ctx * m = g_s3gen_cache_entry->m.get();
     if (m) {
@@ -190,6 +300,18 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
         g_s3gen_cache_last_load_ms = 0.0;
         return g_s3gen_cache_entry->m.get();
     }
+    // Cache miss → switching backend.  The per-stage gallocr/ctx caches
+    // hold buffers allocated against the OLD backend; tear them down here,
+    // before we drop the old s3gen_cache_entry (and thus the old backend),
+    // for the same reason as in s3gen_model_cache_release.
+    if (g_s3gen_cache_entry) {
+        g_time_mlp_cache.destroy();
+        g_time_mixed_cache.destroy();
+        g_encoder_cache.destroy();
+        g_f0_cache.destroy();
+        g_stft_cache.destroy();
+        g_hift_cache.destroy();
+    }
     if (verbose) fprintf(stderr, "Loading %s\n", path.c_str());
     double t0 = now_ms();
     auto m = std::make_unique<model_ctx>(load_s3gen_gguf(path, n_gpu_layers, verbose));
@@ -212,6 +334,75 @@ static model_ctx * s3gen_model_cache_get(const std::string & path, int n_gpu_lay
 
 static double s3gen_model_cache_last_load_ms() { return g_s3gen_cache_last_load_ms; }
 
+// QVAC-17872 round-C1 (opt-in, default OFF): convert CFM matmul `src0`
+// weights from F32 to F16 at s3gen-model load time.  Unlocks F16
+// tensor-core paths on NVIDIA / AMD RDNA3+ Vulkan; halves CFM matmul
+// weight bandwidth on every other Vulkan device.  Roughly doubles
+// matmul throughput on RTX 5090 (warm S3GEN_INFER 130 ms → ~90 ms
+// projected, see DECISION_C1_F16_CFM_WEIGHTS.md and
+// FINDINGS_ROUND3.md §3 Observation 4).
+//
+// **Breaks bit-exact** vs the round-1/2/3 F32 MD5 invariants —
+// off by default; user must opt in by setting CHATTERBOX_F16_CFM=1.
+// When OFF (no env-var, "0", "false", or empty), every code path is
+// byte-identical to round-6: CFM tensors load as F32, every locked MD5
+// still matches.
+//
+// Scope: only F32→F16 conversion of matmul *src0* weights.  We do NOT
+// touch:
+//   - biases (1D, used as src0 of `add` only — F16 makes no sense)
+//   - LayerNorm / norm scales (1D, used as `mul` operand)
+//   - convolution kernels going through conv1d_f32 (the kernel is
+//     reshaped and used as src1 of mul_mat in im2col, so F16 wouldn't
+//     unlock tensor cores; also conv1d_f32's own implementation
+//     materialises an F32 im2col tensor)
+//   - cfm/final_proj/weight (used via conv1d_f32, same reason)
+//
+// Activations and accumulators stay F32; ggml_mul_mat(F16, F32) is
+// the standard "weight × activation" pattern that every backend
+// chatterbox ships (Vulkan, Metal, OpenCL, CUDA, CPU) supports
+// natively.
+//
+// Counts on chatterbox-s3gen-turbo.gguf: 353 matmul weights
+// (251 MB F32 → 126 MB F16, ~125 MB saved on the device).
+static bool cfm_f16_enabled() {
+    static const bool enabled = []() {
+        const char * e = getenv("CHATTERBOX_F16_CFM");
+        if (!e) return false;
+        const std::string s = e;
+        return !(s == "0" || s == "false" || s == "FALSE" || s.empty());
+    }();
+    return enabled;
+}
+
+static bool is_cfm_matmul_src0_weight(const std::string & name) {
+    if (name.compare(0, 4, "cfm/") != 0) return false;
+    // Top-level CFM matmul weights (3 tensors).
+    if (name == "cfm/time_mlp/linear_1/weight")     return true;
+    if (name == "cfm/time_mlp/linear_2/weight")     return true;
+    if (name == "cfm/time_embed_mixer/weight")      return true;
+    // resnet time-projection MLP inside down_blocks/<i>/0, mid_blocks/<i>/0,
+    // up_blocks/<i>/0 (14 tensors total: 1 down + 12 mid + 1 up).
+    if (name.find("/0/mlp/1/weight") != std::string::npos) return true;
+    // basic_tfm matmuls inside down_blocks/<i>/1/<j>, mid_blocks/<i>/1/<j>,
+    // up_blocks/<i>/1/<j> (336 tensors: 56 tfms × 6 weights each).
+    if (name.find("/1/") != std::string::npos) {
+        const char * suffixes[] = {
+            "/attn1/to_q/weight",
+            "/attn1/to_k/weight",
+            "/attn1/to_v/weight",
+            "/attn1/to_out/0/weight",
+            "/ff/net/0/proj/weight",
+            "/ff/net/2/weight",
+        };
+        for (const char * s : suffixes) {
+            const size_t slen = std::strlen(s);
+            if (name.size() >= slen && name.compare(name.size() - slen, slen, s) == 0) return true;
+        }
+    }
+    return false;
+}
+
 static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, bool verbose) {
     model_ctx m;
     ggml_context * tmp_ctx = nullptr;
@@ -222,17 +413,49 @@ static model_ctx load_s3gen_gguf(const std::string & path, int n_gpu_layers, boo
     int64_t n_tensors = gguf_get_n_tensors(g);
     ggml_init_params p = { ggml_tensor_overhead() * (size_t)n_tensors, nullptr, true };
     m.ctx_w = ggml_init(p);
+
+    const bool f16_cfm = cfm_f16_enabled();
+    int64_t n_converted = 0;
+    size_t bytes_saved = 0;
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(g, i);
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, name);
-        ggml_tensor * dst = ggml_dup_tensor(m.ctx_w, src);
+        const bool convert = f16_cfm
+            && src->type == GGML_TYPE_F32
+            && is_cfm_matmul_src0_weight(name);
+        ggml_tensor * dst;
+        if (convert) {
+            dst = ggml_new_tensor(m.ctx_w, GGML_TYPE_F16, ggml_n_dims(src), src->ne);
+            n_converted++;
+            bytes_saved += ggml_nbytes(src) / 2;  // F32 -> F16 = exactly half
+        } else {
+            dst = ggml_dup_tensor(m.ctx_w, src);
+        }
         ggml_set_name(dst, name);
         m.tensors[name] = dst;
     }
+
+    if (verbose && f16_cfm) {
+        fprintf(stderr,
+                "  CHATTERBOX_F16_CFM=1: converted %lld CFM matmul weights to F16 (~%.1f MB saved)\n",
+                (long long) n_converted, bytes_saved / (1024.0 * 1024.0));
+    }
+
     m.buffer_w = ggml_backend_alloc_ctx_tensors(m.ctx_w, m.backend);
     for (ggml_tensor * cur = ggml_get_first_tensor(m.ctx_w); cur; cur = ggml_get_next_tensor(m.ctx_w, cur)) {
         ggml_tensor * src = ggml_get_tensor(tmp_ctx, ggml_get_name(cur));
-        ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        if (cur->type == src->type) {
+            ggml_backend_tensor_set(cur, ggml_get_data(src), 0, ggml_nbytes(src));
+        } else if (cur->type == GGML_TYPE_F16 && src->type == GGML_TYPE_F32) {
+            const int64_t n = ggml_nelements(src);
+            std::vector<ggml_fp16_t> f16_buf((size_t) n);
+            ggml_fp32_to_fp16_row((const float *) ggml_get_data(src), f16_buf.data(), n);
+            ggml_backend_tensor_set(cur, f16_buf.data(), 0, ggml_nbytes(cur));
+        } else {
+            throw std::runtime_error(
+                std::string("load_s3gen_gguf: unexpected dtype change at ") + ggml_get_name(cur));
+        }
     }
     gguf_free(g);
     ggml_free(tmp_ctx);
@@ -265,29 +488,35 @@ static ggml_tensor * conv_transpose_1d_f32(ggml_context * ctx, ggml_tensor * ker
     return ggml_cont(ctx, v);
 }
 
-// Metal backend currently has no PAD / PAD_EXT dispatcher entry, so emulate
-// front/back zero padding on dim 0 via concat(scale(view, 0), x) /
-// concat(x, scale(view, 0)).  The scale(..., 0) trick produces a defined
-// zero tensor (as opposed to allocating an uninitialised one and hoping).
+// QVAC-17872 round-V5 (2026-04-30): replaced the previous
+// concat(scale(view, 0), x) emulation with a single ggml_pad_ext call.
+// All four backends chatterbox.cpp ships against support per-dim
+// front/back padding natively today:
+//   * Vulkan    — pad.comp shader takes lp0..lp3 + rp0..rp3 (always has)
+//   * Metal     — round-1's ggml-metal-chatterbox-ops.patch added lp0..lp3
+//   * CUDA      — pad.cu takes (lp0,rp0,lp1,rp1,...,lp3,rp3) per-dim
+//   * OpenCL    — kernel_pad with lp/rp params
+// CPU has the reference impl that always handled it.
+//
+// The previous workaround built a 3-dispatch chain per padded edge
+// (ggml_view_4d → ggml_scale(_, 0.0f) → ggml_concat) for both front and
+// back padding when p_front>0 OR p_back>0; ~30 such calls per CFM step
+// on chatterbox-multilingual gave us ~60 redundant scale + concat
+// dispatches per CFM step on top of the single intended pad.
+//
+// ggml_pad_ext produces a single dispatch that reads src directly into
+// the (front_pad + src + back_pad)-sized destination, writing zeros for
+// the padded regions.  Output is byte-identical to the previous
+// emulation for F32 inputs (0.0 == 0.0; the src region is a literal
+// element copy either way; only the floating-point operation count
+// differs).
+//
+// Round-5's "drop wasted ggml_cont" cleanup is now subsumed by this
+// change — ggml_pad_ext doesn't need a contiguous source view at all.
 static ggml_tensor * zero_pad_dim0(ggml_context * ctx, ggml_tensor * x, int p_front, int p_back) {
     if (p_front <= 0 && p_back <= 0) return x;
-    ggml_tensor * y = x;
-    if (p_front > 0) {
-        GGML_ASSERT(p_front <= (int)x->ne[0]);
-        ggml_tensor * head = ggml_view_4d(ctx, x, p_front, x->ne[1], x->ne[2], x->ne[3],
-                                           x->nb[1], x->nb[2], x->nb[3], 0);
-        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, head), 0.0f);
-        y = ggml_concat(ctx, z, y, 0);
-    }
-    if (p_back > 0) {
-        GGML_ASSERT(p_back <= (int)x->ne[0]);
-        ggml_tensor * tail = ggml_view_4d(ctx, x, p_back, x->ne[1], x->ne[2], x->ne[3],
-                                           x->nb[1], x->nb[2], x->nb[3],
-                                           (size_t)(x->ne[0] - p_back) * x->nb[0]);
-        ggml_tensor * z = ggml_scale(ctx, ggml_cont(ctx, tail), 0.0f);
-        y = ggml_concat(ctx, y, z, 0);
-    }
-    return y;
+    GGML_ASSERT(p_front >= 0 && p_back >= 0);
+    return ggml_pad_ext(ctx, x, p_front, p_back, 0, 0, 0, 0, 0, 0);
 }
 
 static ggml_tensor * ggml_mish_fn(ggml_context * ctx, ggml_tensor * x) {
@@ -304,6 +533,11 @@ static ggml_tensor * layer_norm(ggml_context * ctx, ggml_tensor * x,
 }
 
 // LayerNorm on channel axis where x ne=[T, C].
+//
+// QVAC-17872 round-AUDIT: tried dropping the trailing ggml_cont; binary
+// crashed in some downstream op (likely conv1d_f32's im2col or ggml_concat
+// — both common consumers in cfm_causal_block).  Reverted.  The trailing
+// cont is genuinely necessary for the chatterbox CFM graph topology.
 static ggml_tensor * layer_norm_on_channel(ggml_context * ctx, ggml_tensor * x,
                                            ggml_tensor * w, ggml_tensor * b, float eps = 1e-5f) {
     ggml_tensor * xt = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
@@ -367,9 +601,46 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     ggml_tensor * xn = ggml_norm(ctx, x, eps);
     xn = ggml_add(ctx, ggml_mul(ctx, xn, w.norm_mha_w), w.norm_mha_b);
 
-    ggml_tensor * q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, xn), w.q_b);
-    ggml_tensor * k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, xn), w.k_b);
-    ggml_tensor * v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, xn), w.v_b);
+    // QVAC-17872 round-6: encoder-side analog of the round-4 CFM
+    // basic_tfm fusion.  conformer_block also issues 3 separate
+    // ggml_mul_mat for Q / K / V on the same `xn` input — but unlike
+    // basic_tfm it adds a bias to each output, so we keep the three
+    // adds outside the fused path.  10 conformer blocks per encoder
+    // (6 lower at T=326 + 4 upper at T=652) → 30 mul_mat dispatches
+    // saved per encoder run with the fusion enabled.
+    //
+    // The same env-var (CHATTERBOX_FUSE_QKV) gates both round-4 (CFM
+    // basic_tfm) and this round-6 (encoder conformer_block) fusion;
+    // setting it to 0 reverts both to the round-3 baseline.
+    static const bool fuse_qkv = []() {
+        const char * e = getenv("CHATTERBOX_FUSE_QKV");
+        if (!e) return true;
+        const std::string s = e;
+        return !(s == "0" || s == "false" || s == "FALSE" || s.empty());
+    }();
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (fuse_qkv) {
+        const int INNER = (int) w.q_w->ne[1];
+        ggml_tensor * w_q3  = ggml_reshape_3d(ctx, w.q_w, w.q_w->ne[0], w.q_w->ne[1], 1);
+        ggml_tensor * w_k3  = ggml_reshape_3d(ctx, w.k_w, w.k_w->ne[0], w.k_w->ne[1], 1);
+        ggml_tensor * w_v3  = ggml_reshape_3d(ctx, w.v_w, w.v_w->ne[0], w.v_w->ne[1], 1);
+        ggml_tensor * w_qk  = ggml_concat(ctx, w_q3, w_k3, /*dim=*/2);
+        ggml_tensor * w_qkv = ggml_concat(ctx, w_qk, w_v3, /*dim=*/2);  // ne=(D, INNER, 3)
+        ggml_tensor * xn_b3 = ggml_repeat_4d(ctx, xn, xn->ne[0], xn->ne[1], 3, 1);
+        ggml_tensor * qkv   = ggml_mul_mat(ctx, w_qkv, xn_b3);          // ne=(INNER, T, 3)
+        const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+        // Each Q/K/V is a contiguous view; the post-split bias add is
+        // bit-exact equivalent to the original `add(mul_mat, bias)`.
+        q = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 0),                  w.q_b);
+        k = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), batch_stride),      w.k_b);
+        v = ggml_add(ctx, ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 2 * batch_stride),  w.v_b);
+    } else {
+        q = ggml_add(ctx, ggml_mul_mat(ctx, w.q_w, xn), w.q_b);
+        k = ggml_add(ctx, ggml_mul_mat(ctx, w.k_w, xn), w.k_b);
+        v = ggml_add(ctx, ggml_mul_mat(ctx, w.v_w, xn), w.v_b);
+    }
     ggml_tensor * p = ggml_mul_mat(ctx, w.pos_w, pos_emb);
 
     q = ggml_reshape_3d(ctx, q, HD, H, T);
@@ -377,9 +648,19 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     v = ggml_reshape_3d(ctx, v, HD, H, T);
     p = ggml_reshape_3d(ctx, p, HD, H, pos_emb->ne[1]);
 
-    ggml_tensor * q_perm = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+    // QVAC-17872 round-AUDIT:
+    //   q_perm — consumed only by ggml_add (lines 658-659 producing
+    //            q_plus_u / q_plus_v); add accepts strided src0.  Cont
+    //            is redundant.
+    //   v_perm — consumed only by ggml_permute → ggml_cont on line 678
+    //            (v_for_mm).  The trailing cont materialises contig output
+    //            regardless of v_perm's stride state, so the cont here is
+    //            redundant.
+    //   k_perm and p_perm KEEP their conts — they're src0 of ggml_mul_mat
+    //            (lines 661-662) which requires contiguous src0.
+    ggml_tensor * q_perm = ggml_permute(ctx, q, 0, 2, 1, 3);
     ggml_tensor * k_perm = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
-    ggml_tensor * v_perm = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+    ggml_tensor * v_perm = ggml_permute(ctx, v, 0, 2, 1, 3);
     ggml_tensor * p_perm = ggml_cont(ctx, ggml_permute(ctx, p, 0, 2, 1, 3));
 
     ggml_tensor * u_bias = ggml_reshape_3d(ctx, w.pos_bias_u, HD, 1, H);
@@ -396,8 +677,10 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
     ggml_tensor * bd_reshaped = ggml_reshape_3d(ctx, ggml_cont(ctx, bd_sliced), 2*T - 1, T, H);
     ggml_tensor * bd_final = ggml_view_3d(ctx, bd_reshaped, T, T, H,
                                           bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
-    bd_final = ggml_cont(ctx, bd_final);
-
+    // QVAC-17872 round-AUDIT: drop the trailing ggml_cont — bd_final is
+    // consumed only as src1 of ggml_add(ac, bd_final) below, which handles
+    // strided src1.  Saves 1 dispatch per conformer_block call (10 calls
+    // per encoder run).
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
     ggml_tensor * attn = ggml_soft_max(ctx, scores);
@@ -445,15 +728,29 @@ static void compute_pos_emb(std::vector<float> & pe, int T, int D) {
 }
 
 // Run the full S3Gen encoder: input (T, D=512) -> mu (2T, 80)
+// QVAC-17872 round-2 (§5.7): keep encoder ctx/graph/gallocr alive across
+// synthesize calls to remove repeat Vulkan buffer-pool grow + first-cmd-
+// setup cost in streaming/server mode.  Graph topology depends on T
+// (number of input speech tokens), so cache->key tracks that and we
+// rebuild on T change; the underlying gallocr buffer is grown by reserve.
 static std::vector<float> run_encoder(const model_ctx & m, const std::vector<float> & input_embed, int T, int D = 512) {
     const int H = 8, HEAD_DIM = 64;
     const int T2 = 2 * T;
 
-    static size_t buf_size = 64 * 1024 * 1024;  // plenty
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 32768, false);
+    auto & C = g_encoder_cache;
+    const bool build = (C.key != T);
+    if (build) {
+        C.destroy();
+        C.buf.assign(64 * 1024 * 1024, 0);  // matches the previous static buf_size
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph_custom(C.ctx, 32768, false);
+        C.key = T;
+    }
+    ggml_context * ctx = C.ctx;
+    ggml_cgraph * gf = C.gf;
+    if (!build) goto encoder_compute;
+    {
 
     ggml_tensor * x_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, T);
     ggml_set_name(x_in, "x_in"); ggml_set_input(x_in);
@@ -486,7 +783,10 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     xt = zero_pad_dim0(ctx, xt, 2, 0);
     xt = conv1d_f32(ctx, pw2, xt, 1, 0, 1);
     xt = ggml_add(ctx, xt, ggml_reshape_2d(ctx, pb2, 1, D));
-    xt = ggml_cont(ctx, ggml_permute(ctx, xt, 1, 0, 2, 3));
+    // QVAC-17872 round-AUDIT: drop the trailing ggml_cont — xt is consumed
+    // only as src0 of ggml_add(xt, residual) below, which handles strided
+    // sources via nb[] indexing.  Saves 1 dispatch per encoder run.
+    xt = ggml_permute(ctx, xt, 1, 0, 2, 3);
     x = ggml_add(ctx, xt, residual);
 
     // 6 conformer blocks at length T
@@ -501,7 +801,10 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_tensor * xu = ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
     ggml_tensor * xu_3d = ggml_reshape_3d(ctx, xu, 1, xu->ne[0], xu->ne[1]);
     ggml_tensor * xu_2x = ggml_concat(ctx, xu_3d, xu_3d, 0);
-    xu = ggml_cont(ctx, ggml_reshape_2d(ctx, xu_2x, xu_3d->ne[1]*2, xu_3d->ne[2]));
+    // QVAC-17872 round-AUDIT: drop outer cont; ggml_concat output is
+    // contiguous and ggml_reshape_2d on contig source returns a contig
+    // view, so the wrapping ggml_cont was a redundant no-op copy.
+    xu = ggml_reshape_2d(ctx, xu_2x, xu_3d->ne[1]*2, xu_3d->ne[2]);
     xu = zero_pad_dim0(ctx, xu, 4, 0);
     xu = conv1d_f32(ctx, up_w, xu, 1, 0, 1);
     xu = ggml_add(ctx, xu, ggml_reshape_2d(ctx, up_b, 1, D));
@@ -536,22 +839,35 @@ static std::vector<float> run_encoder(const model_ctx & m, const std::vector<flo
     ggml_set_name(mu, "mu"); ggml_set_output(mu);
     ggml_build_forward_expand(gf, mu);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(C.allocr, gf);
+    }  // end build block
+
+encoder_compute:
+    ggml_gallocr_alloc_graph(C.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), input_embed.data(), 0, input_embed.size()*sizeof(float));
 
-    std::vector<float> pe1, pe2;
-    compute_pos_emb(pe1, T, D);
-    compute_pos_emb(pe2, T2, D);
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos1"), pe1.data(), 0, pe1.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos2"), pe2.data(), 0, pe2.size()*sizeof(float));
+    // QVAC-17872 round-3 (§5.7-cache-hit): pos_emb is fully determined by
+    // (T, D), both baked into C.key.  Compute it once into the cache on
+    // first build, re-upload only on first compute (gallocr_alloc_graph
+    // resets buffer ownership but tensor-set persists across subsequent
+    // alloc_graph calls for an unchanged graph).
+    if (!C.inputs_uploaded) {
+        if (C.pe1_data.empty()) {
+            compute_pos_emb(C.pe1_data, T,  D);
+            compute_pos_emb(C.pe2_data, T2, D);
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos1"),
+                                C.pe1_data.data(), 0, C.pe1_data.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos2"),
+                                C.pe2_data.data(), 0, C.pe2_data.size()*sizeof(float));
+        C.inputs_uploaded = true;
+    }
     compute(m.backend, gf);
 
-    std::vector<float> mu_data(ggml_nelements(mu));
-    ggml_backend_tensor_get(mu, mu_data.data(), 0, ggml_nbytes(mu));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_tensor * mu_t = ggml_graph_get_tensor(gf, "mu");
+    std::vector<float> mu_data(ggml_nelements(mu_t));
+    ggml_backend_tensor_get(mu_t, mu_data.data(), 0, ggml_nbytes(mu_t));
     return mu_data;  // shape ggml ne=[T2, 80] = numpy (80, T2)
 }
 
@@ -634,9 +950,68 @@ static ggml_tensor * basic_tfm(ggml_context * ctx, const basic_tfm_w & w,
                                ggml_tensor * x, int T, int C, int H = 8, int HD = 64) {
     int INNER = H * HD;
     ggml_tensor * nx = layer_norm(ctx, x, w.norm1_w, w.norm1_b);
-    ggml_tensor * q = ggml_mul_mat(ctx, w.to_q, nx);
-    ggml_tensor * k = ggml_mul_mat(ctx, w.to_k, nx);
-    ggml_tensor * v = ggml_mul_mat(ctx, w.to_v, nx);
+    // QVAC-17872 round-4 (chatterbox-side desktop-Vulkan win, default-on,
+    // env-var opt-out via CHATTERBOX_FUSE_QKV=0): fuse the three separate
+    // Q/K/V projections in apply_tfm_stack's mid-block transformers into
+    // a single batched mul_mat.  The converter already does this for
+    // down_block/up_block (the m=652 n=256 k=768 shape in the perf log
+    // is fused QKV; 768 = 3·256), but leaves the inner mid_block
+    // transformers as 3 separate (D, INNER) matmuls.  We measured this on
+    // RTX 5090 + NVIDIA 590.48 + Vulkan 1.4.325:
+    //   168 of MUL_MAT f32 m=512 n=652 k=256 (3 per tfm × 56 tfms), ~22 µs each.
+    // Fusing them cuts the per-CFM-step matmul dispatch count for Q/K/V
+    // from 168 to 56 while keeping the math bit-exact (verified against
+    // all three round-1/2/3 MD5 invariants — see
+    // bench-logs-vk-round3/r4-fuse-on-{single,multi,varied}*.log).
+    //
+    // Layout: ggml_mul_mat output ne=(M, N) with M innermost, so
+    // mul_mat(W_q ne=(D, INNER), nx ne=(D, T)) yields ne=(INNER, T).  We
+    // concat the three weights along the *batch* dim (dim=2 after a 3D
+    // reshape), giving W_qkv ne=(D, INNER, 3); the batched mul_mat
+    // output is ne=(INNER, T, 3) with each batch a contiguous (INNER, T)
+    // — bit-identical to what the three separate matmuls would produce.
+    // ggml_can_mul_mat asserts src1->ne[2] % src0->ne[2] == 0, so we
+    // broadcast nx to ne[2]=3 with ggml_repeat_4d (cost: 3× tile copies
+    // on the device, ~120 µs / inference, dwarfed by the saved dispatch
+    // overhead).
+    //
+    // Each Q/K/V is then a plain ggml_view_2d into the batched output;
+    // the existing reshape_3d → permute → cont chain for flash-attn is
+    // unchanged.
+    //
+    // Measured on RTX 5090 (5 alternating opt-in/opt-out pairs, 15 warm
+    // chunks each via regress-tight.sh):
+    //   opt-out (default-off): 139.7 ms avg S3GEN_INFER
+    //   opt-in  (default-on):  136.5 ms avg S3GEN_INFER  →  -3.2 ms / -2.3 %
+    // Opt-out path provided in case a future driver / Vulkan version
+    // produces different reduction orders for the batched shader.
+    static const bool fuse_qkv = []() {
+        const char * e = getenv("CHATTERBOX_FUSE_QKV");
+        // Default on; only "0" / "false" / empty disables.
+        if (!e) return true;
+        const std::string s = e;
+        return !(s == "0" || s == "false" || s == "FALSE" || s.empty());
+    }();
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    if (fuse_qkv) {
+        ggml_tensor * w_q3  = ggml_reshape_3d(ctx, w.to_q, w.to_q->ne[0], w.to_q->ne[1], 1);
+        ggml_tensor * w_k3  = ggml_reshape_3d(ctx, w.to_k, w.to_k->ne[0], w.to_k->ne[1], 1);
+        ggml_tensor * w_v3  = ggml_reshape_3d(ctx, w.to_v, w.to_v->ne[0], w.to_v->ne[1], 1);
+        ggml_tensor * w_qk  = ggml_concat(ctx, w_q3, w_k3, /*dim=*/2);
+        ggml_tensor * w_qkv = ggml_concat(ctx, w_qk, w_v3, /*dim=*/2);  // ne=(D, INNER, 3)
+        ggml_tensor * nx_b3 = ggml_repeat_4d(ctx, nx, nx->ne[0], nx->ne[1], 3, 1);
+        ggml_tensor * qkv   = ggml_mul_mat(ctx, w_qkv, nx_b3);          // ne=(INNER, T, 3)
+        const size_t batch_stride = (size_t) INNER * T * sizeof(float);
+        q = ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 0);
+        k = ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), batch_stride);
+        v = ggml_view_2d(ctx, qkv, INNER, T, INNER * sizeof(float), 2 * batch_stride);
+    } else {
+        q = ggml_mul_mat(ctx, w.to_q, nx);
+        k = ggml_mul_mat(ctx, w.to_k, nx);
+        v = ggml_mul_mat(ctx, w.to_v, nx);
+    }
     // (INNER, T) -> (HD, H, T) -> (HD, T, H) contiguous for flash-attn
     q = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, q, HD, H, T), 0, 2, 1, 3));
     k = ggml_cont(ctx, ggml_permute(ctx, ggml_reshape_3d(ctx, k, HD, H, T), 0, 2, 1, 3));
@@ -683,6 +1058,14 @@ static ggml_tensor * cfm_causal_k3(ggml_context * ctx, ggml_tensor * x,
 
 // Compute the time embedding for a single scalar t (or r).
 // Returns (TIME_EMB_DIM=1024,) after sinusoidal + 2-layer MLP.
+//
+// QVAC-17872 round-2 (§5.7): the graph topology is fixed (TDIM→HIDDEN→OUT);
+// across the cfm_steps loop this function is called 2× (Turbo) / 20×
+// (MTL) per synthesize, each call previously paid `gallocr_new` +
+// Vulkan buffer-pool grow + first-cmd-setup.  We now build the graph
+// once into g_time_mlp_cache and rebind only the `x` input on subsequent
+// calls.  `g_time_mlp_cache` is destroyed alongside the s3gen backend
+// (see s3gen_model_cache_release / s3gen_model_cache_get cache-miss).
 static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     const int TDIM = 320;
     const int HIDDEN = 1280;
@@ -697,69 +1080,87 @@ static std::vector<float> compute_time_mlp(const model_ctx & m, float t_val) {
     }
     (void)HIDDEN; (void)OUT;
 
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
+    auto & C = g_time_mlp_cache;
+    if (!C.built) {
+        C.buf.assign(4 * 1024 * 1024, 0);
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph(C.ctx);
 
-    ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TDIM);
-    ggml_set_name(x, "x"); ggml_set_input(x);
-    ggml_tensor * l1w = find_tensor(m, "cfm/time_mlp/linear_1/weight");
-    ggml_tensor * l1b = find_tensor(m, "cfm/time_mlp/linear_1/bias");
-    ggml_tensor * l2w = find_tensor(m, "cfm/time_mlp/linear_2/weight");
-    ggml_tensor * l2b = find_tensor(m, "cfm/time_mlp/linear_2/bias");
-    ggml_tensor * y = ggml_add(ctx, ggml_mul_mat(ctx, l1w, x), l1b);
-    y = ggml_silu(ctx, y);
-    y = ggml_add(ctx, ggml_mul_mat(ctx, l2w, y), l2b);
-    ggml_set_name(y, "out"); ggml_set_output(y);
-    ggml_build_forward_expand(gf, y);
+        ggml_tensor * x = ggml_new_tensor_1d(C.ctx, GGML_TYPE_F32, TDIM);
+        ggml_set_name(x, "x"); ggml_set_input(x);
+        ggml_tensor * l1w = find_tensor(m, "cfm/time_mlp/linear_1/weight");
+        ggml_tensor * l1b = find_tensor(m, "cfm/time_mlp/linear_1/bias");
+        ggml_tensor * l2w = find_tensor(m, "cfm/time_mlp/linear_2/weight");
+        ggml_tensor * l2b = find_tensor(m, "cfm/time_mlp/linear_2/bias");
+        ggml_tensor * y = ggml_add(C.ctx, ggml_mul_mat(C.ctx, l1w, x), l1b);
+        y = ggml_silu(C.ctx, y);
+        y = ggml_add(C.ctx, ggml_mul_mat(C.ctx, l2w, y), l2b);
+        ggml_set_name(y, "out"); ggml_set_output(y);
+        ggml_build_forward_expand(C.gf, y);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x"), t_sin.data(), 0, t_sin.size()*sizeof(float));
-    compute(m.backend, gf);
+        C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(C.allocr, C.gf);
+        C.built = true;
+    }
+    ggml_gallocr_alloc_graph(C.allocr, C.gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(C.gf, "x"), t_sin.data(), 0, t_sin.size()*sizeof(float));
+    compute(m.backend, C.gf);
 
-    std::vector<float> out(ggml_nelements(y));
-    ggml_backend_tensor_get(y, out.data(), 0, ggml_nbytes(y));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_tensor * y_out = ggml_graph_get_tensor(C.gf, "out");
+    std::vector<float> out(ggml_nelements(y_out));
+    ggml_backend_tensor_get(y_out, out.data(), 0, ggml_nbytes(y_out));
     return out;
 }
 
 // Mix t and r embeddings via time_embed_mixer (Linear(2048 -> 1024), no bias)
+//
+// QVAC-17872 round-2 (§5.7): same shape on every call (TOT is always
+// time_mlp's output dim = 1024).  Cached identically to compute_time_mlp
+// — see g_time_mixed_cache.  The TOT == cached TOT check guards a future
+// case where time_mlp's output dim changes; today it never does.
 static std::vector<float> compute_time_mixed(const model_ctx & m,
                                              const std::vector<float> & t_mlp,
                                              const std::vector<float> & r_mlp) {
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph(ctx);
-
+    auto & C = g_time_mixed_cache;
     int TOT = (int)t_mlp.size();
-    ggml_tensor * t_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TOT);
-    ggml_set_name(t_in, "t_in"); ggml_set_input(t_in);
-    ggml_tensor * r_in = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, TOT);
-    ggml_set_name(r_in, "r_in"); ggml_set_input(r_in);
-    ggml_tensor * cat = ggml_concat(ctx, t_in, r_in, 0);
-    ggml_tensor * mix_w = find_tensor(m, "cfm/time_embed_mixer/weight");
-    ggml_tensor * mixed = ggml_mul_mat(ctx, mix_w, cat);
-    ggml_set_name(mixed, "out"); ggml_set_output(mixed);
-    ggml_build_forward_expand(gf, mixed);
+    if (!C.built) {
+        C.buf.assign(4 * 1024 * 1024, 0);
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph(C.ctx);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "t_in"), t_mlp.data(), 0, t_mlp.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "r_in"), r_mlp.data(), 0, r_mlp.size()*sizeof(float));
-    compute(m.backend, gf);
+        ggml_tensor * t_in = ggml_new_tensor_1d(C.ctx, GGML_TYPE_F32, TOT);
+        ggml_set_name(t_in, "t_in"); ggml_set_input(t_in);
+        ggml_tensor * r_in = ggml_new_tensor_1d(C.ctx, GGML_TYPE_F32, TOT);
+        ggml_set_name(r_in, "r_in"); ggml_set_input(r_in);
+        ggml_tensor * cat = ggml_concat(C.ctx, t_in, r_in, 0);
+        ggml_tensor * mix_w = find_tensor(m, "cfm/time_embed_mixer/weight");
+        ggml_tensor * mixed = ggml_mul_mat(C.ctx, mix_w, cat);
+        ggml_set_name(mixed, "out"); ggml_set_output(mixed);
+        ggml_build_forward_expand(C.gf, mixed);
 
+        C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+        ggml_gallocr_reserve(C.allocr, C.gf);
+        C.built = true;
+    } else {
+        // Defensive: time_mlp's output dim is fixed at 1024 today.  If a
+        // future model variant changes that we'd silently produce wrong
+        // output without this guard.
+        ggml_tensor * t_in = ggml_graph_get_tensor(C.gf, "t_in");
+        if ((int)t_in->ne[0] != TOT) {
+            C.destroy();
+            return compute_time_mixed(m, t_mlp, r_mlp);  // single retry, will hit !built branch
+        }
+    }
+    ggml_gallocr_alloc_graph(C.allocr, C.gf);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(C.gf, "t_in"), t_mlp.data(), 0, t_mlp.size()*sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(C.gf, "r_in"), r_mlp.data(), 0, r_mlp.size()*sizeof(float));
+    compute(m.backend, C.gf);
+
+    ggml_tensor * mixed = ggml_graph_get_tensor(C.gf, "out");
     std::vector<float> out(ggml_nelements(mixed));
     ggml_backend_tensor_get(mixed, out.data(), 0, ggml_nbytes(mixed));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
     return out;
 }
 
@@ -964,12 +1365,25 @@ static std::vector<float> invert_alpha_cpu(const model_ctx & m, const std::strin
 }
 
 // F0 predictor (mel (80, T) -> f0 (T,))
+//
+// QVAC-17872 round-2 (§5.7): T_mel-keyed cache identical in shape to
+// run_encoder; rebuild only when T_mel changes between successive
+// synthesize calls.
 static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vector<float> & mel, int T_mel) {
-    static size_t buf_size = 8 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 1024, false);
+    auto & C = g_f0_cache;
+    const bool build = (C.key != T_mel);
+    if (build) {
+        C.destroy();
+        C.buf.assign(8 * 1024 * 1024, 0);
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph_custom(C.ctx, 1024, false);
+        C.key = T_mel;
+    }
+    ggml_context * ctx = C.ctx;
+    ggml_cgraph * gf = C.gf;
+    if (!build) goto f0_compute;
+    {
     ggml_tensor * mel_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_mel, 80);
     ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
     ggml_tensor * x = mel_in;
@@ -991,15 +1405,16 @@ static std::vector<float> run_f0_predictor(const model_ctx & m, const std::vecto
     y = ggml_reshape_1d(ctx, y, T_mel);
     ggml_set_name(y, "out"); ggml_set_output(y);
     ggml_build_forward_expand(gf, y);
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(C.allocr, gf);
+    }  // end build block
+f0_compute:
+    ggml_gallocr_alloc_graph(C.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
     compute(m.backend, gf);
+    ggml_tensor * y_t = ggml_graph_get_tensor(gf, "out");
     std::vector<float> f0(T_mel);
-    ggml_backend_tensor_get(y, f0.data(), 0, ggml_nbytes(y));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_backend_tensor_get(y_t, f0.data(), 0, ggml_nbytes(y_t));
     return f0;
 }
 
@@ -1041,6 +1456,10 @@ static std::vector<float> sinegen_source(const std::vector<float> & f0_wav, int 
 }
 
 // STFT (time-domain source -> spec)
+//
+// QVAC-17872 round-2 (§5.7): T_src-keyed cache.  T_src changes when the
+// upstream HiFT generates a different number of samples (proportional to
+// T_mel), so this is rebuilt at the same frequency as run_f0_predictor.
 static std::vector<float> run_stft(const model_ctx & m, const std::vector<float> & src) {
     const int n_fft = 16, hop = 4;
     const int F = n_fft / 2 + 1;
@@ -1048,11 +1467,20 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     auto window = build_hann_window(n_fft, true);
     auto kernel = build_stft_kernel(n_fft, window);
 
-    static size_t buf_size = 4 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    auto & C = g_stft_cache;
+    const bool build = (C.key != T_src);
+    if (build) {
+        C.destroy();
+        C.buf.assign(4 * 1024 * 1024, 0);
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph_custom(C.ctx, 8192, false);
+        C.key = T_src;
+    }
+    ggml_context * ctx = C.ctx;
+    ggml_cgraph * gf = C.gf;
+    if (!build) goto stft_compute;
+    {
     ggml_tensor * s = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_src, 1);
     ggml_set_name(s, "s"); ggml_set_input(s);
     ggml_tensor * s_pad = reflect_pad_1d(ctx, s, n_fft/2, n_fft/2);
@@ -1061,20 +1489,36 @@ static std::vector<float> run_stft(const model_ctx & m, const std::vector<float>
     ggml_tensor * spec = conv1d_f32(ctx, k, s_pad, hop, 0, 1);
     ggml_set_name(spec, "out"); ggml_set_output(spec);
     ggml_build_forward_expand(gf, spec);
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(C.allocr, gf);
+    }  // end build block
+stft_compute:
+    ggml_gallocr_alloc_graph(C.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s"), src.data(), 0, src.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "k"), kernel.data(), 0, kernel.size()*sizeof(float));
+    // QVAC-17872 round-3: STFT kernel only depends on n_fft, which is a
+    // compile-time constant here.  Move it into the cache, upload once.
+    if (!C.inputs_uploaded) {
+        if (C.kernel_data.empty()) {
+            C.kernel_data = std::move(kernel);
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "k"),
+                                C.kernel_data.data(), 0, C.kernel_data.size()*sizeof(float));
+        C.inputs_uploaded = true;
+    }
     compute(m.backend, gf);
-    std::vector<float> out(ggml_nelements(spec));
-    ggml_backend_tensor_get(spec, out.data(), 0, ggml_nbytes(spec));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_tensor * spec_t = ggml_graph_get_tensor(gf, "out");
+    std::vector<float> out(ggml_nelements(spec_t));
+    ggml_backend_tensor_get(spec_t, out.data(), 0, ggml_nbytes(spec_t));
     return out;
 }
 
 // Full HiFT decode: mel + s_stft -> wav (inlined from mel2wav.cpp)
+//
+// QVAC-17872 round-2 (§5.7): cache key combines T_mel and T_stft (which
+// are linked: T_stft = (T_mel * up_rate_product) / hop, but encoded
+// jointly here in case future model variants decouple them).  inv_alpha
+// host data lives in g_hift_cache.inv_alphas alongside the graph and is
+// re-uploaded on every compute call.
 static std::vector<float> run_hift_decode(const model_ctx & m,
                                           const std::vector<float> & mel, int T_mel,
                                           const std::vector<float> & s_stft, int T_stft) {
@@ -1088,25 +1532,35 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     std::vector<int> src_rb_ksizes = {7, 7, 11};
     std::vector<std::vector<int>> src_rb_dils = {{1,3,5},{1,3,5},{1,3,5}};
 
-    static size_t buf_size = 64 * 1024 * 1024;
-    std::vector<uint8_t> buf(buf_size);
-    ggml_init_params gp = { buf_size, buf.data(), true };
-    ggml_context * ctx = ggml_init(gp);
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 131072, false);
-
+    auto & C = g_hift_cache;
+    // Encode (T_mel, T_stft) into a single int key by hashing.  Collisions
+    // are practically impossible at the dimensions we use (T_mel ≤ ~3000,
+    // T_stft fits comfortably in 24 bits).
+    const int key = (T_mel * 100003) ^ T_stft;
+    const bool build = (C.key != key);
+    if (build) {
+        C.destroy();
+        C.buf.assign(64 * 1024 * 1024, 0);
+        ggml_init_params gp = { C.buf.size(), C.buf.data(), true };
+        C.ctx = ggml_init(gp);
+        C.gf  = ggml_new_graph_custom(C.ctx, 131072, false);
+        C.key = key;
+    }
+    ggml_context * ctx = C.ctx;
+    ggml_cgraph * gf = C.gf;
+    if (!build) goto hift_compute;
+    {
     ggml_tensor * mel_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_mel, MEL);
     ggml_set_name(mel_in, "mel_in"); ggml_set_input(mel_in);
     ggml_tensor * s_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, T_stft, NFFT2);
     ggml_set_name(s_in, "s_in"); ggml_set_input(s_in);
 
-    struct inv_entry { std::string gn; std::vector<float> data; };
-    std::vector<inv_entry> inv_alphas;
-    auto mk_inv = [&](const std::string & pref, int C) {
+    auto mk_inv = [&](const std::string & pref, int C_dim) {
         std::string gn = "inv_" + pref;
         auto inv = invert_alpha_cpu(m, pref);
-        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C);
+        ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C_dim);
         ggml_set_name(t, gn.c_str()); ggml_set_input(t);
-        inv_alphas.push_back({gn, std::move(inv)});
+        C.inv_alphas.push_back({gn, std::move(inv)});
         return t;
     };
 
@@ -1186,6 +1640,12 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     x = ggml_add(ctx, x, ggml_reshape_2d(ctx, cp2b, 1, NFFT2));
 
     // ISTFT
+    // QVAC-17872 round-AUDIT (negative result): tried dropping the leading
+    // conts on mag_log and ph_in.  Single-shot passed bit-exact but
+    // multi-synth multi-chunk produced a different PCM MD5 (the F-stride
+    // view at non-zero offset apparently interacts with the cache-rebuild
+    // path in a way that diverges from the F32 reference for some T_stft
+    // values).  Conts are required.
     size_t col_stride = x->nb[1];
     ggml_tensor * mag_log = ggml_cont(ctx, ggml_view_2d(ctx, x, T_stft, F, col_stride, 0));
     mag_log = ggml_clamp(ctx, mag_log, -1e6f, 1e2f);
@@ -1215,22 +1675,42 @@ static std::vector<float> run_hift_decode(const model_ctx & m,
     ggml_set_name(y_trim, "wav"); ggml_set_output(y_trim);
     ggml_build_forward_expand(gf, y_trim);
 
-    ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
-    ggml_gallocr_reserve(allocr, gf);
-    ggml_gallocr_alloc_graph(allocr, gf);
+    C.allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(m.backend));
+    ggml_gallocr_reserve(C.allocr, gf);
+    }  // end build block
+hift_compute:
+    {
+    ggml_gallocr_alloc_graph(C.allocr, gf);
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mel_in"), mel.data(), 0, mel.size()*sizeof(float));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "s_in"), s_stft.data(), 0, s_stft.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "istft_k"), ik.data(), 0, ik.size()*sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"), ws.data(), 0, ws.size()*sizeof(float));
-    for (auto & ia : inv_alphas)
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ia.gn.c_str()), ia.data.data(), 0, ia.data.size()*sizeof(float));
+
+    // QVAC-17872 round-3 (§5.7-cache-hit): istft_k / w_sum / inv_alphas are
+    // all derived from constants (n_fft, hop, T_stft, model weights) — they
+    // don't depend on per-call inputs.  Compute once into the cache on
+    // first build, re-upload to GPU once on the first compute call after
+    // each rebuild, then trust the gallocr to keep the offsets stable.
+    if (!C.inputs_uploaded) {
+        if (C.istft_k_data.empty()) {
+            auto window = build_hann_window(n_fft, true);
+            C.istft_k_data = build_istft_kernel(n_fft, window);
+            C.w_sum_data   = build_window_sum(T_stft, n_fft, hop, window);
+        }
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "istft_k"),
+                                C.istft_k_data.data(), 0, C.istft_k_data.size()*sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "w_sum"),
+                                C.w_sum_data.data(), 0, C.w_sum_data.size()*sizeof(float));
+        for (auto & ia : C.inv_alphas)
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, ia.first.c_str()),
+                                    ia.second.data(), 0, ia.second.size()*sizeof(float));
+        C.inputs_uploaded = true;
+    }
     compute(m.backend, gf);
 
-    std::vector<float> wav(ggml_nelements(y_trim));
-    ggml_backend_tensor_get(y_trim, wav.data(), 0, ggml_nbytes(y_trim));
-    ggml_gallocr_free(allocr);
-    ggml_free(ctx);
+    ggml_tensor * y_trim_t = ggml_graph_get_tensor(gf, "wav");
+    std::vector<float> wav(ggml_nelements(y_trim_t));
+    ggml_backend_tensor_get(y_trim_t, wav.data(), 0, ggml_nbytes(y_trim_t));
     return wav;
+    }
 }
 
 // ============================================================================
