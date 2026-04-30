@@ -458,6 +458,22 @@ static ggml_tensor * conformer_block(ggml_context * ctx, const conformer_w & w,
                                           bd_reshaped->nb[1], bd_reshaped->nb[2], 0);
     bd_final = ggml_cont(ctx, bd_final);
 
+    // Rel-pos Conformer MHA is kept on the classic ggml_soft_max +
+    // separate V mat-mul path rather than ggml_flash_attn_ext because
+    // the f16 cast of the relative-position bias `bd_final` (which
+    // flash_attn_ext requires for its mask argument — ggml.c:5320
+    // GGML_ASSERT(mask->type == GGML_TYPE_F16)) drifts the softmax
+    // output by ~1e-4 per block, which compounds through the
+    // 10-step CFM estimator downstream and fails the WAV quality
+    // gate (cos 0.998647 vs required > 0.9998, md5 differs vs the
+    // §3.22 reference 79002f09bc48dda95ec0c2cfc2b895bd). Measured
+    // speed upside was −13 ms S3Gen / −1.8 % total on M3 Ultra with
+    // Metal, Q4_0, Spanish prompt, seed 42 — real but not worth
+    // trading against the audio quality threshold. See PROGRESS
+    // §3.25 for the full negative-finding writeup. Same pattern
+    // works on parakeet.cpp (see §15.8 there) because parakeet's
+    // downstream is a joint argmax over tokens, which is invariant
+    // to sub-bit-15 precision drift in attention scores.
     ggml_tensor * scores = ggml_add(ctx, ac, bd_final);
     scores = ggml_scale(ctx, scores, 1.0f / std::sqrt((float)HD));
     ggml_tensor * attn = ggml_soft_max(ctx, scores);

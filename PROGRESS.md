@@ -3092,3 +3092,116 @@ reasons the realised win is smaller:
 | [scripts/requantize-gguf.py](scripts/requantize-gguf.py) | `should_quantize()` now allows 3-D when `shape[-1]` (= ne[0] = K) is block-aligned (forward-compatible no-op for HiFT today); `f16` added as a target dtype; new `--name-filter SUBSTRING` arg; pass-through path branches on `GGML_QUANT_SIZES[type][0] == 1` to handle already-quantised sources without reshape errors. |
 | `models/chatterbox-s3gen-mtl-q4_0_hift_f16.gguf` | New GGUF artifact (gitignored, 754 MB).  Recipe documented in the script's docstring + this section. |
 
+
+### 3.25  S3Gen flow-encoder `ggml_flash_attn_ext` — _negative finding_
+
+Tried flipping `src/chatterbox_tts.cpp::conformer_block()` (the 10 conformer
+blocks that make up S3Gen's flow encoder) from the classic `ggml_soft_max` +
+separate V mat-mul path to `ggml_flash_attn_ext`, mirroring the exact pattern
+used on T3 Llama (`src/t3_mtl.cpp:221 / 425`) and on CFM `basic_tfm`
+(`src/chatterbox_tts.cpp:712 / 800`), plus the `rel_pos_mha_graph` fix just
+landed on `parakeet.cpp` (§15.8 there).
+
+**Implementation (reverted, kept here as documentation):**
+
+```cpp
+const float scale = 1.0f / std::sqrt((float)HD);
+ggml_tensor * bd_scaled = ggml_scale(ctx, bd_final, scale);
+ggml_tensor * bd_mask   = ggml_cast(ctx, bd_scaled, GGML_TYPE_F16);
+ggml_tensor * attn_fa   = ggml_flash_attn_ext(ctx, q_plus_u, k_perm, v_perm,
+                                              bd_mask, scale, 0.0f, 0.0f);
+ggml_tensor * flat      = ggml_reshape_2d(ctx, attn_fa, HD * H, T);
+```
+
+Math is byte-correct: non-flash path is `softmax(scale * (q*k^T + bd_final)) * v
+= softmax(scale * q*k^T + scale * bd_final) * v`, and flash_attn_ext computes
+`softmax(scale * q*k^T + mask) * v`, so `mask = scale * bd_final` is the
+equivalent. Flow encoder runs single-window (no chunk mask) so no `att_mask`
+to fold in.
+
+#### Measured speedup was real
+
+| Stage (M3 Ultra, Metal, Q4_0, ES prompt, seed 42, 3 invocations averaged) | baseline | FA        | Δ                |
+|------|---------:|----------:|-----------------:|
+| `[encoder]` ms   |  ~43     |    29.6  | **−13 / −31 %** (flow encoder only) |
+| S3Gen ms         |   721    |   708    | **−13 / −1.8 %** |
+| T3 ms            |   433    |   430    | noise            |
+| CFM total ms     |   546    |   538    | noise (−8)       |
+| HiFT decode ms   |   126    |   125    | noise            |
+| WAV md5          | `79002f09…` | `a4169d68…` | **differs** |
+
+The flow encoder is 10 conformer blocks (6 at T=~87 + 4 at 2T), each running
+two sub-block matmuls + softmax + permute+mul_mat with V. Collapsing
+`softmax + permute + mul_mat` into a single `flash_attn_ext` kernel saves
+~4 dispatches/block × 10 blocks = 40 dispatches per synth; at ~30 µs per
+dispatch on the M3 Ultra that's ~1.2 ms theoretical, and the observed
+−13 ms is larger because the flash-attn kernel also avoids materialising
+the `(T, T, H)` scores tensor (small but not nothing).
+
+#### Why it was reverted
+
+The `ggml_flash_attn_ext` contract requires an f16 mask
+(`ggml.c:5320 GGML_ASSERT(mask->type == GGML_TYPE_F16)`). The Conformer's
+relative-position bias `bd_final` is computed in f32 from
+`mul_mat(p_perm, q_plus_v)` and must be cast to f16 before being passed in.
+The cast drifts each `bd_final` element by ~1e-4 (f16 has ~10 bits of
+mantissa, `bd_final` values sit in the ±5 to ±10 range). That drift is
+well below what parakeet's downstream argmax classifier can see, but
+chatterbox's downstream is very different:
+
+1. Flow encoder output → **10-step CFM estimator** (a diffusion U-Net). Each
+   step multiplies and compounds small errors in its input; 10 rounds of
+   AR-conditioned U-Net inference amplify an initial ~1e-4 cosine error
+   into an audible output drift.
+2. CFM output → **HiFT vocoder**, which produces a waveform. Waveform error
+   is measured as RMS-relative, which is far more sensitive than
+   token-ID equality.
+
+Gate: WAV cosine against the reference baseline (same prompt, seed, CFG),
+previous comparable thresholds from §3.24 were cos > 0.9998. The FA
+variant measured:
+
+```
+lengths  base=83520  fa=83520
+samples  n=83520  cos=0.998647
+rms_diff=69.334   rms_base=1332.522
+max_abs_diff=1702.0   gate: FAIL (threshold > 0.9998; got 0.998647)
+```
+
+Parakeet could absorb this drift (PR #1 §15.8 shipped it at exact token-ID
+parity across 95 tokens). Chatterbox cannot. Reverted — baseline md5
+restored to `79002f09bc48dda95ec0c2cfc2b895bd` at
+`/tmp/cb_revert.wav == /tmp/cb_base_1.wav`.
+
+#### Options explored and rejected
+
+1. **Pass `bd_scaled` in f32 via `ggml_flash_attn_ext`**. Blocked by the
+   hard assertion that mask must be f16.
+2. **Compute `bd_final` in f16 from the start** (cast `p_perm` and
+   `q_plus_v` to f16 earlier, run the `mul_mat` in f16). Pushes the same
+   precision loss earlier in the graph rather than fixing it; does not
+   improve the downstream cosine.
+3. **Skip the mask entirely** (pass nullptr to flash_attn_ext). Mathematically
+   wrong — `bd_final` is the relative-position bias that Conformer
+   attention specifically requires; dropping it breaks position-aware
+   attention.
+
+#### What to do instead
+
+Conformer flow-encoder stays on the `ggml_soft_max` path. Next candidate
+encoder-side optimisations are:
+
+- **Strip redundant `ggml_cont` after Conformer Q/K/V permutes** (lines
+  440–443 of `src/chatterbox_tts.cpp`). Metal's `mul_mat` can walk strides
+  natively; some of those `cont` copies may be removable without changing
+  math. Tracked as QW-D in today's planning notes.
+- **F32 `mul_mm + add(bias)` shader fusion in
+  `patches/ggml-metal-chatterbox-ops.patch`** (the estimate +10–25 ms on
+  S3Gen — CFM transformer batched mat-muls). Already queued in §3.24
+  follow-ups.
+
+#### Files touched (reverted)
+
+| File | Change |
+|------|--------|
+| [src/chatterbox_tts.cpp](src/chatterbox_tts.cpp) | 10-line commentary block added to `conformer_block()` explaining why the flash-attn path is intentionally not taken, pinning the negative-finding cosine number and the speed upside that was measured, and pointing at the parakeet §15.8 counterexample. No code change to the graph itself. |
