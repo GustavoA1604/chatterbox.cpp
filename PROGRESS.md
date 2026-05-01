@@ -3928,3 +3928,127 @@ Three items still deferred:
    not done because chatterbox / T3 / CFM don't emit those
    after a mul_mat+bias pair.  Useful infra for downstream
    consumers of this patch (stable-diffusion.cpp / tts-cpp).
+
+### 3.31  iOS-arm64 cross-build + M4 validation harness (`scripts/bench-m4-validation.sh`)
+
+Closes the validation gap left by §3.24 / §3.26 / §3.27 / §3.28 / §3.30
+— all of those predict positive-on-bandwidth-limited-hardware
+(M4 Air / iPhone / iPad) but were measured only on M3 Ultra where
+per-dispatch overhead is so low that the fusion wins largely
+cancel out against kernel-path overhead.  Two pieces:
+
+#### 1. iOS-arm64 build portability
+
+Cross-compiled `libggml-metal.a` + `libtts-cpp.a` for iOS 14.0+
+arm64 on this M3 Ultra host (Xcode 16 / iOS 18.5 SDK):
+
+```
+cmake -S . -B build-ios \
+  -DCMAKE_SYSTEM_NAME=iOS \
+  -DCMAKE_OSX_SYSROOT=iphoneos \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+  -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON \
+  -DGGML_NATIVE=OFF -DGGML_BLAS=OFF -DGGML_ACCELERATE=OFF
+cmake --build build-ios --target tts-cpp ggml-metal -j
+```
+
+Both libraries produce clean `arm64`-only archives:
+
+```
+build-ios/ggml/src/ggml-metal/libggml-metal.a: arm64
+build-ios/libtts-cpp.a: arm64
+```
+
+That's the **structural validation** that §3.26's
+`kernel_mul_mv_f32_f16{,_4,_short}` variants and §3.27 / §3.28 /
+§3.30's `kernel_mul_mm` FC-gated bias / gelu_erf fold-ins are
+iOS-portable — none of the kernel code uses macOS-only
+intrinsics.  Runtime validation still requires a real iOS device
+(TestFlight / Xcode device provisioning); this confirms there's
+no compile-time barrier to shipping.
+
+#### 2. `scripts/bench-m4-validation.sh`
+
+Self-contained harness the user runs on any Apple-silicon Mac
+(M4 Air / M4 Pro / M3 / etc.) or any host that mounts the model
+GGUFs.  Pipeline:
+
+1. Apply the pinned ggml patch via `scripts/setup-ggml.sh`
+2. Configure + build `build-metal` (Release, GGML_METAL=ON,
+   GGML_BLAS=OFF, GGML_NATIVE=ON)
+3. Run `test-metal-ops` — asserts all 14 gates PASS (3 base
+   diag/pad + 3 conv_transpose_1d HiFT + 8 fused-mul_mm)
+4. Run 5 invocations of `chatterbox` on the Spanish-prompt
+   baseline (Q4_0 + HiFT F16 v2 GGUF + seed 42)
+5. Collect per-run `[encoder]` / `[cfm_total]` / `[hift_decode]` /
+   `S3GEN_INFER_MS` / `T3_INFER_MS`
+6. Compute means, compare against the M3 Ultra reference baked
+   into the script header:
+
+       M3U CFM   = 534.0 ms
+       M3U S3Gen = 706.6 ms
+       M3U T3    = 432.6 ms
+       M3U HiFT  = 121.1 ms
+
+7. Check WAV determinism (all 5 runs same md5) and byte-exactness
+   vs the M3U reference md5 `d8a1b22375dbcb2259c686426a7d76c5`
+8. Write `artifacts/bench/m4-validation.json` with the full
+   comparison + host info (chip, model)
+
+Dependencies on the target host:
+
+- macOS + Xcode command-line tools (`cmake`, `clang++`)
+- Python 3 (for `scripts/setup-ggml.sh`'s gguf tooling)
+- Model GGUFs at the usual paths (or override via env vars:
+  `T3_GGUF=... S3GEN_GGUF=... REF_WAV=... RUNS=... bash scripts/bench-m4-validation.sh`)
+- ~16 GB disk for model + build artefacts
+
+Example predicted output on M4 Air (hypothetical; actual to be
+captured when the script runs on M4 hardware):
+
+```
+=== Summary: Apple M4 vs M3 Ultra reference ===
+stage                 M3 Ultra (ref)       this host       Δ vs M3U
+[cfm_total] ms                 534.0           ~XXX.X      -A / -B%
+S3GEN_INFER_MS                 706.6           ~YYY.Y      -C / -D%
+```
+
+The `Δ` column tells us whether the §3.27 / §3.28 / §3.30
+predicted-positive story holds.  If M4 shows noticeably smaller
+CFM than M3U after accounting for M4's higher single-core clock,
+the shipping portfolio is vindicated.  If M4 matches M3U or
+regresses, §3.27 / §3.30 should be re-examined.
+
+#### Self-smoke on M3 Ultra
+
+Ran the script locally as a sanity check — expected to show
+"this host == reference" with no deltas:
+
+```
+=== Summary: Apple M3 Ultra vs M3 Ultra reference ===
+stage                 M3 Ultra (ref)       this host       Δ vs M3U
+[cfm_total] ms                 534.0           533.7    -0.3 (-0.1%)
+S3GEN_INFER_MS                 706.6           707.4    +0.8 (+0.1%)
+T3_INFER_MS                    432.6           434.6    +2.0 (+0.5%)
+[hift_decode] ms               121.1           123.1    +2.0 (+1.7%)
+
+=== Parity ===
+determinism: PASS  (md5 d8a1b22375dbcb2259c686426a7d76c5 stable across 5 runs)
+byte-exact vs M3 Ultra: PASS (d8a1b22375dbcb2259c686426a7d76c5)
+```
+
+All deltas within per-invocation stdev.  Script is ready to
+scp + run on any M4 / M3 / M2 box.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| [scripts/bench-m4-validation.sh](scripts/bench-m4-validation.sh) | New 150-line bash script.  Self-contained: pins the M3 Ultra reference numbers, runs test-metal-ops, 5-invocation bench, compares, writes JSON. |
+
+#### Next
+
+- Run the script on an M4 Air (user action: `scp -r chatterbox.cpp m4:` + `scp models/*.gguf m4:.../models/` + `ssh m4 'bash chatterbox.cpp/scripts/bench-m4-validation.sh'` + `scp m4:.../artifacts/bench/m4-validation.json .`).
+- If M4 results confirm the prediction: update the §3.27 / §3.28 / §3.30 sections with the M4 numbers alongside M3U.
+- If M4 results contradict the prediction: file a follow-up to revisit the fusion costs on smaller Apple silicon.
