@@ -3509,3 +3509,135 @@ costs ~an equal amount. Net: neutral on M3 Ultra.
 - **Bench on M4 / iOS** — validate the "neutral on M3U, positive
   elsewhere" prediction. Until measured the estimate is just
   that.
+
+### 3.28  `mul_mm + ADD(bias) + GELU_ERF` fusion — CFM FF activation path
+
+Builds directly on §3.27 infrastructure.  Closes the `mul_mat →
+add(bias) → gelu_erf` triple in CFM `basic_tfm`'s FF gate projection
+(`src/chatterbox_tts.cpp:738`):
+
+```cpp
+ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff0_w, nx2), w.ff0_b);  // (mul_mat + bias) — fused by §3.27
+ff = ggml_gelu_erf(ctx, ff);                                    // §3.28 absorbs this into the same kernel
+ff = ggml_add(ctx, ggml_mul_mat(ctx, w.ff2_w, ff), w.ff2_b);    // ff2 remains a separate mul_mm + bias fusion
+```
+
+§3.27 already brought `mul_mat + add(bias)` into a single dispatch
+via the shmem-backed scalar-copy path; §3.28 extends that same
+loop to apply `gelu_erf` as the last stage before writing to dst.
+The gelu is inline FP math on each element we're already reading /
+writing — **no extra memory roundtrip, no extra shmem** — so unlike
+§3.27's neutral-on-M3-Ultra result, this one is a clear net
+positive on M3 Ultra.
+
+#### What lands
+
+1. **`ggml-metal.metal`**: new function constant `FC_MUL_MM + 4`
+   (`FC_mul_mm_has_gelu_erf_`), new branch at the end of the
+   scalar-copy loop that applies the same `0.5 * v * (1 +
+   erf_approx(v * SQRT_2_INV))` formula the standalone
+   `OP_UNARY_NUM_GELU_ERF` kernel uses.  Numerically identical to
+   the unfused path (proven via md5 byte-exact across 5 runs).
+
+2. **`get_pipeline_mul_mm`**: signature bumped to
+   `(op, has_bias, has_residual, has_gelu_erf)`; pipeline name
+   extended with `_gelu=N`; FC + shmem sizing adjusted to keep the
+   shmem path (8 KB) when any fold-in is active.
+
+3. **Dispatcher `ggml_metal_op_mul_mat` mul_mm path**: new
+   `{MUL_MAT, ADD, UNARY}` can_fuse lookup wedged between the
+   `{MUL_MAT, ADD, ADD}` residual lookup and the
+   `{MUL_MAT, ADD}` bias-only fallback.  Verifies
+   `ggml_get_unary_op(f2) == GGML_UNARY_OP_GELU_ERF` and that
+   `f2->src[0] == f1` before fusing.  Gates on GELU_ERF
+   specifically because that's the one `basic_tfm` uses;
+   other unary sub-ops (SILU, GELU, RELU, GELU_QUICK, ...) are
+   left as independent follow-up work — same pattern would extend
+   trivially.
+
+#### Pipeline names actually compiled
+
+(from `GGML_LOG_DEBUG` compile trace on first invocation)
+
+```
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0_gelu=1   ← CFM ff0 (gelu_erf-activated)
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0_gelu=1   ← ff0 edge blocks
+kernel_mul_mm_q4_0_f32_bci=0_bco=0_bias=1_res=0_gelu=0   ← CFM ff2 / to_out (bias only, §3.27)
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=1_res=0_gelu=0
+kernel_mul_mm_f32_f32_bci=0_bco=0_bias=1_res=0_gelu=0    ← time_mlp / final_proj
+kernel_mul_mm_f32_f32_bci=0_bco=1_bias=1_res=0_gelu=0
+kernel_mul_mm_q4_0_f32_bci=0_bco=1_bias=0_res=0_gelu=0   ← unfused (no-bias) passthroughs
+kernel_mul_mm_f32_f32_bci=1_bco=1_bias=0_res=0_gelu=0
+```
+
+The `gelu=1` variants correspond to 56 basic_tfm blocks × 10 CFM
+steps × 2 CFG batches = **1120 saved `gelu_erf` dispatches per
+synth** (on top of the 1820 bias-add dispatches saved in §3.27).
+
+#### Bench (M3 Ultra, Metal, Q4_0 + HiFT F16, ES prompt, seed 42, 5 invocations)
+
+| Metric             | §3.27 (bias only) | §3.28 (+ gelu) | Δ                     |
+|--------------------|------------------:|---------------:|----------------------:|
+| `[encoder]` ms     |     30.5          |    30.8        | noise                 |
+| `[cfm_total]` ms   |    542.2          |   **533.4 ± 1.0**  | **−8.8 / −1.6 %** |
+| `[hift_decode]` ms |    121.2          |   120.8        | neutral               |
+| S3GEN_INFER_MS     |    713.2          |   **706.0 ± 0.8**  | **−7.2 / −1.0 %** |
+| T3_INFER_MS        |    433.4          |   431.0        | noise                 |
+| md5                | `d8a1b22…`       | `d8a1b22…`    | **byte-exact ×5**     |
+
+#### Parity gates
+
+- `test-metal-ops`: all 4 pre-existing ops (diag_mask_inf, pad_ext,
+  conv_transpose_1d × 3 + tiny) PASS.
+- WAV md5 byte-exact vs §3.26 / §3.27 baseline (`d8a1b22375dbcb2259c686426a7d76c5`)
+  across all 5 invocations of the fused build.  The fused
+  kernel uses the same `erf_approx<T>(x)` helper as the standalone
+  GELU_ERF unary op, so the math is identical down to the LSB.
+- Determinism across runs: md5 stable.
+
+#### Why this time it's not neutral on M3 Ultra (unlike §3.27)
+
+§3.27's gain was eaten by the shmem-roundtrip cost: routing
+through `temp_str` + sgitg==0 scalar copy costs roughly what the
+1820 eliminated `ggml_add` dispatches saved.  §3.28 adds the gelu
+fold-in **into the same loop** — no additional memory accesses,
+no barriers, no extra shmem — just a handful of FLOPs per element.
+So the 1120 saved `gelu_erf` dispatches show up as a clean net
+positive:  −8.8 ms CFM / −7.2 ms S3Gen.
+
+This also refines the §3.27 story: the infrastructure we built
+there is what makes §3.28 cheap.  Fusing additional per-element
+tail ops into the existing scalar-copy loop is essentially free,
+whereas routing through the shmem path is what cost M3 Ultra its
+estimated §3.27 win.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `ggml/src/ggml-metal/ggml-metal.metal` | New FC `FC_MUL_MM + 4` (has_gelu_erf); gelu_erf branch in the scalar-copy loop using `erf_approx<float>`; shared early-out condition updated to include the new flag.  Local edit under `ggml/` worktree. |
+| `ggml/src/ggml-metal/ggml-metal-device.{cpp,h}` | `get_pipeline_mul_mm(op, has_bias, has_residual, has_gelu_erf)` — new fourth parameter, pipeline name extended with `_gelu=N`, shmem sizing adjusted. |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | Dispatcher mul_mm path gains `{MUL_MAT, ADD, UNARY}` can_fuse lookup with `ggml_get_unary_op == GGML_UNARY_OP_GELU_ERF` check; slotted between the 3-op residual and 2-op bias lookups. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`. 995 → 1054 lines, +59. Applies cleanly via `git apply --check`. |
+
+#### What's next
+
+The same fold-in pattern extends trivially to other unary sub-ops
+whenever the chatterbox (or downstream consumer) graph uses them
+right after a `mul_mat + add(bias)`:
+
+- SILU (`t3_mtl.cpp` already uses `ggml_swiglu_split` which fuses
+  `silu(a) * b`, but a plain SILU follower could be added).
+- GELU (non-erf variant) — not in chatterbox today.
+- RELU, GELU_QUICK — not in chatterbox.
+
+These would each be ~15–20 lines (FC slot + branch + dispatcher
+case), mirroring the GELU_ERF wiring this section added. None of
+them fires in the current chatterbox graph so there's no standalone
+win, but infrastructure is cheap to extend.
+
+Bigger next-step: reclaim the §3.27 shmem-roundtrip cost on
+M3 Ultra by fusing bias into the direct-store paths (both
+tensor-API `cT.store` and simdgroup-fallback `simdgroup_store`).
+2–3 h of Metal kernel work; predicted to flip the §3.27 contribution
+from neutral to +3–5 ms CFM on top of today's §3.28 gain.
