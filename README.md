@@ -93,6 +93,41 @@ from `chatterbox.variant` GGUF metadata and dispatches:
 One binary, one invocation, end to end — `scripts/synthesize.sh` is a
 thin convenience wrapper that fills in the two GGUF paths.
 
+## Experimental: Supertonic 2 GGUF / CPU
+
+This branch also contains an experimental Supertonic 2 path.  It is
+model-specific: the official `Supertone/supertonic-2` ONNX files and assets
+are converted into one GGUF, then a CPU C++ runtime runs the known
+Supertonic stages.
+
+Current status:
+
+- `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
+- `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic2.gguf`.
+- `build/supertonic-cli` can synthesize a 44.1 kHz wav on CPU.
+- Stage parity currently passes for preprocessing, duration, text encoder,
+  and vocoder.  The vector estimator is implemented but still has a known
+  first-step parity gap and remains the main correctness blocker.
+
+Example:
+
+```bash
+python scripts/dump-supertonic-reference.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --out artifacts/supertonic-ref-quick --write-wav
+
+python scripts/convert-supertonic2-to-gguf.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --out models/supertonic2.gguf --validate
+
+cmake --build build --target supertonic-cli
+./build/supertonic-cli \
+  --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+```
+
 ## Prerequisites
 
 - C++17 compiler (clang or gcc)
