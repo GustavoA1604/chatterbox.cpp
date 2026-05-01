@@ -1,5 +1,5 @@
 diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
-index e8548b05..9114903b 100644
+index e8548b05..2a9c5856 100644
 --- a/src/ggml-metal/ggml-metal-device.cpp
 +++ b/src/ggml-metal/ggml-metal-device.cpp
 @@ -668,7 +668,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
@@ -11,7 +11,7 @@ index e8548b05..9114903b 100644
      char base[256];
      char name[256];
  
-@@ -679,27 +679,35 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
+@@ -679,27 +679,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
      const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % 32 != 0;
  
      snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
@@ -38,12 +38,16 @@ index e8548b05..9114903b 100644
  
 -    // when the output size is not multiple of 64x32, we need extra smem to prevent out-of-bounds writes
 -    res.smem = bc_out ? 8192 : 4096 + 2048;
-+    // when the output size is not multiple of 64x32, or any of bias /
-+    // residual / gelu_erf is fused, we need the shmem path (8 KB) to
-+    // host the temp_str buffer so the scalar-copy loop can read + fold
-+    // + write.  (Attempted §3.29 direct-store RMW variant reverted —
-+    // see §3.29 writeup.)
-+    res.smem = (bc_out || has_bias || has_residual || has_gelu_erf) ? 8192 : 4096 + 2048;
++    // Shmem sizing:
++    //   - edge block (bc_out=1): 8 KB for temp_str (scalar-copy landing).
++    //   - full block + residual or gelu fold-in: 8 KB — routed through
++    //     shmem because cT.store's cooperative layout + device RMW was
++    //     unstable for these (see §3.29 writeup).
++    //   - full block + bias-only fold-in: 6 KB — direct-store path with
++    //     a post-barrier bias-add scan does not need temp_str (§3.30).
++    //   - full block, no fold-in: 6 KB.
++    const bool _nonbias_foldin = has_residual || has_gelu_erf;
++    res.smem = (bc_out || _nonbias_foldin) ? 8192 : 4096 + 2048;
  
      return res;
  }
@@ -53,7 +57,7 @@ index e8548b05..9114903b 100644
      GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
      GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
  
-@@ -857,13 +865,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+@@ -857,13 +869,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
      };
  
      snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
@@ -71,7 +75,7 @@ index e8548b05..9114903b 100644
  
          res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
  
-@@ -1854,6 +1864,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
+@@ -1854,6 +1868,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad_reflect_1d(g
      return res;
  }
  
@@ -533,7 +537,7 @@ index 50e3c5c7..a3aa05c1 100644
  int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx);
  int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 diff --git a/src/ggml-metal/ggml-metal.metal b/src/ggml-metal/ggml-metal.metal
-index f67c5cd8..5bb4ad5d 100644
+index f67c5cd8..1b938fc2 100644
 --- a/src/ggml-metal/ggml-metal.metal
 +++ b/src/ggml-metal/ggml-metal.metal
 @@ -3300,6 +3300,63 @@ inline float block_q_n_dot_y(device const block_q5_1 * qb_curr, float sumy, thre
@@ -957,43 +961,57 @@ index f67c5cd8..5bb4ad5d 100644
          threadgroup  char * shmem [[threadgroup(0)]],
          uint3  tgpig[[threadgroup_position_in_grid]],
          ushort tiitg[[thread_index_in_threadgroup]],
-@@ -9514,7 +9721,32 @@ kernel void kernel_mul_mm(
+@@ -9514,7 +9721,23 @@ kernel void kernel_mul_mm(
  #endif
      }
  
 -    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
-+    // chatterbox PROGRESS §3.27 (+ §3.28): when bias, residual, or
-+    // gelu_erf is fused in, route through the shmem + scalar-copy path
-+    // so the fold-in can happen inside the copy loop (same pattern as
-+    // the Q-variant helper_mv_add_bias).  Non-fused path stays on the
-+    // fast direct-store.
++    // chatterbox PROGRESS §3.27 (+ §3.28, §3.30): fold-in dispatch
++    // strategy across the two store paths:
 +    //
-+    // §3.29 ATTEMPTED to also patch the direct-store path to do an
-+    // RMW fold-in pass (instead of forcing shmem) — goal was to
-+    // reclaim the shmem-roundtrip cost on M3 Ultra.  That attempt
-+    // produced wrong output (T3 EOS'd early at 70 tokens vs expected
-+    // 84, md5 `06ee1aaaa94a10d70eec2835d3da7dbf` vs §3.28 baseline
-+    // `d8a1b22375dbcb2259c686426a7d76c5`) despite test-metal-ops
-+    // passing — root cause was never isolated in the §3.29 session.
-+    // Suspects: per-simdgroup partition doesn't match cT.store's
-+    // cooperative layout, threadgroup-barrier memory ordering with
-+    // mem_flags::mem_device is weaker than expected on A17/M3,
-+    // or an index/broadcast bug in the RMW pass that test-metal-ops
-+    // doesn't exercise.  Reverted to the §3.28 shmem-forcing
-+    // behaviour.  Tracked as a structural follow-up — see §3.29
-+    // writeup for what a future attempt should test first.
++    // - Full-block writes (_mm_use_direct = true): residual + gelu
++    //   still route through the shmem path (§3.29 attempt left
++    //   them there — cT.store's cooperative layout vs a generic
++    //   device-memory RMW was not numerically stable).  Bias-only
++    //   can fuse into the direct-store path via a small
++    //   post-barrier scan (§3.30 reattempt under the test-metal-ops
++    //   mul_mm_fused parity gate).
++    // - Edge blocks (_mm_bounds_ok = false): shmem scalar-copy
++    //   path, which handles all three fold-ins inline.
 +    const bool _mm_bounds_ok = (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1);
++    const bool _mm_has_nonbias_foldin = FC_mul_mm_has_residual || FC_mul_mm_has_gelu_erf;
 +    const bool _mm_use_direct = (!FC_mul_mm_bc_out || _mm_bounds_ok)
-+                                && !FC_mul_mm_has_bias
-+                                && !FC_mul_mm_has_residual
-+                                && !FC_mul_mm_has_gelu_erf;
++                                && !_mm_has_nonbias_foldin;
 +    if (_mm_use_direct) {
          // if no bounds checks on the output are needed, we can directly write to device memory
  #ifdef GGML_METAL_HAS_TENSOR
          device float * C = (device float *) dst +
-@@ -9533,7 +9765,9 @@ kernel void kernel_mul_mm(
+@@ -9532,8 +9755,32 @@ kernel void kernel_mul_mm(
+             simdgroup_store(mc[i], C + 8*(i%4) + 8*args.ne0*(i/4), args.ne0, 0, false);
          }
  #endif
++        // §3.30: post-store bias fold-in on the direct-store path
++        // (bias-only — residual and gelu still go through shmem).
++        // Requires a threadgroup_barrier to order cT.store's or
++        // simdgroup_store's writes against the subsequent reads,
++        // then distributes 2048 elements (NR0*NR1) across 128
++        // threads (tiitg) so each thread reads+writes 16 values.
++        // Gated under the harness in test-metal-ops to avoid the
++        // §3.29 regression (wrong output on residual / gelu paths).
++        if (FC_mul_mm_has_bias) {
++            threadgroup_barrier(mem_flags::mem_device);
++            device const float * bias_f32 = (device const float *) bias;
++            const int thread_idx = (int) tiitg;
++            for (int k = thread_idx; k < NR0 * NR1; k += 128) {
++                const int row_off = k % NR0; // 0..63
++                const int col_off = k / NR0; // 0..31
++                const int abs_r   = r0 + row_off;
++                const int abs_c   = r1 + col_off;
++                const uint64_t off = (uint64_t)abs_c * args.ne0 + abs_r + (uint64_t)im*args.ne1*args.ne0;
++                device float * D  = (device float *) dst + off;
++                *D = *D + bias_f32[abs_r];
++            }
++        }
      } else {
 -        // block is smaller than 64x32, we should avoid writing data outside of the matrix
 +        // block is smaller than 64x32 OR bias/residual is fused — route
@@ -1002,7 +1020,7 @@ index f67c5cd8..5bb4ad5d 100644
          threadgroup_barrier(mem_flags::mem_threadgroup);
  
          threadgroup float * temp_str = ((threadgroup float *) shmem) + 32*(sgitg&1) + (16*(sgitg >> 1))*NR0;
-@@ -9550,21 +9784,55 @@ kernel void kernel_mul_mm(
+@@ -9550,21 +9797,55 @@ kernel void kernel_mul_mm(
          threadgroup_barrier(mem_flags::mem_threadgroup);
  
          if (sgitg == 0) {
@@ -1022,15 +1040,15 @@ index f67c5cd8..5bb4ad5d 100644
 +                if (!FC_mul_mm_has_bias && !FC_mul_mm_has_residual && !FC_mul_mm_has_gelu_erf) {
 +                    device float4 * D4 = (device float4 *) D;
 +                    threadgroup float4 * C4 = (threadgroup float4 *) C;
- 
--                i *= 4;
--                for (; i < nr0; i++) {
--                    *(D + i) = *(C + i);
++
 +                    int i = 0;
 +                    for (; i < nr0/4; i++) {
 +                        *(D4 + i) = *(C4 + i);
 +                    }
-+
+ 
+-                i *= 4;
+-                for (; i < nr0; i++) {
+-                    *(D + i) = *(C + i);
 +                    i *= 4;
 +                    for (; i < nr0; i++) {
 +                        *(D + i) = *(C + i);

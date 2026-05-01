@@ -3810,3 +3810,121 @@ If you pick this up:
   orders cooperative-tensor-store writes against subsequent
   device reads on A17+ silicon.  Cf. `simdgroup_fence_t` as
   an alternative to `threadgroup_barrier`.
+
+### 3.30  `test-metal-ops` fused-mul_mm harness + §3.29 direct-store retry (bias-only)
+
+Two pieces, both closing §3.29 loose ends:
+
+1. **Harness**: new `test_mul_mm_fused` in `src/test_metal_ops.cpp`
+   builds a small graph `add(mul_mat(W_q4_0, X_f32), bias)` (and
+   with an optional `gelu_erf` follow-up), runs it on CPU + Metal,
+   and compares element-wise.  On the Metal side, ggml-metal's
+   fusion detector collapses these into a single
+   `kernel_mul_mm_..._bias=1_res=X_gelu=Y` dispatch; CPU is always
+   the unfused triple.  Any numerical drift beyond tolerance
+   indicates a kernel bug.  Tolerance picked at 2e-2 absolute
+   after observing the Q4_0-dequant-order CPU-vs-GPU noise on
+   K=256..1024 shapes runs ~5–11e-3 max abs (4× margin over
+   the noise floor).
+2. **Bias-only direct-store (§3.29 retry)**: full-block writes
+   with `has_bias && !has_residual && !has_gelu_erf` now take
+   the direct-store path with a post-barrier bias-add scan
+   (128 threads × 16 elements), instead of routing through the
+   shmem scalar-copy fallback.  Residual / gelu fold-ins still
+   route through shmem — §3.29's negative finding on those
+   paths stands (root cause unresolved), so keeping the proven
+   path for them.  This is the minimum-scope slice of §3.29
+   that the new harness proves byte-stable.
+
+#### Harness coverage
+
+8 fused-mul_mm shape variants, gated under the same `test-metal-ops`
+binary so CI/ship criteria run them alongside diag_mask_inf /
+pad_ext / conv_transpose_1d:
+
+```
+[mul_mm_fused cfm-attn-qkv]          OK (K=256 N=256  T=87 B=2 fuse=bias, max_abs=5.2e-03)
+[mul_mm_fused cfm-attn-out]          OK (K=256 N=512  T=87 B=2 fuse=bias, max_abs=5.7e-03)
+[mul_mm_fused cfm-ff-gate-bias]      OK (K=256 N=1024 T=87 B=2 fuse=bias, max_abs=5.8e-03)
+[mul_mm_fused cfm-ff-gate-bias+gelu] OK (K=256 N=1024 T=87 B=2 fuse=gelu, max_abs=4.9e-03)
+[mul_mm_fused cfm-ff-down]           OK (K=1024 N=256 T=87 B=2 fuse=bias, max_abs=1.1e-02)
+[mul_mm_fused cfm-b1]                OK (K=256 N=512  T=87 B=1 fuse=bias, max_abs=5.7e-03)
+[mul_mm_fused bco-bias]              OK (K=256 N=320  T=87 B=2 fuse=bias, max_abs=5.8e-03)
+[mul_mm_fused bco-gelu]              OK (K=256 N=320  T=87 B=2 fuse=gelu, max_abs=5.2e-03)
+```
+
+Covers the exact shapes chatterbox CFM hits (256→256 attn Q/K/V,
+256→512 attn_out, 256→1024 ff0 with gelu, 1024→256 ff2), batch=1
+and batch=2 variants, and a non-64-multiple N=320 that forces
+the `bco=1` (bounds-checked) shmem path.
+
+#### §3.29 retry (bias-only) outcome
+
+The bias-only direct-store path passes the harness byte-stably
+and produces byte-exact WAV output end-to-end
+(`md5 d8a1b22375dbcb2259c686426a7d76c5` across 5 runs, T3 84
+tokens, audio_ms 3480).
+
+Measured impact on M3 Ultra (5 invocations, Q4_0 + HiFT F16):
+
+| Metric             | §3.28            | §3.30            | Δ                |
+|--------------------|-----------------:|-----------------:|-----------------:|
+| `[cfm_total]` ms   |        533.4 ± 1.0 |      534.0 ± 0.9 | noise            |
+| `S3GEN_INFER_MS`   |        706.0 ± 0.8 |      706.2 ± 3.2 | noise            |
+| `[hift_decode]` ms |             121.2 |           121.8  | noise            |
+
+Neutral on M3 Ultra, same as §3.27.  Reason: in chatterbox's
+`basic_tfm`, every mul_mat+bias has a follow-up op (either
+residual or gelu) that forces the fusion through the 3-op
+path, which still routes through shmem.  The 2-op
+`{MUL_MAT, ADD(bias)}` path §3.30 optimises only fires for
+a few tensors outside basic_tfm (time_mlp / final_proj /
+resnet t_mlp) that contribute negligibly to wall time.
+
+The harness itself is the real deliverable — any future
+attempt at the residual / gelu direct-store paths now has a
+way to get fast feedback on whether a change is correct
+before spending 2–3 h on an end-to-end chatterbox run.
+
+#### Why not also ship the residual / gelu direct-store retries
+
+The `{MUL_MAT, ADD, ADD}` residual fusion and `{MUL_MAT, ADD,
+GELU_ERF}` gelu fusion on the direct-store path were what
+failed in §3.29 (the test-metal-ops gate I've just added would
+have immediately flagged them as wrong output, avoiding the
+revert).  Fixing them needs either:
+
+- a deeper audit of `cT.store`'s cooperative write layout vs
+  Metal memory ordering with `mem_flags::mem_device` — likely
+  where §3.29 broke; OR
+- a different strategy entirely (e.g., inline residual read
+  into the simdgroup accumulator before `simdgroup_store`,
+  avoiding the post-barrier RMW round-trip).
+
+Either is 2–3 h of Metal-specific debugging.  Left for a future
+session; the harness now makes that session tractable.
+
+#### Files touched
+
+| File | Change |
+|------|--------|
+| `src/test_metal_ops.cpp` | New `test_mul_mm_fused(cpu, gpu, K, N, T, B, fuse_mode, label)` helper + 8 test invocations covering the CFM shape space.  New `#include "ggml-cpu.h"` for the CPU reference backend (via the existing include cluster). |
+| `ggml/src/ggml-metal/ggml-metal.metal` | Bias-only direct-store path: full-block write via `cT.store` / `simdgroup_store`, then `threadgroup_barrier(mem_flags::mem_device)`, then a 128-thread scan adding `bias[r0 + row_off]` to each of the 2048 elements.  Only fires when `FC_mul_mm_has_bias && !FC_mul_mm_has_residual && !FC_mul_mm_has_gelu_erf` — gated narrowly to the scope the harness validates. |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | Shmem sizing: 8 KB when `bc_out || has_residual || has_gelu_erf`; 6 KB for bias-only-direct-store and non-fused calls. |
+| [patches/ggml-metal-chatterbox-ops.patch](patches/ggml-metal-chatterbox-ops.patch) | Regenerated from pinned `58c38058`.  1070 → 1088 lines, +18 (direct-store bias scan + shmem-sizing comment). Applies cleanly. |
+
+#### Follow-up tracking
+
+Three items still deferred:
+
+1. **Residual direct-store** — needs the cooperative-store
+   barrier audit mentioned above.  Harness is ready.
+2. **Gelu direct-store** — same as residual.  The inline-math
+   cost is cheap, so the win is mostly avoiding the shmem
+   roundtrip (like bias).  Estimated +2–5 ms on M3 Ultra
+   _if_ it works; infra pattern identical to §3.28 and §3.30.
+3. **Extend fusion to other unary sub-ops** (SILU, GELU
+   non-erf, RELU, GELU_QUICK) — trivial copy-paste of §3.28;
+   not done because chatterbox / T3 / CFM don't emit those
+   after a mul_mat+bias pair.  Useful infra for downstream
+   consumers of this patch (stable-diffusion.cpp / tts-cpp).
