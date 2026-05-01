@@ -93,6 +93,81 @@ from `chatterbox.variant` GGUF metadata and dispatches:
 One binary, one invocation, end to end — `scripts/synthesize.sh` is a
 thin convenience wrapper that fills in the two GGUF paths.
 
+## Experimental: Supertonic GGUF / CPU
+
+This branch also contains an experimental Supertonic path.  It is
+model-specific: the official Supertone ONNX files and assets are converted
+into one GGUF, then a CPU C++ runtime runs the known Supertonic stages.
+
+There are two related upstream bundles:
+
+- `Supertone/supertonic` is the stable English bundle.  It should be used for
+  English and does **not** wrap text in language tags.
+- `Supertone/supertonic-2` is the multilingual bundle.  It should use the
+  open/close language-tag path (`<lang>...</lang>`).  The older prefix-only
+  form (`<lang>... `) can make English prompts stutter.
+
+Current status:
+
+- `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
+- `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic.gguf`
+  (English) or `models/supertonic2.gguf` (multilingual), depending on flags.
+- `build/supertonic-cli` can synthesize a 44.1 kHz wav on CPU.
+- All four stages pass numerical parity against the ONNX reference
+  (preprocess, duration, text encoder, vector estimator, vocoder), and the
+  full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
+  waveform to `max_abs ≈ 6.5e-5` in float / `≈ 7.4e-5` after 16-bit PCM
+  round-trip when fed the same initial noise tensor.
+
+Example:
+
+```bash
+# Stable English bundle: no language wrapping.
+python scripts/dump-supertonic-reference.py \
+  --onnx-dir /path/to/Supertone-supertonic/onnx \
+  --assets-dir /path/to/Supertone-supertonic \
+  --voice-style /path/to/Supertone-supertonic/voice_styles/F1.json \
+  --no-language-wrap \
+  --out artifacts/supertonic-ref-stable --write-wav
+
+python scripts/convert-supertonic2-to-gguf.py \
+  --onnx-dir /path/to/Supertone-supertonic/onnx \
+  --assets-dir /path/to/Supertone-supertonic \
+  --arch supertonic --reference-repo Supertone/supertonic \
+  --default-voice F1 --no-language-wrap \
+  --out models/supertonic.gguf --validate
+
+cmake --build build --target supertonic-cli
+./build/supertonic-cli \
+  --model models/supertonic.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice F1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+
+# Multilingual bundle: uses the <lang>...</lang> wrapping path.
+python scripts/dump-supertonic-reference.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --out artifacts/supertonic-ref-quick --write-wav
+
+python scripts/convert-supertonic2-to-gguf.py \
+  --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
+  --out models/supertonic2.gguf --validate
+
+cmake --build build --target supertonic-cli
+./build/supertonic-cli \
+  --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+
+# Bit-exact reproduction of the ONNX reference run (pass the same noise tensor)
+./build/supertonic-cli --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --noise-npy artifacts/supertonic-ref-quick/noise.npy \
+  --out /tmp/supertonic.wav
+```
+
 ## Prerequisites
 
 - C++17 compiler (clang or gcc)

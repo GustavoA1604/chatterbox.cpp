@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Convert official Supertonic 2 ONNX/assets into a single GGUF file.
+
+This is intentionally model-specific.  The GGUF stores every ONNX initializer
+and tensor-valued Constant under short ggml-safe names, plus metadata arrays
+mapping those short names back to their source ONNX names.  The C++ runtime can
+therefore ask for a tensor by its original ONNX source name without relying on
+long ggml tensor names.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+import onnx
+from onnx import numpy_helper
+
+try:
+    import gguf
+except ImportError as exc:  # pragma: no cover - user environment guard
+    raise SystemExit("error: Python package 'gguf' is required; install with `pip install gguf`.") from exc
+
+
+STAGES = (
+    ("duration", "duration_predictor.onnx"),
+    ("text_encoder", "text_encoder.onnx"),
+    ("vector_estimator", "vector_estimator.onnx"),
+    ("vocoder", "vocoder.onnx"),
+)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Convert Supertonic 2 ONNX/assets to GGUF.")
+    p.add_argument("--onnx-dir", type=Path, required=True,
+                   help="Directory containing the four Supertonic 2 ONNX files and tts.json.")
+    p.add_argument("--assets-dir", type=Path, default=None,
+                   help="Directory containing unicode_indexer.json and voice_styles/. "
+                        "Defaults to --onnx-dir if present, otherwise ../../assets relative to --onnx-dir.")
+    p.add_argument("--out", type=Path, default=Path("models/supertonic2.gguf"))
+    p.add_argument("--arch", default="supertonic2", choices=("supertonic", "supertonic2"),
+                   help="Model family metadata. Use 'supertonic' for the English-only HF bundle.")
+    p.add_argument("--reference-repo", default=None,
+                   help="HF repo/source metadata. Defaults from --arch.")
+    p.add_argument("--default-voice", default=None,
+                   help="Default voice metadata. Defaults to F1 when present, otherwise first voice.")
+    p.add_argument("--language-wrap-mode", choices=("none", "prefix", "open_close"), default=None,
+                   help="Text wrapping metadata. Defaults to none for --arch supertonic and open_close for supertonic2.")
+    p.add_argument("--no-language-wrap", action="store_true",
+                   help="Store metadata telling runtimes not to wrap text as <lang>... . "
+                        "Use for the English-only Supertone/supertonic bundle.")
+    p.add_argument("--validate", action="store_true",
+                   help="Re-open the written GGUF and validate tensor count + metadata.")
+    return p.parse_args()
+
+
+def resolve_assets_dir(onnx_dir: Path, assets_dir: Path | None) -> Path:
+    if assets_dir is not None:
+        return assets_dir
+    if (onnx_dir / "unicode_indexer.json").exists():
+        return onnx_dir
+    return onnx_dir.parent.parent / "assets"
+
+
+def resolve_unicode_indexer(onnx_dir: Path, assets_dir: Path) -> Path:
+    for candidate in (assets_dir / "unicode_indexer.json", onnx_dir / "unicode_indexer.json"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"unicode_indexer.json not found under {assets_dir} or {onnx_dir}")
+
+
+def resolve_voice_styles_dir(onnx_dir: Path, assets_dir: Path) -> Path:
+    for candidate in (assets_dir / "voice_styles", onnx_dir / "voice_styles", onnx_dir.parent / "voice_styles"):
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"voice_styles/ not found under {assets_dir}, {onnx_dir}, or {onnx_dir.parent}")
+
+
+def as_contiguous(arr: np.ndarray) -> np.ndarray:
+    if arr.dtype == np.float64:
+        arr = arr.astype(np.float32)
+    # GGUF stores int64 tensors, but int32 is easier for ggml consumers when
+    # values are small ids/shapes.  Leave true int64 if narrowing would change data.
+    if arr.dtype == np.int64:
+        narrowed = arr.astype(np.int32)
+        if np.array_equal(arr, narrowed.astype(np.int64)):
+            arr = narrowed
+    return np.ascontiguousarray(arr)
+
+
+def tensor_sha256(arr: np.ndarray) -> str:
+    data = np.ascontiguousarray(arr).view(np.uint8)
+    return hashlib.sha256(data).hexdigest()
+
+
+def tensor_from_attribute(attr: onnx.AttributeProto) -> np.ndarray | None:
+    if attr.type == onnx.AttributeProto.TENSOR:
+        return numpy_helper.to_array(attr.t)
+    if attr.type == onnx.AttributeProto.FLOAT:
+        return np.asarray([attr.f], dtype=np.float32)
+    if attr.type == onnx.AttributeProto.FLOATS:
+        return np.asarray(attr.floats, dtype=np.float32)
+    if attr.type == onnx.AttributeProto.INT:
+        return np.asarray([attr.i], dtype=np.int32)
+    if attr.type == onnx.AttributeProto.INTS:
+        return np.asarray(attr.ints, dtype=np.int32)
+    return None
+
+
+def iter_onnx_tensors(model_path: Path) -> Iterable[tuple[str, np.ndarray]]:
+    model = onnx.load(str(model_path), load_external_data=True)
+    seen: set[str] = set()
+
+    for init in model.graph.initializer:
+        name = init.name
+        if not name:
+            continue
+        arr = numpy_helper.to_array(init)
+        seen.add(name)
+        yield name, as_contiguous(arr)
+
+    for node_idx, node in enumerate(model.graph.node):
+        if node.op_type != "Constant":
+            continue
+        if not node.output:
+            continue
+        out_name = node.output[0]
+        if not out_name or out_name in seen:
+            continue
+        for attr in node.attribute:
+            arr = tensor_from_attribute(attr)
+            if arr is None:
+                continue
+            seen.add(out_name)
+            yield out_name, as_contiguous(arr)
+            break
+
+
+def add_json_metadata(writer: "gguf.GGUFWriter", prefix: str, data: dict) -> None:
+    writer.add_string(prefix, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def main() -> int:
+    args = parse_args()
+    assets_dir = resolve_assets_dir(args.onnx_dir, args.assets_dir)
+    unicode_path = resolve_unicode_indexer(args.onnx_dir, assets_dir)
+    voice_styles_dir = resolve_voice_styles_dir(args.onnx_dir, assets_dir)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    cfg = json.loads((args.onnx_dir / "tts.json").read_text())
+    unicode_indexer = np.asarray(json.loads(unicode_path.read_text()), dtype=np.int32)
+
+    reference_repo = args.reference_repo or ("Supertone/supertonic" if args.arch == "supertonic" else "Supertone/supertonic-2")
+    writer = gguf.GGUFWriter(str(args.out), args.arch)
+    writer.add_name("Supertonic" if args.arch == "supertonic" else "Supertonic 2")
+    writer.add_description(f"{reference_repo} ONNX weights/assets converted for a model-specific ggml runtime.")
+    writer.add_string("supertonic.arch", args.arch)
+    writer.add_string("supertonic.reference_repo", reference_repo)
+    writer.add_string("supertonic.tts_version", str(cfg.get("tts_version", "")))
+    writer.add_string("supertonic.split", str(cfg.get("split", "")))
+    writer.add_uint32("supertonic.sample_rate", int(cfg["ae"]["sample_rate"]))
+    writer.add_uint32("supertonic.base_chunk_size", int(cfg["ae"]["base_chunk_size"]))
+    writer.add_uint32("supertonic.ttl_chunk_compress_factor", int(cfg["ttl"]["chunk_compress_factor"]))
+    writer.add_uint32("supertonic.latent_dim", int(cfg["ttl"]["latent_dim"]))
+    writer.add_uint32(
+        "supertonic.latent_channels",
+        int(cfg["ttl"]["latent_dim"]) * int(cfg["ttl"]["chunk_compress_factor"]),
+    )
+    wrap_mode = "none" if args.no_language_wrap else (args.language_wrap_mode or ("none" if args.arch == "supertonic" else "open_close"))
+
+    writer.add_uint32("supertonic.default_steps", 5)
+    writer.add_float32("supertonic.default_speed", 1.05)
+    writer.add_uint32("supertonic.language_wrap", 0 if wrap_mode == "none" else 1)
+    writer.add_string("supertonic.language_wrap_mode", wrap_mode)
+    writer.add_array("supertonic.languages", ["en", "ko", "es", "pt", "fr"])
+    add_json_metadata(writer, "supertonic.tts_json", cfg)
+
+    writer.add_tensor("supertonic/unicode_indexer", unicode_indexer)
+
+    voice_names: list[str] = []
+    for voice_path in sorted(voice_styles_dir.glob("*.json")):
+        voice_name = voice_path.stem
+        voice = json.loads(voice_path.read_text())
+        ttl = as_contiguous(np.asarray(voice["style_ttl"]["data"], dtype=np.float32))
+        dp = as_contiguous(np.asarray(voice["style_dp"]["data"], dtype=np.float32))
+        writer.add_tensor(f"supertonic/voices/{voice_name}/ttl", ttl)
+        writer.add_tensor(f"supertonic/voices/{voice_name}/dp", dp)
+        writer.add_string(f"supertonic.voice.{voice_name}.metadata",
+                          json.dumps(voice.get("metadata", {}), ensure_ascii=False, separators=(",", ":")))
+        voice_names.append(voice_name)
+    writer.add_array("supertonic.voice_names", voice_names)
+    default_voice = args.default_voice or ("F1" if "F1" in voice_names else (voice_names[0] if voice_names else ""))
+    writer.add_string("supertonic.default_voice", default_voice)
+
+    tensor_names: list[str] = []
+    source_names: list[str] = []
+    tensor_shapes: list[str] = []
+    tensor_dtypes: list[str] = []
+    tensor_hashes: list[str] = []
+    per_stage_counts: dict[str, int] = {}
+    total_bytes = 0
+
+    for stage, filename in STAGES:
+        count = 0
+        for source_name, arr in iter_onnx_tensors(args.onnx_dir / filename):
+            short_name = f"supertonic/{stage}/t{count:04d}"
+            source_key = f"{stage}:{source_name}"
+            writer.add_tensor(short_name, arr)
+            tensor_names.append(short_name)
+            source_names.append(source_key)
+            tensor_shapes.append(json.dumps(list(arr.shape), separators=(",", ":")))
+            tensor_dtypes.append(str(arr.dtype))
+            tensor_hashes.append(tensor_sha256(arr))
+            total_bytes += arr.nbytes
+            count += 1
+        per_stage_counts[stage] = count
+        print(f"{stage:16s} {count:5d} tensors")
+
+    writer.add_array("supertonic.tensor_names", tensor_names)
+    writer.add_array("supertonic.source_names", source_names)
+    writer.add_array("supertonic.tensor_shapes", tensor_shapes)
+    writer.add_array("supertonic.tensor_dtypes", tensor_dtypes)
+    writer.add_array("supertonic.tensor_sha256", tensor_hashes)
+    for stage, count in per_stage_counts.items():
+        writer.add_uint32(f"supertonic.{stage}.tensor_count", count)
+
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+    print(f"Wrote {len(tensor_names)} ONNX tensors + {1 + 2 * len(voice_names)} asset tensors")
+    print(f"  output: {args.out}")
+    print(f"  source tensor bytes: {total_bytes / 1e6:.1f} MB")
+
+    if args.validate:
+        reader = gguf.GGUFReader(args.out, "r")
+        if len(reader.tensors) != len(tensor_names) + 1 + 2 * len(voice_names):
+            raise RuntimeError(
+                f"tensor count mismatch: got {len(reader.tensors)}, "
+                f"expected {len(tensor_names) + 1 + 2 * len(voice_names)}"
+            )
+        print("Validation: tensor count OK")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

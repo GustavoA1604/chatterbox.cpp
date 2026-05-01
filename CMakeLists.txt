@@ -44,6 +44,13 @@ set(TTS_CPP_LIB_SOURCES
     src/campplus.cpp
     src/s3tokenizer.cpp
     src/t3_mtl.cpp
+    src/supertonic_gguf.cpp
+    src/supertonic_preprocess.cpp
+    src/supertonic_vocoder.cpp
+    src/supertonic_duration.cpp
+    src/supertonic_text_encoder.cpp
+    src/supertonic_vector_estimator.cpp
+    src/supertonic_engine.cpp
 )
 
 add_library(mtl_tokenizer STATIC src/mtl_tokenizer.cpp)
@@ -103,6 +110,9 @@ if (TTS_CPP_BUILD_EXECUTABLES)
     add_executable(mel2wav src/mel2wav.cpp)
     target_link_libraries(mel2wav PRIVATE ggml)
     target_include_directories(mel2wav PRIVATE ggml/include src)
+
+    add_executable(supertonic-cli src/supertonic_cli.cpp)
+    target_link_libraries(supertonic-cli PRIVATE tts-cpp)
 endif()
 
 if (TTS_CPP_BUILD_TESTS)
@@ -195,6 +205,62 @@ if (TTS_CPP_BUILD_TESTS)
     if (GGML_METAL)
         target_compile_definitions(test-metal-ops PRIVATE GGML_USE_METAL)
     endif()
+
+    add_executable(test-supertonic-preprocess
+        src/test_supertonic_preprocess.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_preprocess.cpp)
+    target_link_libraries(test-supertonic-preprocess PRIVATE ggml)
+    target_include_directories(test-supertonic-preprocess PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-vocoder
+        src/test_supertonic_vocoder.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(test-supertonic-vocoder PRIVATE ggml)
+    target_include_directories(test-supertonic-vocoder PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-duration
+        src/test_supertonic_duration.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_duration.cpp)
+    target_link_libraries(test-supertonic-duration PRIVATE ggml)
+    target_include_directories(test-supertonic-duration PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-text-encoder
+        src/test_supertonic_text_encoder.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_text_encoder.cpp)
+    target_link_libraries(test-supertonic-text-encoder PRIVATE ggml)
+    target_include_directories(test-supertonic-text-encoder PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-vector
+        src/test_supertonic_vector.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_vector_estimator.cpp)
+    target_link_libraries(test-supertonic-vector PRIVATE ggml)
+    target_include_directories(test-supertonic-vector PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-pipeline
+        src/test_supertonic_pipeline.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_preprocess.cpp
+        src/supertonic_text_encoder.cpp
+        src/supertonic_vector_estimator.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(test-supertonic-pipeline PRIVATE ggml)
+    target_include_directories(test-supertonic-pipeline PRIVATE ggml/include src)
+
+    add_executable(supertonic-bench
+        src/supertonic_bench.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_preprocess.cpp
+        src/supertonic_duration.cpp
+        src/supertonic_text_encoder.cpp
+        src/supertonic_vector_estimator.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(supertonic-bench PRIVATE ggml)
+    target_include_directories(supertonic-bench PRIVATE ggml/include src)
 endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)
