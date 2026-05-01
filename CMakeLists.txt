@@ -240,6 +240,16 @@ if (TTS_CPP_BUILD_TESTS)
         src/supertonic_vector_estimator.cpp)
     target_link_libraries(test-supertonic-vector PRIVATE ggml)
     target_include_directories(test-supertonic-vector PRIVATE ggml/include src)
+
+    add_executable(test-supertonic-pipeline
+        src/test_supertonic_pipeline.cpp
+        src/supertonic_gguf.cpp
+        src/supertonic_preprocess.cpp
+        src/supertonic_text_encoder.cpp
+        src/supertonic_vector_estimator.cpp
+        src/supertonic_vocoder.cpp)
+    target_link_libraries(test-supertonic-pipeline PRIVATE ggml)
+    target_include_directories(test-supertonic-pipeline PRIVATE ggml/include src)
 endif()
 
 if (TTS_CPP_INSTALL AND TTS_CPP_BUILD_LIBRARY)

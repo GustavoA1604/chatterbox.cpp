@@ -127,11 +127,10 @@ std::vector<float> time_embedding(const supertonic_model & m, int current, int t
     return o;
 }
 
-void apply_rope(std::vector<float> & x, int L, int H, int D) {
+void apply_rope(const float * theta, std::vector<float> & x, int L, int H, int D) {
     int half = D/2;
     for(int h=0;h<H;++h) for(int t=0;t<L;++t) for(int d=0;d<half;++d) {
-        float theta = std::pow(10000.0f, -(float)d/(float)half);
-        float angle = ((float)t/(float)L)*theta;
+        float angle = ((float)t/(float)L)*theta[d];
         float cs=std::cos(angle), sn=std::sin(angle);
         size_t i1=((size_t)t*H+h)*D+d, i2=((size_t)t*H+h)*D+half+d;
         float a=x[i1], b=x[i2];
@@ -150,7 +149,8 @@ void rope_attn(const supertonic_model & m, int group, std::vector<float> & x, in
     for(int t=0;t<LT;++t) for(int c=0;c<256;++c) text_lc[(size_t)t*256+c]=text_emb[(size_t)c*LT+t];
     dense_matmul_time(text_lc,LT,256,read_f32(m,"vector_estimator:onnx::MatMul_"+std::to_string(kids[group])),read_f32(m,base+"W_key.linear.bias"),A,k);
     dense_matmul_time(text_lc,LT,256,read_f32(m,"vector_estimator:onnx::MatMul_"+std::to_string(vids[group])),read_f32(m,base+"W_value.linear.bias"),A,v);
-    apply_rope(q,L,H,D); apply_rope(k,LT,H,D);
+    auto theta_t = read_f32(m,"vector_estimator:tts.ttl.vector_field.main_blocks.3.attn.theta");
+    apply_rope(theta_t.data.data(),q,L,H,D); apply_rope(theta_t.data.data(),k,LT,H,D);
     std::vector<float> attn_out((size_t)L*A,0), scores(LT), probs(LT);
     float scale=1.0f/16.0f;
     for(int h=0;h<H;++h) for(int qi=0;qi<L;++qi){

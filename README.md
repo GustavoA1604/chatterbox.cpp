@@ -105,9 +105,11 @@ Current status:
 - `scripts/dump-supertonic-reference.py` dumps ONNX Runtime reference tensors.
 - `scripts/convert-supertonic2-to-gguf.py` writes `models/supertonic2.gguf`.
 - `build/supertonic-cli` can synthesize a 44.1 kHz wav on CPU.
-- Stage parity currently passes for preprocessing, duration, text encoder,
-  and vocoder.  The vector estimator is implemented but still has a known
-  first-step parity gap and remains the main correctness blocker.
+- All four stages pass numerical parity against the ONNX reference
+  (preprocess, duration, text encoder, vector estimator, vocoder), and the
+  full pipeline (`test-supertonic-pipeline`) reproduces the ONNX reference
+  waveform to `max_abs ≈ 6.5e-5` in float / `≈ 7.4e-5` after 16-bit PCM
+  round-trip when fed the same initial noise tensor.
 
 Example:
 
@@ -125,6 +127,13 @@ cmake --build build --target supertonic-cli
   --model models/supertonic2.gguf \
   --text "The quick brown fox jumps over the lazy dog." \
   --voice M1 --language en --steps 5 --speed 1.05 \
+  --out /tmp/supertonic.wav
+
+# Bit-exact reproduction of the ONNX reference run (pass the same noise tensor)
+./build/supertonic-cli --model models/supertonic2.gguf \
+  --text "The quick brown fox jumps over the lazy dog." \
+  --voice M1 --language en --steps 5 --speed 1.05 \
+  --noise-npy artifacts/supertonic-ref-quick/noise.npy \
   --out /tmp/supertonic.wav
 ```
 

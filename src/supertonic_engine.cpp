@@ -1,8 +1,10 @@
 #include "tts-cpp/supertonic/engine.h"
 
 #include "supertonic_internal.h"
+#include "npy.h"
 
 #include <cmath>
+#include <cstring>
 #include <random>
 #include <stdexcept>
 
@@ -53,8 +55,26 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
         const float duration_s = duration_raw / opts.speed;
         const int sample_rate = model.hparams.sample_rate;
         const int chunk = model.hparams.base_chunk_size * model.hparams.ttl_chunk_compress_factor;
-        const int wav_len = (int) (duration_s * sample_rate);
-        const int latent_len = std::max(1, (wav_len + chunk - 1) / chunk);
+        int wav_len = (int) (duration_s * sample_rate);
+        int latent_len = std::max(1, (wav_len + chunk - 1) / chunk);
+
+        std::vector<float> latent;
+        if (!opts.noise_npy_path.empty()) {
+            npy_array noise = npy_load(opts.noise_npy_path);
+            if (noise.dtype != "<f4" || noise.shape.size() != 3 || noise.shape[0] != 1 ||
+                noise.shape[1] != model.hparams.latent_channels) {
+                throw std::runtime_error("noise npy must be float32 [1, latent_channels, L]");
+            }
+            latent_len = (int) noise.shape[2];
+            wav_len = latent_len * chunk;
+            latent.resize(noise.n_elements());
+            std::memcpy(latent.data(), npy_as_f32(noise), latent.size() * sizeof(float));
+        } else {
+            std::mt19937 rng(opts.seed);
+            std::normal_distribution<float> normal(0.0f, 1.0f);
+            latent.assign((size_t) model.hparams.latent_channels * latent_len, 0.0f);
+            for (float & v : latent) v = normal(rng);
+        }
 
         std::vector<float> text_emb;
         if (!supertonic_text_encoder_forward_cpu(model, text_ids.data(), (int) text_ids.size(),
@@ -62,10 +82,6 @@ SynthesisResult synthesize(const EngineOptions & opts, const std::string & text)
             throw std::runtime_error("text encoder failed: " + error);
         }
 
-        std::mt19937 rng(opts.seed);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-        std::vector<float> latent((size_t) model.hparams.latent_channels * latent_len);
-        for (float & v : latent) v = normal(rng);
         std::vector<float> latent_mask((size_t) latent_len, 1.0f);
 
         std::vector<float> next;
