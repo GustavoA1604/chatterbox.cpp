@@ -89,7 +89,11 @@ bool load_supertonic_gguf(const std::string & path, supertonic_model & model) {
         model.hparams.latent_channels = (int) get_u32(gguf_ctx, "supertonic.latent_channels");
         model.hparams.default_steps = (int) get_u32(gguf_ctx, "supertonic.default_steps");
         model.hparams.default_speed = get_f32(gguf_ctx, "supertonic.default_speed");
-        model.hparams.language_wrap = get_bool_u32(gguf_ctx, "supertonic.language_wrap", true);
+        model.hparams.language_wrap_mode = get_string(gguf_ctx, "supertonic.language_wrap_mode");
+        if (model.hparams.language_wrap_mode.empty()) {
+            bool language_wrap = get_bool_u32(gguf_ctx, "supertonic.language_wrap", arch != "supertonic");
+            model.hparams.language_wrap_mode = language_wrap ? (arch == "supertonic2" ? "open_close" : "prefix") : "none";
+        }
         model.hparams.default_voice = get_string(gguf_ctx, "supertonic.default_voice", "F1");
         model.languages = get_string_array(gguf_ctx, "supertonic.languages");
         model.tts_json = get_string(gguf_ctx, "supertonic.tts_json");

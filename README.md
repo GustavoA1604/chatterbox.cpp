@@ -103,9 +103,9 @@ There are two related upstream bundles:
 
 - `Supertone/supertonic` is the stable English bundle.  It should be used for
   English and does **not** wrap text in language tags.
-- `Supertone/supertonic-2` is the multilingual bundle.  It uses the
-  language-tag path (`<lang>...`) and is useful for non-English validation, but
-  English prompts can stutter on that path.
+- `Supertone/supertonic-2` is the multilingual bundle.  It should use the
+  open/close language-tag path (`<lang>...</lang>`).  The older prefix-only
+  form (`<lang>... `) can make English prompts stutter.
 
 Current status:
 
@@ -144,7 +144,7 @@ cmake --build build --target supertonic-cli
   --voice F1 --language en --steps 5 --speed 1.05 \
   --out /tmp/supertonic.wav
 
-# Multilingual bundle: keeps the <lang> wrapping path.
+# Multilingual bundle: uses the <lang>...</lang> wrapping path.
 python scripts/dump-supertonic-reference.py \
   --onnx-dir /path/to/supertonic-pytorch/onnx_models/onnx \
   --out artifacts/supertonic-ref-quick --write-wav

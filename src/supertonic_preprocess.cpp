@@ -171,7 +171,7 @@ bool is_supported_language(const std::string & language) {
 
 std::string supertonic_preprocess_text(const std::string & text,
                                        const std::string & language,
-                                       bool language_wrap) {
+                                       const std::string & language_wrap_mode) {
     if (!is_supported_language(language)) {
         throw std::runtime_error("invalid Supertonic language: " + language);
     }
@@ -212,7 +212,10 @@ std::string supertonic_preprocess_text(const std::string & text,
 
     s = collapse_spaces(s);
     if (!has_terminal_punct(s)) s += ".";
-    return language_wrap ? "<" + language + ">" + s + " " : s;
+    if (language_wrap_mode == "none") return s;
+    if (language_wrap_mode == "prefix") return "<" + language + ">" + s + " ";
+    if (language_wrap_mode == "open_close") return "<" + language + ">" + s + "</" + language + ">";
+    throw std::runtime_error("invalid Supertonic language_wrap_mode: " + language_wrap_mode);
 }
 
 bool supertonic_text_to_ids(const supertonic_model & model,
@@ -222,7 +225,7 @@ bool supertonic_text_to_ids(const supertonic_model & model,
                             std::string * normalized_text,
                             std::string * error) {
     try {
-        std::string normalized = supertonic_preprocess_text(text, language, model.hparams.language_wrap);
+        std::string normalized = supertonic_preprocess_text(text, language, model.hparams.language_wrap_mode);
         std::vector<uint32_t> cps = utf8_to_cps(normalized);
         ids.clear();
         ids.reserve(cps.size());

@@ -48,6 +48,8 @@ def parse_args() -> argparse.Namespace:
                    help="HF repo/source metadata. Defaults from --arch.")
     p.add_argument("--default-voice", default=None,
                    help="Default voice metadata. Defaults to F1 when present, otherwise first voice.")
+    p.add_argument("--language-wrap-mode", choices=("none", "prefix", "open_close"), default=None,
+                   help="Text wrapping metadata. Defaults to none for --arch supertonic and open_close for supertonic2.")
     p.add_argument("--no-language-wrap", action="store_true",
                    help="Store metadata telling runtimes not to wrap text as <lang>... . "
                         "Use for the English-only Supertone/supertonic bundle.")
@@ -168,9 +170,12 @@ def main() -> int:
         "supertonic.latent_channels",
         int(cfg["ttl"]["latent_dim"]) * int(cfg["ttl"]["chunk_compress_factor"]),
     )
+    wrap_mode = "none" if args.no_language_wrap else (args.language_wrap_mode or ("none" if args.arch == "supertonic" else "open_close"))
+
     writer.add_uint32("supertonic.default_steps", 5)
     writer.add_float32("supertonic.default_speed", 1.05)
-    writer.add_uint32("supertonic.language_wrap", 0 if args.no_language_wrap else 1)
+    writer.add_uint32("supertonic.language_wrap", 0 if wrap_mode == "none" else 1)
+    writer.add_string("supertonic.language_wrap_mode", wrap_mode)
     writer.add_array("supertonic.languages", ["en", "ko", "es", "pt", "fr"])
     add_json_metadata(writer, "supertonic.tts_json", cfg)
 

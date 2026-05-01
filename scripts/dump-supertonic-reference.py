@@ -42,6 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-language-wrap", action="store_true",
                    help="Do not wrap text as <lang>... . Use for English-only Supertone/supertonic.")
+    p.add_argument("--language-wrap-mode", choices=("none", "prefix", "open_close"), default="open_close",
+                   help="How to wrap text for multilingual models. Default matches latest QVAC supertonic-2.")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--providers", default="CPUExecutionProvider",
                    help="Comma-separated ONNX Runtime providers.")
@@ -50,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def preprocess_text(text: str, lang: str, language_wrap: bool = True) -> str:
+def preprocess_text(text: str, lang: str, language_wrap_mode: str = "open_close") -> str:
     if lang not in AVAILABLE_LANGS:
         raise ValueError(f"invalid language: {lang}")
 
@@ -109,12 +111,18 @@ def preprocess_text(text: str, lang: str, language_wrap: bool = True) -> str:
 
     if not re.search(r"[.!?;:,'\"')\]}…。」』】〉》›»]$", text):
         text += "."
-    return f"<{lang}>{text} " if language_wrap else text
+    if language_wrap_mode == "none":
+        return text
+    if language_wrap_mode == "prefix":
+        return f"<{lang}>{text} "
+    if language_wrap_mode == "open_close":
+        return f"<{lang}>{text}</{lang}>"
+    raise ValueError(f"invalid language wrap mode: {language_wrap_mode}")
 
 
 def text_to_ids(text: str, lang: str, unicode_indexer: list[int],
-                language_wrap: bool = True) -> tuple[np.ndarray, np.ndarray, str]:
-    normalized = preprocess_text(text, lang, language_wrap=language_wrap)
+                language_wrap_mode: str = "open_close") -> tuple[np.ndarray, np.ndarray, str]:
+    normalized = preprocess_text(text, lang, language_wrap_mode=language_wrap_mode)
     ids = []
     for ch in normalized:
         cp = ord(ch)
@@ -182,8 +190,9 @@ def main() -> None:
     if not unicode_path.exists() and (args.onnx_dir / "unicode_indexer.json").exists():
         unicode_path = args.onnx_dir / "unicode_indexer.json"
     unicode_indexer = json.loads(unicode_path.read_text())
+    wrap_mode = "none" if args.no_language_wrap else args.language_wrap_mode
     text_ids, text_mask, normalized_text = text_to_ids(
-        args.text, args.lang, unicode_indexer, language_wrap=not args.no_language_wrap)
+        args.text, args.lang, unicode_indexer, language_wrap_mode=wrap_mode)
     style_ttl, style_dp = load_voice_style(voice_style_path)
 
     providers = [p.strip() for p in args.providers.split(",") if p.strip()]
