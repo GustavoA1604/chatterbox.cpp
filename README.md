@@ -690,6 +690,48 @@ Compared to the M4 multilingual numbers above, the M3 Ultra hits
 by 42–45% (see PROGRESS.md §3.21 for the full bench matrix and the
 NEGATIVE results for F16 KV cache and SwiGLU on F16).
 
+### Multilingual (M3 Ultra, post §3.24–§3.31 Metal kernel portfolio)
+
+Same prompt, voice, seed as §3.21 above.  Adds, on top of §3.21:
+
+- **§3.24** — HiFT conv-kernel F16 quantisation (64 tensors).
+- **§3.26** — `kernel_mul_mv_f32_f16{,_4,_short}` Metal kernel variants
+  to unblock 21 more HiFT `source_*` F16 tensors
+  (GGUF shrinks **754 → 747 MB**, WAV cos 1.000000 vs §3.24).
+- **§3.27** — `kernel_mul_mm` + `ADD(bias)` [+ `ADD(residual)`] fusion
+  for the CFM transformer Q4_0 mat-muls (1820 saved `ggml_add`
+  dispatches per synth).
+- **§3.28** — extends the fusion to absorb `GELU_ERF` (CFM FF ff0
+  activation path; 1120 additional saved dispatches).
+- **§3.30** — `test-metal-ops` fused-mul_mm parity harness + bias-only
+  direct-store variant.
+- **§3.31** — iOS-arm64 cross-build portability +
+  `scripts/bench-m4-validation.sh` for M4 hand-off.
+
+5-invocation averages (`default N=10` CFM — compare to the §3.21 N=10 row):
+
+| Config                              | T3 infer            | S3Gen infer | Audio | **RTF** |
+|-------------------------------------|--------------------:|------------:|------:|--------:|
+| MTL, Metal Q4_0 + HiFT F16 v2 (§3.28) |  433 ms / 84 tok  |    706 ms   | 3.48 s| **0.33** |
+| MTL, Metal Q4_0 baseline (§3.21 N=10) |  482 ms / 84 tok  |    730 ms   | 3.48 s|  0.35    |
+| **Δ §3.21 → §3.28**                   |  **−49 ms / −10.2 %** | **−24 ms / −3.3 %** | — | **−0.02** |
+
+WAV is byte-exact deterministic across runs (md5
+`d8a1b22375dbcb2259c686426a7d76c5` ×5).  Parity harness
+`test-metal-ops` passes 14 gates (3 base + 3 conv_transpose_1d + 8
+fused `mul_mm`).  Patch `patches/ggml-metal-chatterbox-ops.patch`
+(1088 lines) applies cleanly on a fresh ggml clone at pinned
+`58c38058`.  All §3.24–§3.30 kernel changes cross-compile cleanly
+for iOS-arm64 (portability verified; runtime measurement deferred
+until an M4 / iPhone / iPad run of
+[`scripts/bench-m4-validation.sh`](scripts/bench-m4-validation.sh)).
+
+M3 Ultra CFM time specifically drops from 541.9 ms → 534.0 ms
+(**−1.5 %**) — modest on this chip because per-dispatch overhead
+is very low; expected to be larger on bandwidth-limited silicon
+(M4 / A-series) where each saved `ggml_add` dispatch is worth more
+relative to compute.
+
 ### Reference comparison vs onnxruntime (Multilingual, M4 CPU, F16)
 
 Same prompt, seed, and reference audio fed through
